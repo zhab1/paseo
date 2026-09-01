@@ -24,6 +24,11 @@ primed.
 Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
 action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
 
+After an abrupt daemon-worker exit, startup resumes unarchived Codex agents whose last persisted
+status was `running` and whose Codex persistence handle is usable. Recovery starts only after the
+daemon is accepting connections and needs no client connection. Graceful shutdown records agents as
+`closed`, so closed, idle, errored, archived, and non-Codex agents keep the normal on-demand behavior.
+
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
 workflows all live in the CLI process, and the completion notification that would have woken the

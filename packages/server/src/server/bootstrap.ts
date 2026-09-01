@@ -129,7 +129,8 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
-import { AgentStorage } from "./agent/agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
@@ -232,6 +233,44 @@ const MCP_DEBUG_BATCH_LIMIT = 10;
 const MCP_DEBUG_SECRET = "[redacted]";
 const DOWNLOAD_OPEN_FLAGS =
   process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+
+async function recoverCrashInterruptedCodexAgents(input: {
+  records: readonly StoredAgentRecord[];
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  logger: Logger;
+}): Promise<void> {
+  const interrupted = input.records.filter(
+    (record) =>
+      record.provider === "codex" &&
+      record.lastStatus === "running" &&
+      !record.archivedAt &&
+      record.persistence?.provider === "codex" &&
+      record.persistence.sessionId.trim().length > 0,
+  );
+
+  if (interrupted.length === 0) return;
+
+  input.logger.info(
+    { agentCount: interrupted.length },
+    "Recovering crash-interrupted Codex agents",
+  );
+  for (const record of interrupted) {
+    try {
+      await ensureAgentLoaded(record.id, {
+        agentManager: input.agentManager,
+        agentStorage: input.agentStorage,
+        logger: input.logger,
+      });
+      input.logger.info({ agentId: record.id }, "Crash-interrupted Codex agent recovered");
+    } catch (error) {
+      input.logger.warn(
+        { err: error, agentId: record.id },
+        "Failed to recover crash-interrupted Codex agent",
+      );
+    }
+  }
+}
 
 function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
@@ -1324,7 +1363,7 @@ export async function createPaseoDaemon(
   const persistedRecords = await agentStorage.list();
   logger.info(
     { elapsed: elapsed() },
-    `Agent registry loaded (${persistedRecords.length} record${persistedRecords.length === 1 ? "" : "s"}); agents will initialize on demand`,
+    `Agent registry loaded (${persistedRecords.length} record${persistedRecords.length === 1 ? "" : "s"}); inactive agents will initialize on demand`,
   );
   logger.info(
     "Voice mode configured for agent-scoped resume flow (no dedicated voice assistant provider)",
@@ -1532,6 +1571,8 @@ export async function createPaseoDaemon(
 
   logger.info({ elapsed: elapsed() }, "Bootstrap complete, ready to start listening");
 
+  let interruptedAgentRecovery: Promise<void> | null = null;
+
   const start = async () => {
     let mainStarted = false;
     try {
@@ -1724,6 +1765,12 @@ export async function createPaseoDaemon(
       // model loading doesn't block the server from accepting connections.
       speechService.start();
       scriptHealthMonitor.start();
+      interruptedAgentRecovery = recoverCrashInterruptedCodexAgents({
+        records: persistedRecords,
+        agentManager,
+        agentStorage,
+        logger,
+      });
     } catch (error) {
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
@@ -1744,6 +1791,7 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    await interruptedAgentRecovery;
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
