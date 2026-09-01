@@ -82,7 +82,10 @@ describe("Codex executable discovery", () => {
   });
 });
 
-import { CodexAppServerClient } from "./codex/app-server-transport.js";
+import {
+  CodexAppServerClient,
+  CodexAppServerRpcError,
+} from "./codex/app-server-transport.js";
 import {
   createFakeCodexAppServer,
   type FakeCodexAppServer,
@@ -833,6 +836,24 @@ describe("Codex app-server provider", () => {
         },
       },
     ]);
+  });
+
+  test("setMode falls back to next-turn policy when thread settings are unsupported", async () => {
+    const session = createSession({ modeId: "auto" });
+    session.activeForegroundTurnId = null;
+    session.client = {
+      request: vi.fn(async () => {
+        throw new CodexAppServerRpcError(
+          "Invalid request: unknown variant `thread/settings/update`, expected one of `thread/start`",
+          -32600,
+          undefined,
+        );
+      }),
+    };
+
+    await expect(session.setMode("full-access")).resolves.toBeUndefined();
+    await expect(session.getCurrentMode()).resolves.toBe("full-access");
+    expect(session.client.request).toHaveBeenCalledOnce();
   });
 
   test.each(["auto_review", "guardian_subagent"])(

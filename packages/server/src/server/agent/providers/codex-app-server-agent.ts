@@ -885,6 +885,16 @@ function isCodexAlreadyIdleInterrupt(error: unknown): boolean {
   );
 }
 
+function isUnsupportedCodexThreadSettingsUpdate(error: unknown): boolean {
+  return (
+    error instanceof CodexAppServerRpcError &&
+    error.code === -32600 &&
+    error.message.startsWith(
+      "Invalid request: unknown variant `thread/settings/update`, expected one of ",
+    )
+  );
+}
+
 // Codex app-server API response types
 interface CodexReasoningEffortEntry {
   reasoningEffort?: string;
@@ -4522,7 +4532,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         });
       }
       applyApprovalsReviewerParam(params, preset);
-      await client.request("thread/settings/update", params);
+      try {
+        await client.request("thread/settings/update", params);
+      } catch (error) {
+        if (!isUnsupportedCodexThreadSettingsUpdate(error)) throw error;
+        return this.activeForegroundTurnId ? MODE_APPLIES_NEXT_TURN_NOTICE : undefined;
+      }
 
       const activeChildThreadIds = Array.from(this.subAgentCallsByCallId.values()).flatMap(
         (state) => (state.toolCall.status === "running" ? Array.from(state.childThreadIds) : []),
