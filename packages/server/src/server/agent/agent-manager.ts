@@ -3189,9 +3189,18 @@ export class AgentManager {
         options,
       });
 
+      const resumedTurnId = session.getActiveTurnId?.() ?? null;
+      if (resumedTurnId) {
+        managed.activeForegroundTurnId = resumedTurnId;
+        this.openActiveTurn(managed, resumedTurnId, now);
+        managed.lifecycle = "running";
+        this.runs.trackAutonomousRun(resolvedAgentId, resumedTurnId);
+      }
+
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
+      this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
@@ -3206,12 +3215,11 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = "idle";
+      managed.lifecycle = managed.activeTurnId ? "running" : "idle";
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
-      this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
       if (!registered) {

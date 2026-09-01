@@ -126,6 +126,7 @@ interface CodexClientLike {
 type CodexTestSession = AgentSession & {
   connected: boolean;
   currentThreadId: string | null;
+  currentTurnId: string | null;
   activeForegroundTurnId: string | null;
   client: CodexClientLike | null;
 };
@@ -760,6 +761,50 @@ describe("Codex app-server provider", () => {
 
     await expect(session.setMode("auto")).resolves.toBeUndefined();
     await expect(session.setThinkingOption?.("low")).resolves.toBeUndefined();
+  });
+
+  test("setMode updates the native thread and its running subagents", async () => {
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const session = createSession({ modeId: "auto" });
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        return {};
+      }),
+    };
+    asInternals(session).handleNotification("item/completed", {
+      threadId: "test-thread",
+      item: {
+        type: "collabAgentToolCall",
+        id: "running-child-call",
+        tool: "spawnAgent",
+        status: "inProgress",
+        prompt: "Keep working",
+        receiverThreadIds: ["running-child-thread"],
+        agentsStates: { "running-child-thread": { status: "running" } },
+      },
+    });
+
+    await session.setMode("full-access");
+
+    expect(requests).toEqual([
+      {
+        method: "thread/settings/update",
+        params: {
+          threadId: "test-thread",
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" },
+        },
+      },
+      {
+        method: "thread/settings/update",
+        params: {
+          threadId: "running-child-thread",
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" },
+        },
+      },
+    ]);
   });
 
   test.each(["auto_review", "guardian_subagent"])(
@@ -1469,6 +1514,55 @@ describe("Codex app-server provider", () => {
       "thread/unarchive",
       "thread/resume",
       "thread/read",
+    ]);
+    await session.close();
+    appServer.assertNoErrors();
+  });
+
+  test("restores permission policy and active turn identity when resuming Codex", async () => {
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": (params) => {
+        requests.push({ method: "thread/resume", params });
+        return {
+          thread: {
+            id: "archived-thread-id",
+            turns: [
+              { id: "completed-turn", status: "completed", items: [] },
+              { id: "native-running-turn", status: "inProgress", items: [] },
+            ],
+          },
+          sandbox: { type: "dangerFullAccess" },
+        };
+      },
+      "thread/read": () => ({ thread: { turns: [] } }),
+      "turn/interrupt": (params) => {
+        requests.push({ method: "turn/interrupt", params });
+        return {};
+      },
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+
+    const session = await provider.resumeSession(archivedThreadHandle(), {
+      modeId: "full-access",
+    });
+
+    expect(session.getActiveTurnId?.()).toBe("native-running-turn");
+    await session.interrupt();
+    expect(requests).toEqual([
+      {
+        method: "thread/resume",
+        params: expect.objectContaining({
+          threadId: "archived-thread-id",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        }),
+      },
+      {
+        method: "turn/interrupt",
+        params: { threadId: "archived-thread-id", turnId: "native-running-turn" },
+      },
     ]);
     await session.close();
     appServer.assertNoErrors();
@@ -4660,7 +4754,14 @@ describe("Codex app-server provider", () => {
     expect(session.currentThreadId).toBe("archived-thread-id");
     expect(requests).toEqual([
       { method: "thread/loaded/list", params: {} },
-      { method: "thread/resume", params: { threadId: "archived-thread-id" } },
+      {
+        method: "thread/resume",
+        params: {
+          threadId: "archived-thread-id",
+          approvalPolicy: "on-request",
+          sandbox: "workspace-write",
+        },
+      },
     ]);
   });
 

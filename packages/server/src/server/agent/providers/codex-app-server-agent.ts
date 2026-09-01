@@ -2019,6 +2019,18 @@ function readCodexThread(client: CodexAppServerClientLike, threadId: string): Pr
   });
 }
 
+function readActiveCodexTurnId(response: unknown): string | null {
+  const thread = toObjectRecord(toObjectRecord(response)?.thread);
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = toObjectRecord(turns[index]);
+    if (turn?.status === "inProgress" && typeof turn.id === "string") {
+      return turn.id;
+    }
+  }
+  return null;
+}
+
 export async function forkCodexThread(
   client: CodexAppServerClientLike,
   params: CodexThreadForkParams,
@@ -3838,6 +3850,16 @@ export class CodexAppServerAgentSession implements AgentSession {
   ): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
     const params: Record<string, unknown> = { threadId: this.currentThreadId };
+    const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
+    if (this.hasWorkflowModeOverride) {
+      if (this.providerOptions.approval_policy === undefined) {
+        params.approvalPolicy = preset.approvalPolicy;
+      }
+      if (this.providerOptions.sandbox_mode === undefined) {
+        params.sandbox = preset.sandbox;
+      }
+      applyApprovalsReviewerParam(params, preset);
+    }
     const developerInstructions = composeSystemPromptParts(
       this.config.systemPrompt,
       this.config.daemonAppendSystemPrompt,
@@ -3857,6 +3879,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       const response = await this.client.request("thread/resume", params);
       this.rememberResolvedSandboxPolicy(response);
+      this.restoreActiveTurn(response);
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
@@ -3880,12 +3903,20 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
         const response = await this.client.request("thread/resume", params);
         this.rememberResolvedSandboxPolicy(response);
+        this.restoreActiveTurn(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
       }
       this.logger.warn({ error, threadId }, "Failed to resume persisted Codex thread");
       throw new Error(`Failed to resume Codex thread ${threadId}: ${message}`, { cause: error });
     }
+  }
+
+  private restoreActiveTurn(response: unknown): void {
+    const turnId = readActiveCodexTurnId(response);
+    if (!turnId) return;
+    this.currentTurnId = turnId;
+    this.activeForegroundTurnId = turnId;
   }
 
   private parseSlashCommandInput(text: string): { commandName: string; args?: string } | null {
@@ -4385,6 +4416,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     return { ...info };
   }
 
+  getActiveTurnId(): string | null {
+    return this.activeForegroundTurnId;
+  }
+
   async getAvailableModes(): Promise<AgentMode[]> {
     if (this.autoReviewEnabled) {
       return CODEX_MODES;
@@ -4402,6 +4437,40 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.hasWorkflowModeOverride = true;
     this.config.modeId = modeId;
     this.cachedRuntimeInfo = null;
+    const client = this.client;
+    const threadId = this.currentThreadId;
+    if (client && threadId) {
+      const preset = MODE_PRESETS[modeId];
+      const params: Record<string, unknown> = { threadId };
+      if (this.providerOptions.approval_policy === undefined) {
+        params.approvalPolicy = preset.approvalPolicy;
+      }
+      if (this.providerOptions.sandbox_mode === undefined) {
+        params.sandboxPolicy = toSandboxPolicy(preset.sandbox, {
+          ...this.resolvedWorkspaceWrite,
+          ...this.providerOptions.sandbox_workspace_write,
+        });
+      }
+      applyApprovalsReviewerParam(params, preset);
+      await client.request("thread/settings/update", params);
+
+      const activeChildThreadIds = Array.from(this.subAgentCallsByCallId.values()).flatMap(
+        (state) => (state.toolCall.status === "running" ? Array.from(state.childThreadIds) : []),
+      );
+      const updates = await Promise.allSettled(
+        activeChildThreadIds.map((childThreadId) =>
+          client.request("thread/settings/update", { ...params, threadId: childThreadId }),
+        ),
+      );
+      updates.forEach((result, index) => {
+        if (result.status === "rejected") {
+          this.logger.warn(
+            { err: result.reason, threadId: activeChildThreadIds[index] },
+            "Failed to update a running Codex subagent permission mode",
+          );
+        }
+      });
+    }
     if (this.activeForegroundTurnId) {
       return MODE_APPLIES_NEXT_TURN_NOTICE;
     }
