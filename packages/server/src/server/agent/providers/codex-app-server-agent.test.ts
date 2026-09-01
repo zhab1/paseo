@@ -82,10 +82,7 @@ describe("Codex executable discovery", () => {
   });
 });
 
-import {
-  CodexAppServerClient,
-  CodexAppServerRpcError,
-} from "./codex/app-server-transport.js";
+import { CodexAppServerClient, CodexAppServerRpcError } from "./codex/app-server-transport.js";
 import {
   createFakeCodexAppServer,
   type FakeCodexAppServer,
