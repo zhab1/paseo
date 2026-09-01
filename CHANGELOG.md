@@ -39,6 +39,8 @@
 
 ### Fixed
 
+- Fixed resumed Codex agents losing the native active-turn identity required for stop and interrupt actions
+- Fixed resumed Codex permission modes falling back and mode changes not reaching running native subagents
 - Fixed the daemon crashing when a Claude or OMP JSONL process closes during a write ([#4048](https://github.com/getpaseo/paseo/pull/4048))
 - Fixed Android first-message submissions crashing when the keyboard restarted during composer teardown ([#4044](https://github.com/getpaseo/paseo/pull/4044))
 - Fixed long mobile drafts hiding composer controls behind the keyboard ([#4051](https://github.com/getpaseo/paseo/pull/4051))

@@ -709,6 +709,46 @@ test("retries provider history hydration after a stream failure", async () => {
   }
 });
 
+test("registers a resumed provider turn as running and interruptible", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resumed-turn-"));
+  class ResumedTurnSession extends TestAgentSession {
+    getActiveTurnId(): string | null {
+      return "native-running-turn";
+    }
+  }
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async resumeSession(
+          _handle: AgentPersistenceHandle,
+          config?: Partial<AgentSessionConfig>,
+        ): Promise<AgentSession> {
+          return new ResumedTurnSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+        }
+      })(),
+    },
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "resumed-active-thread" },
+      { cwd: workdir },
+    );
+    agentId = agent.id;
+
+    expect(agent).toMatchObject({
+      lifecycle: "running",
+      activeForegroundTurnId: "native-running-turn",
+      activeTurnId: "native-running-turn",
+    });
+    expect(manager.hasInFlightRun(agent.id)).toBe(true);
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("unavailable steer interrupts once and starts one replacement turn", async () => {
   const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
   session.steerResult = "unavailable";
