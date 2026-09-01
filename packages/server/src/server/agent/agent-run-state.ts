@@ -76,6 +76,9 @@ export class AgentRunState {
   trackAutonomousRun(agentId: string, turnId: string | null): TrackedAgentRun {
     const current = this.runs.get(agentId);
     if (current) {
+      if (current.kind === "autonomous") {
+        current.turnId = turnId;
+      }
       return current;
     }
 

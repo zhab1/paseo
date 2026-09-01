@@ -136,7 +136,7 @@ function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolea
 }
 
 const TURN_START_TIMEOUT_MS = 90 * 1000;
-const INTERRUPT_TIMEOUT_MS = 2_000;
+const INTERRUPT_TIMEOUT_MS = 30_000;
 const CODEX_PROVIDER = "codex" as const;
 // Codex treats most app-server client names as the model-request originator.
 // This reserved Codex name is non-originating, so requests keep Codex's default
@@ -244,7 +244,7 @@ const CODEX_MODES: AgentMode[] = [
 const DEFAULT_CODEX_MODE_ID = "auto";
 
 interface CodexAppServerClientLike {
-  request(method: string, params?: unknown): Promise<unknown>;
+  request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
   forkThread?(params: CodexThreadForkParams): Promise<CodexThreadForkResponse>;
   rollbackThread?(params: CodexThreadRollbackParams): Promise<CodexThreadRollbackResponse>;
   notify(method: string, params?: unknown): void;
@@ -861,9 +861,20 @@ function isDefinitiveCodexSteerRejection(error: unknown): boolean {
   // invalid-request, timeout, disconnect, or unknown error is ambiguous.
   return (
     error.message === "no active turn to steer" ||
-    /^expected active turn id `[^`]+` but found `[^`]+`$/.test(error.message) ||
     error.message === "active turn uses a different output schema"
   );
+}
+
+function readCodexSteerTurnMismatch(error: unknown): string | null {
+  if (!(error instanceof CodexAppServerRpcError) || error.code !== -32600) return null;
+  const match = /^expected active turn id `[^`]+` but found `([^`]+)`$/.exec(error.message);
+  return match?.[1] ?? null;
+}
+
+function readCodexInterruptTurnMismatch(error: unknown): string | null {
+  if (!(error instanceof CodexAppServerRpcError) || error.code !== -32600) return null;
+  const match = /^expected active turn id \S+ but found (\S+)$/.exec(error.message);
+  return match?.[1] ?? null;
 }
 
 function isCodexAlreadyIdleInterrupt(error: unknown): boolean {
@@ -3283,6 +3294,20 @@ interface CodexPendingPermissionHandler {
   planText?: string;
 }
 
+interface CodexSteerRequestResult {
+  response: unknown;
+  nativeTurnId: string;
+}
+
+interface CodexSteerRequest {
+  client: CodexAppServerClientLike;
+  threadId: string;
+  nativeTurnId: string;
+  foregroundTurnId: string;
+  input: unknown;
+  clientMessageId?: string;
+}
+
 interface ConsumedRootCompaction {
   itemId?: string;
 }
@@ -4267,31 +4292,76 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.matchesSteerAdmission({ client, threadId, nativeTurnId, foregroundTurnId })) {
       return { status: "unavailable" };
     }
-    try {
-      const response = await client.request(
-        "turn/steer",
-        {
-          threadId,
-          expectedTurnId: nativeTurnId,
-          input,
-          ...(options.clientMessageId ? { clientUserMessageId: options.clientMessageId } : {}),
-        },
-        TURN_START_TIMEOUT_MS,
-      );
-      const record = toObjectRecord(response);
-      const turn = record ? toObjectRecord(record.turn) : null;
-      const acknowledgedTurnId = nonEmptyString(record?.turnId) ?? nonEmptyString(turn?.id);
-      if (acknowledgedTurnId !== nativeTurnId) {
-        throw new Error("Codex returned an invalid steer acknowledgement");
-      }
-      if (options.clearPendingPermissions) {
-        await this.clearPendingPermissionsForSteer();
-      }
-      return { status: "accepted" };
-    } catch (error) {
-      if (isDefinitiveCodexSteerRejection(error)) return { status: "unavailable" };
-      throw error;
+    const result = await this.requestActiveTurnSteer({
+      client,
+      threadId,
+      nativeTurnId,
+      foregroundTurnId,
+      input,
+      clientMessageId: options.clientMessageId,
+    });
+    if (!result) return { status: "unavailable" };
+    const record = toObjectRecord(result.response);
+    const turn = record ? toObjectRecord(record.turn) : null;
+    const acknowledgedTurnId = nonEmptyString(record?.turnId) ?? nonEmptyString(turn?.id);
+    if (acknowledgedTurnId !== result.nativeTurnId) {
+      throw new Error("Codex returned an invalid steer acknowledgement");
     }
+    if (options.clearPendingPermissions) {
+      await this.clearPendingPermissionsForSteer();
+    }
+    return { status: "accepted" };
+  }
+
+  private async requestActiveTurnSteer(
+    params: CodexSteerRequest,
+  ): Promise<CodexSteerRequestResult | null> {
+    let nativeTurnId = params.nativeTurnId;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await params.client.request(
+          "turn/steer",
+          {
+            threadId: params.threadId,
+            expectedTurnId: nativeTurnId,
+            input: params.input,
+            ...(params.clientMessageId ? { clientUserMessageId: params.clientMessageId } : {}),
+          },
+          TURN_START_TIMEOUT_MS,
+        );
+        return { response, nativeTurnId };
+      } catch (error) {
+        const actualTurnId = readCodexSteerTurnMismatch(error);
+        const resyncedTurnId = this.resyncSteerTurn(params, nativeTurnId, actualTurnId, attempt);
+        if (resyncedTurnId) {
+          nativeTurnId = resyncedTurnId;
+          continue;
+        }
+        if (isDefinitiveCodexSteerRejection(error) || actualTurnId) return null;
+        throw error;
+      }
+    }
+    return null;
+  }
+
+  private resyncSteerTurn(
+    params: Pick<CodexSteerRequest, "client" | "threadId" | "foregroundTurnId">,
+    nativeTurnId: string,
+    actualTurnId: string | null,
+    attempt: number,
+  ): string | null {
+    if (
+      attempt !== 0 ||
+      !actualTurnId ||
+      actualTurnId === nativeTurnId ||
+      this.client !== params.client ||
+      this.currentThreadId !== params.threadId ||
+      this.activeForegroundTurnId !== params.foregroundTurnId
+    ) {
+      return null;
+    }
+    this.currentTurnId = actualTurnId;
+    return actualTurnId;
   }
 
   private matchesSteerAdmission(admission: {
@@ -4815,24 +4885,56 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!turnId || (foregroundTurnId && this.activeForegroundTurnId !== foregroundTurnId)) {
       throw new Error("Cannot interrupt Codex before turn/started identifies the active turn");
     }
-    try {
-      await this.client.request(
-        "turn/interrupt",
-        {
-          threadId: this.currentThreadId,
-          turnId,
-        },
-        INTERRUPT_TIMEOUT_MS,
-      );
-    } catch (error) {
-      if (!isCodexAlreadyIdleInterrupt(error)) {
-        throw error;
+    await this.requestActiveTurnInterrupt({
+      client: this.client,
+      threadId: this.currentThreadId,
+      turnId,
+    });
+  }
+
+  private async requestActiveTurnInterrupt(params: {
+    client: CodexAppServerClientLike;
+    threadId: string;
+    turnId: string;
+  }): Promise<void> {
+    let turnId = params.turnId;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await params.client.request(
+          "turn/interrupt",
+          {
+            threadId: params.threadId,
+            turnId,
+          },
+          INTERRUPT_TIMEOUT_MS,
+        );
+        return;
+      } catch (error) {
+        const actualTurnId = readCodexInterruptTurnMismatch(error);
+        if (
+          attempt === 0 &&
+          actualTurnId &&
+          actualTurnId !== turnId &&
+          this.client === params.client &&
+          this.currentThreadId === params.threadId
+        ) {
+          this.currentTurnId = actualTurnId;
+          if (this.activeForegroundTurnId === turnId) {
+            this.activeForegroundTurnId = actualTurnId;
+          }
+          turnId = actualTurnId;
+          continue;
+        }
+        if (!isCodexAlreadyIdleInterrupt(error)) {
+          throw error;
+        }
+        this.activeForegroundTurnId = null;
+        this.activeClientMessageId = null;
+        this.currentTurnId = null;
+        this.pendingForegroundTurnIdentification?.resolve(null);
+        this.pendingForegroundTurnIdentification = null;
+        return;
       }
-      this.activeForegroundTurnId = null;
-      this.activeClientMessageId = null;
-      this.currentTurnId = null;
-      this.pendingForegroundTurnIdentification?.resolve(null);
-      this.pendingForegroundTurnIdentification = null;
     }
   }
 
@@ -5908,8 +6010,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, "running", { reopen: true });
       return;
     }
-    this.currentTurnId = parsed.turnId;
+    const previousTurnId = this.currentTurnId;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
+    if (
+      !pendingIdentification &&
+      previousTurnId &&
+      this.activeForegroundTurnId === previousTurnId
+    ) {
+      this.activeForegroundTurnId = parsed.turnId;
+    }
+    this.currentTurnId = parsed.turnId;
     if (
       pendingIdentification &&
       pendingIdentification.foregroundTurnId === this.activeForegroundTurnId
@@ -5918,7 +6028,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.pendingForegroundTurnIdentification = null;
     }
     this.resetTurnTrackingState();
-    this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
+    this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: parsed.turnId });
   }
 
   private handleTurnCompletedNotification(

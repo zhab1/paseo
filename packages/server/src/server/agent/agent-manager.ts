@@ -84,6 +84,7 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const INTERRUPT_REQUEST_TIMEOUT_MS = 35_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -718,7 +719,7 @@ export class AgentManager {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
       interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_REQUEST_TIMEOUT_MS,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
@@ -4234,10 +4235,18 @@ export class AgentManager {
       flags.shouldNotifyWaiters = false;
       return;
     }
-    if (agent.activeForegroundTurnId) {
+    const trackedRun = this.runs.getRun(agent.id);
+    const isAutonomousRollover =
+      trackedRun?.kind === "autonomous" &&
+      eventTurnId !== undefined &&
+      trackedRun.turnId !== eventTurnId;
+    if (agent.activeForegroundTurnId && !isAutonomousRollover) {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
+    }
+    if (isAutonomousRollover && agent.activeForegroundTurnId) {
+      agent.activeForegroundTurnId = eventTurnId;
     }
     this.runs.trackAutonomousRun(agent.id, eventTurnId ?? null);
     if (eventTurnId) {

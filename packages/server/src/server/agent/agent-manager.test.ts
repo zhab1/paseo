@@ -711,6 +711,7 @@ test("retries provider history hydration after a stream failure", async () => {
 
 test("registers a resumed provider turn as running and interruptible", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resumed-turn-"));
+  let resumedSession: ResumedTurnSession | null = null;
   class ResumedTurnSession extends TestAgentSession {
     getActiveTurnId(): string | null {
       return "native-running-turn";
@@ -723,7 +724,11 @@ test("registers a resumed provider turn as running and interruptible", async () 
           _handle: AgentPersistenceHandle,
           config?: Partial<AgentSessionConfig>,
         ): Promise<AgentSession> {
-          return new ResumedTurnSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+          resumedSession = new ResumedTurnSession({
+            provider: "codex",
+            cwd: config?.cwd ?? workdir,
+          });
+          return resumedSession;
         }
       })(),
     },
@@ -743,6 +748,19 @@ test("registers a resumed provider turn as running and interruptible", async () 
       activeTurnId: "native-running-turn",
     });
     expect(manager.hasInFlightRun(agent.id)).toBe(true);
+
+    resumedSession!.pushEvent({
+      type: "turn_started",
+      provider: "codex",
+      turnId: "native-goal-continuation",
+    });
+    await vi.waitFor(() =>
+      expect(manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "running",
+        activeForegroundTurnId: "native-goal-continuation",
+        activeTurnId: "native-goal-continuation",
+      }),
+    );
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
