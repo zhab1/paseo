@@ -3802,10 +3802,12 @@ describe("Codex app-server provider", () => {
   test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
     const interruptedTurns: string[] = [];
     let bInterrupts = 0;
-    const mismatch = (from: string, to: string) => ({
+    const mismatch = (from: string, to: string, quoted = false) => ({
       __jsonRpcError: {
         code: -32600,
-        message: `expected active turn id ${from} but found ${to}`,
+        message: quoted
+          ? `expected active turn id \`${from}\` but found \`${to}\``
+          : `expected active turn id ${from} but found ${to}`,
       },
     });
     const appServer = createFakeCodexAppServer({
@@ -3822,13 +3824,13 @@ describe("Codex app-server provider", () => {
         interruptedTurns.push(turnId);
         if (turnId === "native-A") {
           appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
-          return mismatch("native-A", "native-B");
+          return mismatch("native-A", "native-B", true);
         }
         if (turnId === "native-B") {
           if (bInterrupts++ === 0) return {};
           return mismatch("native-B", "native-C");
         }
-        if (turnId === "native-C") return mismatch("native-C", "native-D");
+        if (turnId === "native-C") return mismatch("native-C", "native-D", true);
         if (turnId === "native-D") {
           appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-E" });
           return {};
@@ -3845,7 +3847,7 @@ describe("Codex app-server provider", () => {
     expect(interruptedTurns).toEqual(["native-A", "native-B"]);
     expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
 
-    await expect(session.interrupt()).rejects.toThrow("found native-D");
+    await expect(session.interrupt()).rejects.toThrow("found `native-D`");
     expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-D" });
 
     await expect(session.interrupt()).resolves.toBeUndefined();

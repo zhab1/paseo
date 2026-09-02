@@ -876,8 +876,10 @@ function isCodexAlreadyIdleInterrupt(error: unknown): boolean {
 
 function readCodexInterruptTurnMismatch(error: unknown): string | null {
   if (!(error instanceof CodexAppServerRpcError) || error.code !== -32600) return null;
-  const match = /^expected active turn id \S+ but found (\S+)$/.exec(error.message);
-  return match?.[1] ?? null;
+  const match = /^expected active turn id (?:`[^`]+`|\S+) but found (?:`([^`]+)`|(\S+))$/.exec(
+    error.message,
+  );
+  return match?.[1] ?? match?.[2] ?? null;
 }
 
 function isUnsupportedCodexThreadSettingsUpdate(error: unknown): boolean {
