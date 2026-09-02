@@ -82,7 +82,7 @@ describe("Codex executable discovery", () => {
   });
 });
 
-import { CodexAppServerClient } from "./codex/app-server-transport.js";
+import { CodexAppServerClient, CodexAppServerRpcError } from "./codex/app-server-transport.js";
 import {
   createFakeCodexAppServer,
   type FakeCodexAppServer,
@@ -805,6 +805,24 @@ describe("Codex app-server provider", () => {
         },
       },
     ]);
+  });
+
+  test("setMode falls back to next-turn policy when thread settings are unsupported", async () => {
+    const session = createSession({ modeId: "auto" });
+    session.activeForegroundTurnId = null;
+    session.client = {
+      request: vi.fn(async () => {
+        throw new CodexAppServerRpcError(
+          "Invalid request: unknown variant `thread/settings/update`, expected one of `thread/start`",
+          -32600,
+          undefined,
+        );
+      }),
+    };
+
+    await expect(session.setMode("full-access")).resolves.toBeUndefined();
+    await expect(session.getCurrentMode()).resolves.toBe("full-access");
+    expect(session.client.request).toHaveBeenCalledOnce();
   });
 
   test.each(["auto_review", "guardian_subagent"])(
@@ -1549,7 +1567,9 @@ describe("Codex app-server provider", () => {
     });
 
     expect(session.getActiveTurnId?.()).toBe("native-running-turn");
-    await session.interrupt();
+    const interrupt = session.interrupt();
+    appServer.completeTurn({ threadId: "archived-thread-id" });
+    await interrupt;
     expect(requests).toEqual([
       {
         method: "thread/resume",
@@ -1564,6 +1584,45 @@ describe("Codex app-server provider", () => {
         params: { threadId: "archived-thread-id", turnId: "native-running-turn" },
       },
     ]);
+    await session.close();
+    appServer.assertNoErrors();
+  });
+
+  test("settles an ID-less completion for the next goal turn after resume", async () => {
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => ({
+        thread: {
+          id: "archived-thread-id",
+          turns: [{ id: "native-running-turn", status: "inProgress", items: [] }],
+        },
+      }),
+      "thread/read": () => ({ thread: { turns: [] } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle());
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-goal-continuation" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    appServer.completeTurn({ threadId: "archived-thread-id" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events).toContainEqual({
+      type: "turn_started",
+      provider: "codex",
+      turnId: "native-goal-continuation",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_completed",
+        provider: "codex",
+        turnId: "native-goal-continuation",
+      }),
+    );
+    expect(session.getActiveTurnId?.()).toBeNull();
+
     await session.close();
     appServer.assertNoErrors();
   });
@@ -3618,10 +3677,11 @@ describe("Codex app-server provider", () => {
 
       const interruptPromise = session.interrupt();
       appServer.startsTurn({ threadId: "thread-1", turnId: "turn-identified-late" });
+      await appServer.waitForRequest("turn/interrupt");
+      appServer.completeTurn();
       await interruptPromise;
 
       expect(interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-identified-late" }]);
-      appServer.completeTurn();
       await resultPromise;
       appServer.assertNoErrors();
     } finally {
@@ -3731,7 +3791,12 @@ describe("Codex app-server provider", () => {
       turn: { id: "autonomous-turn" },
     });
 
-    await session.interrupt();
+    const interrupt = session.interrupt();
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { id: "autonomous-turn", status: "interrupted", items: [] },
+    });
+    await interrupt;
 
     expect(requests).toContainEqual({
       method: "turn/interrupt",
@@ -3740,6 +3805,74 @@ describe("Codex app-server provider", () => {
         turnId: "autonomous-turn",
       },
     });
+  });
+
+  test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
+    const interruptedTurns: string[] = [];
+    let bInterrupts = 0;
+    const mismatch = (from: string, to: string, quoted = false) => ({
+      __jsonRpcError: {
+        code: -32600,
+        message: quoted
+          ? `expected active turn id \`${from}\` but found \`${to}\``
+          : `expected active turn id ${from} but found ${to}`,
+      },
+    });
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => ({
+        thread: {
+          id: "archived-thread-id",
+          turns: [{ id: "native-A", status: "inProgress", items: [] }],
+        },
+      }),
+      "thread/read": () => ({ thread: { turns: [] } }),
+      "turn/interrupt": (params) => {
+        const turnId = castInternals<{ turnId: string }>(params).turnId;
+        interruptedTurns.push(turnId);
+        if (turnId === "native-A") return {};
+        if (turnId === "native-B") {
+          if (bInterrupts++ === 0) return {};
+          return mismatch("native-B", "native-C");
+        }
+        if (turnId === "native-C") return mismatch("native-C", "native-D", true);
+        if (turnId === "native-D") {
+          appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-E" });
+          return {};
+        }
+        return {};
+      },
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle());
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const firstInterrupt = session.interrupt();
+    await vi.waitFor(() => expect(interruptedTurns).toEqual(["native-A"]));
+    appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
+    await expect(firstInterrupt).resolves.toBeUndefined();
+    expect(interruptedTurns).toEqual(["native-A", "native-B"]);
+    expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
+    expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+
+    await expect(session.interrupt()).rejects.toThrow("found `native-D`");
+    expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-D" });
+
+    await expect(session.interrupt()).resolves.toBeUndefined();
+    expect(interruptedTurns).toEqual([
+      "native-A",
+      "native-B",
+      "native-B",
+      "native-C",
+      "native-D",
+      "native-E",
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-E" });
+
+    await session.close();
+    appServer.assertNoErrors();
   });
 
   test("never replaces the root identity with an early child thread start", () => {
