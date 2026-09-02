@@ -431,7 +431,7 @@ class EnvProbeAgentClient extends TestAgentClient {
 }
 
 class TestAgentSession implements AgentSession {
-  readonly provider = "codex" as const;
+  readonly provider: AgentProvider;
   readonly capabilities = TEST_CAPABILITIES;
   readonly id = randomUUID();
   private runtimeModel: string | null = null;
@@ -439,7 +439,9 @@ class TestAgentSession implements AgentSession {
   private turnIdCounter = 0;
   private interrupted = false;
 
-  constructor(private readonly config: AgentSessionConfig) {}
+  constructor(private readonly config: AgentSessionConfig) {
+    this.provider = config.provider;
+  }
 
   async run(): Promise<AgentRunResult> {
     return {
@@ -711,6 +713,7 @@ test("retries provider history hydration after a stream failure", async () => {
 
 test("registers a resumed provider turn as running and interruptible", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resumed-turn-"));
+  let resumedSession: ResumedTurnSession | null = null;
   class ResumedTurnSession extends TestAgentSession {
     getActiveTurnId(): string | null {
       return "native-running-turn";
@@ -723,7 +726,11 @@ test("registers a resumed provider turn as running and interruptible", async () 
           _handle: AgentPersistenceHandle,
           config?: Partial<AgentSessionConfig>,
         ): Promise<AgentSession> {
-          return new ResumedTurnSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+          resumedSession = new ResumedTurnSession({
+            provider: "codex",
+            cwd: config?.cwd ?? workdir,
+          });
+          return resumedSession;
         }
       })(),
     },
@@ -743,6 +750,19 @@ test("registers a resumed provider turn as running and interruptible", async () 
       activeTurnId: "native-running-turn",
     });
     expect(manager.hasInFlightRun(agent.id)).toBe(true);
+
+    resumedSession!.pushEvent({
+      type: "turn_started",
+      provider: "codex",
+      turnId: "native-goal-continuation",
+    });
+    await vi.waitFor(() =>
+      expect(manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "running",
+        activeForegroundTurnId: "native-goal-continuation",
+        activeTurnId: "native-goal-continuation",
+      }),
+    );
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
@@ -1268,11 +1288,13 @@ async function createControlledInterruptFixture(options: {
   name: string;
   agentId: string;
   turnId: string;
+  provider?: AgentProvider;
   interrupt: (session: ControlledInterruptSession) => Promise<void>;
 }): Promise<ControlledInterruptFixture> {
   const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${options.name}-`));
+  const provider = options.provider ?? "codex";
   const session = new ControlledInterruptSession(
-    { provider: "codex", cwd: workdir },
+    { provider, cwd: workdir },
     options.turnId,
     options.interrupt,
   );
@@ -1280,15 +1302,15 @@ async function createControlledInterruptFixture(options: {
     override async createSession(): Promise<AgentSession> {
       return session;
     }
-  })();
+  })(provider);
   const manager = new AgentManager({
-    clients: { codex: client },
+    clients: { [provider]: client },
     registry: new AgentStorage(join(workdir, "agents"), logger),
     logger,
-    rescueTimeouts: { interruptSessionMs: 10 },
+    ...(options.provider ? {} : { rescueTimeouts: { interruptSessionMs: 10 } }),
     idFactory: () => options.agentId,
   });
-  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+  const agent = await manager.createAgent({ provider, cwd: workdir }, undefined, {
     workspaceId: undefined,
   });
 
@@ -2357,6 +2379,7 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
     name: "interrupt-timeout",
     agentId: "00000000-0000-4000-8000-000000000303",
     turnId: "hanging-interrupt-turn",
+    provider: "claude",
     interrupt: async () => await new Promise(() => {}),
   });
 

@@ -84,6 +84,7 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const CODEX_INTERRUPT_REQUEST_TIMEOUT_MS = 35_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -699,7 +700,10 @@ export class AgentManager {
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
-  private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
+  private readonly rescueTimeouts: {
+    reloadSessionCloseMs: number;
+    interruptSessionMs: number | null;
+  };
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
 
@@ -717,8 +721,7 @@ export class AgentManager {
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+      interruptSessionMs: options.rescueTimeouts?.interruptSessionMs ?? null,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
@@ -2733,9 +2736,7 @@ export class AgentManager {
     const interruptAcknowledged = await this.interruptSession(agent.session, agentId);
     const settlement = await this.waitWithTimeout({
       operation: run.settledPromise,
-      timeoutMs: interruptAcknowledged
-        ? INTERRUPT_SESSION_TIMEOUT_MS
-        : this.rescueTimeouts.interruptSessionMs,
+      timeoutMs: INTERRUPT_SESSION_TIMEOUT_MS,
     });
 
     if (!interruptAcknowledged) {
@@ -2797,10 +2798,15 @@ export class AgentManager {
   }
 
   private async interruptSession(session: AgentSession, agentId: string): Promise<boolean> {
+    const timeoutMs =
+      this.rescueTimeouts.interruptSessionMs ??
+      (session.provider === "codex"
+        ? CODEX_INTERRUPT_REQUEST_TIMEOUT_MS
+        : INTERRUPT_SESSION_TIMEOUT_MS);
     try {
       const result = await this.waitWithTimeout({
         operation: session.interrupt(),
-        timeoutMs: this.rescueTimeouts.interruptSessionMs,
+        timeoutMs,
         onLateError: (error) => {
           this.logger.warn(
             { err: error, agentId },
@@ -2810,10 +2816,7 @@ export class AgentManager {
       });
 
       if (result === "timed_out") {
-        this.logger.warn(
-          { agentId, timeoutMs: this.rescueTimeouts.interruptSessionMs },
-          "Timed out interrupting session during cancel",
-        );
+        this.logger.warn({ agentId, timeoutMs }, "Timed out interrupting session during cancel");
         return false;
       }
       return true;
@@ -4234,10 +4237,18 @@ export class AgentManager {
       flags.shouldNotifyWaiters = false;
       return;
     }
-    if (agent.activeForegroundTurnId) {
+    const trackedRun = this.runs.getRun(agent.id);
+    const isAutonomousRollover =
+      trackedRun?.kind === "autonomous" &&
+      eventTurnId !== undefined &&
+      trackedRun.turnId !== eventTurnId;
+    if (agent.activeForegroundTurnId && !isAutonomousRollover) {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
+    }
+    if (isAutonomousRollover && agent.activeForegroundTurnId) {
+      agent.activeForegroundTurnId = eventTurnId;
     }
     this.runs.trackAutonomousRun(agent.id, eventTurnId ?? null);
     if (eventTurnId) {

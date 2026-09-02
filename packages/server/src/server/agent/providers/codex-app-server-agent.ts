@@ -136,7 +136,7 @@ function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolea
 }
 
 const TURN_START_TIMEOUT_MS = 90 * 1000;
-const INTERRUPT_TIMEOUT_MS = 2_000;
+const INTERRUPT_TIMEOUT_MS = 30_000;
 const CODEX_PROVIDER = "codex" as const;
 // Codex treats most app-server client names as the model-request originator.
 // This reserved Codex name is non-originating, so requests keep Codex's default
@@ -244,7 +244,7 @@ const CODEX_MODES: AgentMode[] = [
 const DEFAULT_CODEX_MODE_ID = "auto";
 
 interface CodexAppServerClientLike {
-  request(method: string, params?: unknown): Promise<unknown>;
+  request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
   forkThread?(params: CodexThreadForkParams): Promise<CodexThreadForkResponse>;
   rollbackThread?(params: CodexThreadRollbackParams): Promise<CodexThreadRollbackResponse>;
   notify(method: string, params?: unknown): void;
@@ -872,6 +872,12 @@ function isCodexAlreadyIdleInterrupt(error: unknown): boolean {
     error.code === -32600 &&
     error.message === "no active turn to interrupt"
   );
+}
+
+function readCodexInterruptTurnMismatch(error: unknown): string | null {
+  if (!(error instanceof CodexAppServerRpcError) || error.code !== -32600) return null;
+  const match = /^expected active turn id \S+ but found (\S+)$/.exec(error.message);
+  return match?.[1] ?? null;
 }
 
 // Codex app-server API response types
@@ -2224,9 +2230,11 @@ function getCodexEventTurnId(params: {
 const CodexEventTurnAbortedNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("turn_aborted"),
         reason: z.string().optional(),
       })
@@ -2237,9 +2245,11 @@ const CodexEventTurnAbortedNotificationSchema = z
 const CodexEventTaskCompleteNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("task_complete"),
       })
       .passthrough(),
@@ -2417,6 +2427,7 @@ type ParsedCodexNotification =
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
+      turnId: string | null;
       status: string;
       errorMessage: string | null;
       threadId: string | null;
@@ -2569,6 +2580,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: params.turn.id ?? null,
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
@@ -2993,6 +3005,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "interrupted",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -3013,6 +3026,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "completed",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -4815,25 +4829,75 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!turnId || (foregroundTurnId && this.activeForegroundTurnId !== foregroundTurnId)) {
       throw new Error("Cannot interrupt Codex before turn/started identifies the active turn");
     }
-    try {
-      await this.client.request(
-        "turn/interrupt",
-        {
-          threadId: this.currentThreadId,
-          turnId,
-        },
-        INTERRUPT_TIMEOUT_MS,
-      );
-    } catch (error) {
-      if (!isCodexAlreadyIdleInterrupt(error)) {
-        throw error;
+    await this.requestActiveTurnInterrupt({
+      client: this.client,
+      threadId: this.currentThreadId,
+      turnId,
+    });
+  }
+
+  private async requestActiveTurnInterrupt(params: {
+    client: CodexAppServerClientLike;
+    threadId: string;
+    turnId: string;
+  }): Promise<void> {
+    const deadline = Date.now() + INTERRUPT_TIMEOUT_MS;
+    let turnId = params.turnId;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await params.client.request(
+          "turn/interrupt",
+          { threadId: params.threadId, turnId },
+          Math.max(1, deadline - Date.now()),
+        );
+        const activeTurnId = this.currentTurnId;
+        if (activeTurnId && activeTurnId !== turnId) {
+          if (attempt === 0 && Date.now() < deadline) {
+            turnId = activeTurnId;
+            continue;
+          }
+          throw new Error(`Codex active turn changed from ${turnId} to ${activeTurnId}`);
+        }
+        return;
+      } catch (error) {
+        const actualTurnId = readCodexInterruptTurnMismatch(error);
+        const resyncedTurnId = this.resyncNativeTurn(params, turnId, actualTurnId);
+        if (attempt === 0 && resyncedTurnId && Date.now() < deadline) {
+          turnId = resyncedTurnId;
+          continue;
+        }
+        if (!isCodexAlreadyIdleInterrupt(error)) throw error;
+        this.activeForegroundTurnId = null;
+        this.activeClientMessageId = null;
+        this.currentTurnId = null;
+        this.pendingForegroundTurnIdentification?.resolve(null);
+        this.pendingForegroundTurnIdentification = null;
+        return;
       }
-      this.activeForegroundTurnId = null;
-      this.activeClientMessageId = null;
-      this.currentTurnId = null;
-      this.pendingForegroundTurnIdentification?.resolve(null);
-      this.pendingForegroundTurnIdentification = null;
     }
+  }
+
+  private resyncNativeTurn(
+    params: { client: CodexAppServerClientLike; threadId: string },
+    nativeTurnId: string,
+    actualTurnId: string | null,
+  ): string | null {
+    if (
+      !actualTurnId ||
+      actualTurnId === nativeTurnId ||
+      this.client !== params.client ||
+      this.currentThreadId !== params.threadId
+    ) {
+      return null;
+    }
+    if (this.currentTurnId !== actualTurnId) {
+      this.handleTurnStartedNotification({
+        kind: "turn_started",
+        threadId: params.threadId,
+        turnId: actualTurnId,
+      });
+    }
+    return actualTurnId;
   }
 
   async close(): Promise<void> {
@@ -5908,8 +5972,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, "running", { reopen: true });
       return;
     }
-    this.currentTurnId = parsed.turnId;
+    const previousTurnId = this.currentTurnId;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
+    if (
+      !pendingIdentification &&
+      previousTurnId &&
+      this.activeForegroundTurnId === previousTurnId
+    ) {
+      this.activeForegroundTurnId = parsed.turnId;
+    }
+    this.currentTurnId = parsed.turnId;
     if (
       pendingIdentification &&
       pendingIdentification.foregroundTurnId === this.activeForegroundTurnId
@@ -5918,7 +5990,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.pendingForegroundTurnIdentification = null;
     }
     this.resetTurnTrackingState();
-    this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER });
+    this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: parsed.turnId });
   }
 
   private handleTurnCompletedNotification(
@@ -5935,6 +6007,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
+    if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({
