@@ -431,7 +431,7 @@ class EnvProbeAgentClient extends TestAgentClient {
 }
 
 class TestAgentSession implements AgentSession {
-  readonly provider = "codex" as const;
+  readonly provider: AgentProvider;
   readonly capabilities = TEST_CAPABILITIES;
   readonly id = randomUUID();
   private runtimeModel: string | null = null;
@@ -439,7 +439,9 @@ class TestAgentSession implements AgentSession {
   private turnIdCounter = 0;
   private interrupted = false;
 
-  constructor(private readonly config: AgentSessionConfig) {}
+  constructor(private readonly config: AgentSessionConfig) {
+    this.provider = config.provider;
+  }
 
   async run(): Promise<AgentRunResult> {
     return {
@@ -1286,11 +1288,13 @@ async function createControlledInterruptFixture(options: {
   name: string;
   agentId: string;
   turnId: string;
+  provider?: AgentProvider;
   interrupt: (session: ControlledInterruptSession) => Promise<void>;
 }): Promise<ControlledInterruptFixture> {
   const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${options.name}-`));
+  const provider = options.provider ?? "codex";
   const session = new ControlledInterruptSession(
-    { provider: "codex", cwd: workdir },
+    { provider, cwd: workdir },
     options.turnId,
     options.interrupt,
   );
@@ -1298,15 +1302,15 @@ async function createControlledInterruptFixture(options: {
     override async createSession(): Promise<AgentSession> {
       return session;
     }
-  })();
+  })(provider);
   const manager = new AgentManager({
-    clients: { codex: client },
+    clients: { [provider]: client },
     registry: new AgentStorage(join(workdir, "agents"), logger),
     logger,
-    rescueTimeouts: { interruptSessionMs: 10 },
+    ...(options.provider ? {} : { rescueTimeouts: { interruptSessionMs: 10 } }),
     idFactory: () => options.agentId,
   });
-  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+  const agent = await manager.createAgent({ provider, cwd: workdir }, undefined, {
     workspaceId: undefined,
   });
 
@@ -2375,6 +2379,7 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
     name: "interrupt-timeout",
     agentId: "00000000-0000-4000-8000-000000000303",
     turnId: "hanging-interrupt-turn",
+    provider: "claude",
     interrupt: async () => await new Promise(() => {}),
   });
 
@@ -2394,26 +2399,6 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
     expect(fixture.manager.getAgent(fixture.agentId)?.lifecycle).toBe("running");
   } finally {
     await fixture.cleanup();
-  }
-});
-
-test("keeps the two-second interrupt deadline for non-Codex sessions", async () => {
-  vi.useFakeTimers();
-  try {
-    const manager = new AgentManager({ logger });
-    const interrupt = (
-      manager as unknown as {
-        interruptSession(session: AgentSession, agentId: string): Promise<boolean>;
-      }
-    ).interruptSession.bind(manager);
-    const result = interrupt(
-      { provider: "claude", interrupt: () => new Promise<void>(() => {}) } as AgentSession,
-      "claude-agent",
-    );
-    await vi.advanceTimersByTimeAsync(2_000);
-    await expect(result).resolves.toBe(false);
-  } finally {
-    vi.useRealTimers();
   }
 });
 

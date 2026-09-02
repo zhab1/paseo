@@ -3345,6 +3345,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
+  private requiresIdentifiedTurnCompletion = false;
   private pendingForegroundTurnIdentification: {
     foregroundTurnId: string;
     promise: Promise<string | null>;
@@ -4252,6 +4253,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.activeForegroundTurnId = turnId;
       this.activeClientMessageId = options?.clientMessageId ?? null;
       this.currentTurnId = null;
+      this.requiresIdentifiedTurnCompletion = false;
       this.pendingForegroundTurnIdentification?.resolve(null);
       let resolveTurnIdentification!: (identifiedTurnId: string | null) => void;
       const turnIdentification = new Promise<string | null>((resolvePromise) => {
@@ -4350,8 +4352,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         return { response, nativeTurnId };
       } catch (error) {
         const actualTurnId = readCodexSteerTurnMismatch(error);
-        const resyncedTurnId = this.resyncSteerTurn(params, nativeTurnId, actualTurnId, attempt);
-        if (resyncedTurnId) {
+        const resyncedTurnId = this.resyncNativeTurn(params, nativeTurnId, actualTurnId);
+        if (attempt === 0 && resyncedTurnId) {
           nativeTurnId = resyncedTurnId;
           continue;
         }
@@ -4362,23 +4364,26 @@ export class CodexAppServerAgentSession implements AgentSession {
     return null;
   }
 
-  private resyncSteerTurn(
-    params: Pick<CodexSteerRequest, "client" | "threadId" | "foregroundTurnId">,
+  private resyncNativeTurn(
+    params: Pick<CodexSteerRequest, "client" | "threadId"> & { foregroundTurnId?: string },
     nativeTurnId: string,
     actualTurnId: string | null,
-    attempt: number,
   ): string | null {
     if (
-      attempt !== 0 ||
       !actualTurnId ||
       actualTurnId === nativeTurnId ||
       this.client !== params.client ||
       this.currentThreadId !== params.threadId ||
-      this.activeForegroundTurnId !== params.foregroundTurnId
+      (params.foregroundTurnId !== undefined &&
+        this.activeForegroundTurnId !== params.foregroundTurnId)
     ) {
       return null;
     }
     this.currentTurnId = actualTurnId;
+    if (this.activeForegroundTurnId === nativeTurnId) {
+      this.activeForegroundTurnId = actualTurnId;
+    }
+    this.requiresIdentifiedTurnCompletion = true;
     return actualTurnId;
   }
 
@@ -4936,18 +4941,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         return;
       } catch (error) {
         const actualTurnId = readCodexInterruptTurnMismatch(error);
-        if (
-          attempt === 0 &&
-          actualTurnId &&
-          actualTurnId !== turnId &&
-          this.client === params.client &&
-          this.currentThreadId === params.threadId
-        ) {
-          this.currentTurnId = actualTurnId;
-          if (this.activeForegroundTurnId === turnId) {
-            this.activeForegroundTurnId = actualTurnId;
-          }
-          turnId = actualTurnId;
+        const resyncedTurnId = this.resyncNativeTurn(params, turnId, actualTurnId);
+        if (attempt === 0 && resyncedTurnId) {
+          turnId = resyncedTurnId;
           continue;
         }
         if (!isCodexAlreadyIdleInterrupt(error)) {
@@ -6045,6 +6041,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.activeForegroundTurnId = parsed.turnId;
     }
     this.currentTurnId = parsed.turnId;
+    if (!previousTurnId) {
+      this.requiresIdentifiedTurnCompletion = false;
+    } else if (previousTurnId !== parsed.turnId) {
+      this.requiresIdentifiedTurnCompletion = true;
+    }
     if (
       pendingIdentification &&
       pendingIdentification.foregroundTurnId === this.activeForegroundTurnId
@@ -6070,7 +6071,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
-    if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) {
+    if (
+      (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) ||
+      (!parsed.turnId && this.currentTurnId && this.requiresIdentifiedTurnCompletion)
+    ) {
       return;
     }
     this.completePendingRootCompactions();

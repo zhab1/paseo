@@ -259,8 +259,8 @@ describe("Codex active-turn steering admission", () => {
     ).resolves.toEqual({ status: "accepted" });
     expect(steeredTurns).toEqual(["native-A", "native-B"]);
 
-    castInternals<CodexSessionTestAccess>(session).handleNotification("turn/completed", {
-      turn: { id: "native-A", status: "completed" },
+    castInternals<CodexSessionTestAccess>(session).handleNotification("codex/event/task_complete", {
+      msg: { type: "task_complete" },
     });
     expect(session.getActiveTurnId?.()).toBe(paseoTurnId);
 
@@ -3835,7 +3835,7 @@ describe("Codex app-server provider", () => {
     });
   });
 
-  test("retries an interrupt once with Codex's current turn after a turn rollover", async () => {
+  test("preserves Codex's newest turn when the interrupt retry also finds a rollover", async () => {
     const interruptedTurns: string[] = [];
     const appServer = createFakeCodexAppServer({
       "thread/loaded/list": () => ({ data: [] }),
@@ -3849,22 +3849,17 @@ describe("Codex app-server provider", () => {
       "turn/interrupt": (params) => {
         const turnId = castInternals<{ turnId: string }>(params).turnId;
         interruptedTurns.push(turnId);
-        if (turnId === "native-A") {
-          return {
-            __jsonRpcError: {
-              code: -32600,
-              message: "expected active turn id native-A but found native-B",
-            },
-          };
-        }
-        return {};
+        const actualTurnId = turnId === "native-A" ? "native-B" : "native-C";
+        const message = `expected active turn id ${turnId} but found ${actualTurnId}`;
+        return { __jsonRpcError: { code: -32600, message } };
       },
     });
     const provider = createProviderWithFakeAppServer(appServer);
     const session = await provider.resumeSession(archivedThreadHandle());
 
-    await expect(session.interrupt()).resolves.toBeUndefined();
+    await expect(session.interrupt()).rejects.toThrow("found native-C");
     expect(interruptedTurns).toEqual(["native-A", "native-B"]);
+    expect((session as CodexTestSession).currentTurnId).toBe("native-C");
 
     await session.close();
     appServer.assertNoErrors();
