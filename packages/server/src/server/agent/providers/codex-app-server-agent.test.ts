@@ -3856,10 +3856,12 @@ describe("Codex app-server provider", () => {
     });
     const provider = createProviderWithFakeAppServer(appServer);
     const session = await provider.resumeSession(archivedThreadHandle());
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
 
     await expect(session.interrupt()).rejects.toThrow("found native-C");
     expect(interruptedTurns).toEqual(["native-A", "native-B"]);
-    expect((session as CodexTestSession).currentTurnId).toBe("native-C");
+    expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-C" });
 
     await session.close();
     appServer.assertNoErrors();

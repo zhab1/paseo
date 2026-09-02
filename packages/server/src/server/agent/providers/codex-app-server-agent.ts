@@ -4379,11 +4379,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     ) {
       return null;
     }
-    this.currentTurnId = actualTurnId;
-    if (this.activeForegroundTurnId === nativeTurnId) {
-      this.activeForegroundTurnId = actualTurnId;
-    }
-    this.requiresIdentifiedTurnCompletion = true;
+    this.handleTurnStartedNotification({
+      kind: "turn_started",
+      threadId: params.threadId,
+      turnId: actualTurnId,
+    });
     return actualTurnId;
   }
 
