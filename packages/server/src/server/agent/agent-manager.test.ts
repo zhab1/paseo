@@ -715,8 +715,19 @@ test("registers a resumed provider turn as running and interruptible", async () 
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resumed-turn-"));
   let resumedSession: ResumedTurnSession | null = null;
   class ResumedTurnSession extends TestAgentSession {
+    interruptCalled = false;
+
     getActiveTurnId(): string | null {
       return "native-running-turn";
+    }
+
+    override async interrupt(): Promise<void> {
+      this.interruptCalled = true;
+      this.pushEvent({
+        type: "turn_completed",
+        provider: "codex",
+        turnId: "native-goal-continuation",
+      });
     }
   }
   const manager = new AgentManager({
@@ -763,6 +774,11 @@ test("registers a resumed provider turn as running and interruptible", async () 
         activeTurnId: "native-goal-continuation",
       }),
     );
+
+    await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+    expect(resumedSession!.interruptCalled).toBe(true);
+    expect(manager.hasInFlightRun(agent.id)).toBe(false);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
