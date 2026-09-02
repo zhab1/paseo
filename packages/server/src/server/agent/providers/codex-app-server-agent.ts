@@ -4885,28 +4885,12 @@ export class CodexAppServerAgentSession implements AgentSession {
           }
           throw new Error(`Codex active turn changed from ${turnId} to ${activeTurnId}`);
         }
-        this.pendingInterruptRollover?.(null);
         if (attempt + 1 < maxAttempts && Date.now() < deadline) {
-          let timeout: ReturnType<typeof setTimeout>;
-          const continueInterrupt = (nextTurnId: string | null): void => {
-            clearTimeout(timeout);
-            if (this.pendingInterruptRollover !== continueInterrupt) return;
-            this.pendingInterruptRollover = null;
-            if (!nextTurnId) return;
-            void this.requestActiveTurnInterrupt({
-              ...params,
-              turnId: nextTurnId,
-              deadline,
-              maxAttempts: maxAttempts - attempt - 1,
-            }).catch((error: unknown) => {
-              this.logger.error(
-                { err: error, turnId: nextTurnId },
-                "Failed to interrupt Codex rollover turn",
-              );
-            });
-          };
-          timeout = setTimeout(() => continueInterrupt(null), deadline - Date.now());
-          this.pendingInterruptRollover = continueInterrupt;
+          const nextTurnId = await this.waitForInterruptRollover(turnId, deadline);
+          if (nextTurnId) {
+            turnId = nextTurnId;
+            continue;
+          }
         }
         return;
       } catch (error) {
@@ -4925,6 +4909,25 @@ export class CodexAppServerAgentSession implements AgentSession {
         return;
       }
     }
+  }
+
+  private waitForInterruptRollover(turnId: string, deadline: number): Promise<string | null> {
+    if (this.currentTurnId !== turnId) return Promise.resolve(this.currentTurnId);
+    this.pendingInterruptRollover?.(null);
+    let resolveResult!: (turnId: string | null) => void;
+    const result = new Promise<string | null>((resolve) => {
+      resolveResult = resolve;
+    });
+    let timeout: ReturnType<typeof setTimeout>;
+    const finish = (nextTurnId: string | null): void => {
+      clearTimeout(timeout);
+      if (this.pendingInterruptRollover !== finish) return;
+      this.pendingInterruptRollover = null;
+      resolveResult(nextTurnId);
+    };
+    timeout = setTimeout(() => finish(null), Math.max(0, deadline - Date.now()));
+    this.pendingInterruptRollover = finish;
+    return result;
   }
 
   private resyncNativeTurn(

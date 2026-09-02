@@ -1567,7 +1567,9 @@ describe("Codex app-server provider", () => {
     });
 
     expect(session.getActiveTurnId?.()).toBe("native-running-turn");
-    await session.interrupt();
+    const interrupt = session.interrupt();
+    appServer.completeTurn({ threadId: "archived-thread-id" });
+    await interrupt;
     expect(requests).toEqual([
       {
         method: "thread/resume",
@@ -3675,10 +3677,11 @@ describe("Codex app-server provider", () => {
 
       const interruptPromise = session.interrupt();
       appServer.startsTurn({ threadId: "thread-1", turnId: "turn-identified-late" });
+      await appServer.waitForRequest("turn/interrupt");
+      appServer.completeTurn();
       await interruptPromise;
 
       expect(interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-identified-late" }]);
-      appServer.completeTurn();
       await resultPromise;
       appServer.assertNoErrors();
     } finally {
@@ -3781,7 +3784,6 @@ describe("Codex app-server provider", () => {
         requests.push({ method, params });
         return {};
       },
-      dispose: async () => undefined,
     };
 
     asInternals(session).handleNotification("turn/started", {
@@ -3789,7 +3791,12 @@ describe("Codex app-server provider", () => {
       turn: { id: "autonomous-turn" },
     });
 
-    await session.interrupt();
+    const interrupt = session.interrupt();
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { id: "autonomous-turn", status: "interrupted", items: [] },
+    });
+    await interrupt;
 
     expect(requests).toContainEqual({
       method: "turn/interrupt",
@@ -3798,7 +3805,6 @@ describe("Codex app-server provider", () => {
         turnId: "autonomous-turn",
       },
     });
-    await session.close();
   });
 
   test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
@@ -3842,9 +3848,11 @@ describe("Codex app-server provider", () => {
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
 
-    await expect(session.interrupt()).resolves.toBeUndefined();
+    const firstInterrupt = session.interrupt();
+    await vi.waitFor(() => expect(interruptedTurns).toEqual(["native-A"]));
     appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
-    await vi.waitFor(() => expect(interruptedTurns).toEqual(["native-A", "native-B"]));
+    await expect(firstInterrupt).resolves.toBeUndefined();
+    expect(interruptedTurns).toEqual(["native-A", "native-B"]);
     expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
     appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
     expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
