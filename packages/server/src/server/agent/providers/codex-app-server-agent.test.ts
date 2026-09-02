@@ -3781,6 +3781,7 @@ describe("Codex app-server provider", () => {
         requests.push({ method, params });
         return {};
       },
+      dispose: async () => undefined,
     };
 
     asInternals(session).handleNotification("turn/started", {
@@ -3797,6 +3798,33 @@ describe("Codex app-server provider", () => {
         turnId: "autonomous-turn",
       },
     });
+    await session.close();
+  });
+
+  test("interrupts an autonomous rollover published after the first interrupt is acknowledged", async () => {
+    const interruptedTurns: string[] = [];
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => ({
+        thread: {
+          id: "archived-thread-id",
+          turns: [{ id: "native-A", status: "inProgress", items: [] }],
+        },
+      }),
+      "thread/read": () => ({ thread: { turns: [] } }),
+      "turn/interrupt": (params) => {
+        interruptedTurns.push(castInternals<{ turnId: string }>(params).turnId);
+        return {};
+      },
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    const session = await provider.resumeSession(archivedThreadHandle());
+
+    await session.interrupt();
+    appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
+
+    await vi.waitFor(() => expect(interruptedTurns).toEqual(["native-A", "native-B"]));
+    await session.close();
   });
 
   test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
@@ -3845,6 +3873,8 @@ describe("Codex app-server provider", () => {
 
     await expect(session.interrupt()).resolves.toBeUndefined();
     expect(interruptedTurns).toEqual(["native-A", "native-B"]);
+    expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+    appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-B" });
     expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
 
     await expect(session.interrupt()).rejects.toThrow("found `native-D`");

@@ -3338,6 +3338,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     resolve: () => void;
     cancelRequested: boolean;
   } | null = null;
+  private pendingInterruptRollover: ((turnId: string | null) => void) | null = null;
   private client: CodexAppServerClient | null = null;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private nextTurnOrdinal = 0;
@@ -4859,10 +4860,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     client: CodexAppServerClientLike;
     threadId: string;
     turnId: string;
+    deadline?: number;
+    maxAttempts?: number;
   }): Promise<void> {
-    const deadline = Date.now() + INTERRUPT_TIMEOUT_MS;
+    const deadline = params.deadline ?? Date.now() + INTERRUPT_TIMEOUT_MS;
+    const maxAttempts = params.maxAttempts ?? 2;
     let turnId = params.turnId;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         await params.client.request(
           "turn/interrupt",
@@ -4870,18 +4874,45 @@ export class CodexAppServerAgentSession implements AgentSession {
           Math.max(1, deadline - Date.now()),
         );
         const activeTurnId = this.currentTurnId;
+        if (!activeTurnId) {
+          this.pendingInterruptRollover?.(null);
+          return;
+        }
         if (activeTurnId && activeTurnId !== turnId) {
-          if (attempt === 0 && Date.now() < deadline) {
+          if (attempt + 1 < maxAttempts && Date.now() < deadline) {
             turnId = activeTurnId;
             continue;
           }
           throw new Error(`Codex active turn changed from ${turnId} to ${activeTurnId}`);
         }
+        this.pendingInterruptRollover?.(null);
+        if (attempt + 1 < maxAttempts && Date.now() < deadline) {
+          let timeout: ReturnType<typeof setTimeout>;
+          const continueInterrupt = (nextTurnId: string | null): void => {
+            clearTimeout(timeout);
+            if (this.pendingInterruptRollover !== continueInterrupt) return;
+            this.pendingInterruptRollover = null;
+            if (!nextTurnId) return;
+            void this.requestActiveTurnInterrupt({
+              ...params,
+              turnId: nextTurnId,
+              deadline,
+              maxAttempts: maxAttempts - attempt - 1,
+            }).catch((error: unknown) => {
+              this.logger.error(
+                { err: error, turnId: nextTurnId },
+                "Failed to interrupt Codex rollover turn",
+              );
+            });
+          };
+          timeout = setTimeout(() => continueInterrupt(null), deadline - Date.now());
+          this.pendingInterruptRollover = continueInterrupt;
+        }
         return;
       } catch (error) {
         const actualTurnId = readCodexInterruptTurnMismatch(error);
         const resyncedTurnId = this.resyncNativeTurn(params, turnId, actualTurnId);
-        if (attempt === 0 && resyncedTurnId && Date.now() < deadline) {
+        if (attempt + 1 < maxAttempts && resyncedTurnId && Date.now() < deadline) {
           turnId = resyncedTurnId;
           continue;
         }
@@ -4921,6 +4952,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.pendingInterruptRollover?.(null);
     this.clearPendingPermissions();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.subscribers.clear();
@@ -5992,6 +6024,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     const previousTurnId = this.currentTurnId;
+    if (previousTurnId === parsed.turnId) return;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
     if (
       !pendingIdentification &&
@@ -6010,6 +6043,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.resetTurnTrackingState();
     this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: parsed.turnId });
+    this.pendingInterruptRollover?.(parsed.turnId);
   }
 
   private handleTurnCompletedNotification(
@@ -6027,6 +6061,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
+    this.pendingInterruptRollover?.(null);
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({
