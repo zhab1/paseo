@@ -235,34 +235,26 @@ describe("Codex active-turn steering admission", () => {
     appServer.assertNoErrors();
   });
 
-  test("retries a steer once with Codex's current turn after a turn rollover", async () => {
+  test("falls back to replacement when Codex reports that a steered turn rolled over", async () => {
     const steeredTurns: string[] = [];
     const appServer = createFakeCodexAppServer({
       "turn/steer": (params) => {
         const expectedTurnId = castInternals<{ expectedTurnId: string }>(params).expectedTurnId;
         steeredTurns.push(expectedTurnId);
-        if (expectedTurnId === "native-A") {
-          return {
-            __jsonRpcError: {
-              code: -32600,
-              message: "expected active turn id `native-A` but found `native-B`",
-            },
-          };
-        }
-        return { turn: { id: "native-B" } };
+        return {
+          __jsonRpcError: {
+            code: -32600,
+            message: "expected active turn id `native-A` but found `native-B`",
+          },
+        };
       },
     });
     const { session, paseoTurnId } = await startPublicSteeringSession(appServer);
 
     await expect(
       session.steerActiveTurn!("follow up", { expectedTurnId: paseoTurnId }),
-    ).resolves.toEqual({ status: "accepted" });
-    expect(steeredTurns).toEqual(["native-A", "native-B"]);
-
-    castInternals<CodexSessionTestAccess>(session).handleNotification("codex/event/task_complete", {
-      msg: { type: "task_complete" },
-    });
-    expect(session.getActiveTurnId?.()).toBe(paseoTurnId);
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(steeredTurns).toEqual(["native-A"]);
 
     await session.close();
     appServer.assertNoErrors();
@@ -3835,7 +3827,7 @@ describe("Codex app-server provider", () => {
     });
   });
 
-  test("preserves Codex's newest turn when the interrupt retry also finds a rollover", async () => {
+  test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
     const interruptedTurns: string[] = [];
     const appServer = createFakeCodexAppServer({
       "thread/loaded/list": () => ({ data: [] }),
@@ -3849,9 +3841,18 @@ describe("Codex app-server provider", () => {
       "turn/interrupt": (params) => {
         const turnId = castInternals<{ turnId: string }>(params).turnId;
         interruptedTurns.push(turnId);
+        if (turnId === "native-C") {
+          appServer.startsTurn({ threadId: "archived-thread-id", turnId: "native-D" });
+          return {};
+        }
+        if (turnId === "native-D") return {};
         const actualTurnId = turnId === "native-A" ? "native-B" : "native-C";
-        const message = `expected active turn id ${turnId} but found ${actualTurnId}`;
-        return { __jsonRpcError: { code: -32600, message } };
+        return {
+          __jsonRpcError: {
+            code: -32600,
+            message: `expected active turn id ${turnId} but found ${actualTurnId}`,
+          },
+        };
       },
     });
     const provider = createProviderWithFakeAppServer(appServer);
@@ -3862,6 +3863,10 @@ describe("Codex app-server provider", () => {
     await expect(session.interrupt()).rejects.toThrow("found native-C");
     expect(interruptedTurns).toEqual(["native-A", "native-B"]);
     expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-C" });
+
+    await expect(session.interrupt()).resolves.toBeUndefined();
+    expect(interruptedTurns).toEqual(["native-A", "native-B", "native-C", "native-D"]);
+    expect(events.at(-1)).toMatchObject({ type: "turn_started", turnId: "native-D" });
 
     await session.close();
     appServer.assertNoErrors();

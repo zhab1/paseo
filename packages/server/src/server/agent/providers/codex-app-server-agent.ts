@@ -3312,20 +3312,6 @@ interface CodexPendingPermissionHandler {
   planText?: string;
 }
 
-interface CodexSteerRequestResult {
-  response: unknown;
-  nativeTurnId: string;
-}
-
-interface CodexSteerRequest {
-  client: CodexAppServerClientLike;
-  threadId: string;
-  nativeTurnId: string;
-  foregroundTurnId: string;
-  input: unknown;
-  clientMessageId?: string;
-}
-
 interface ConsumedRootCompaction {
   itemId?: string;
 }
@@ -4312,60 +4298,37 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.matchesSteerAdmission({ client, threadId, nativeTurnId, foregroundTurnId })) {
       return { status: "unavailable" };
     }
-    const result = await this.requestActiveTurnSteer({
-      client,
-      threadId,
-      nativeTurnId,
-      foregroundTurnId,
-      input,
-      clientMessageId: options.clientMessageId,
-    });
-    if (!result) return { status: "unavailable" };
-    const record = toObjectRecord(result.response);
-    const turn = record ? toObjectRecord(record.turn) : null;
-    const acknowledgedTurnId = nonEmptyString(record?.turnId) ?? nonEmptyString(turn?.id);
-    if (acknowledgedTurnId !== result.nativeTurnId) {
-      throw new Error("Codex returned an invalid steer acknowledgement");
-    }
-    if (options.clearPendingPermissions) {
-      await this.clearPendingPermissionsForSteer();
-    }
-    return { status: "accepted" };
-  }
-
-  private async requestActiveTurnSteer(
-    params: CodexSteerRequest,
-  ): Promise<CodexSteerRequestResult | null> {
-    let nativeTurnId = params.nativeTurnId;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const response = await params.client.request(
-          "turn/steer",
-          {
-            threadId: params.threadId,
-            expectedTurnId: nativeTurnId,
-            input: params.input,
-            ...(params.clientMessageId ? { clientUserMessageId: params.clientMessageId } : {}),
-          },
-          TURN_START_TIMEOUT_MS,
-        );
-        return { response, nativeTurnId };
-      } catch (error) {
-        const actualTurnId = readCodexSteerTurnMismatch(error);
-        const resyncedTurnId = this.resyncNativeTurn(params, nativeTurnId, actualTurnId);
-        if (attempt === 0 && resyncedTurnId) {
-          nativeTurnId = resyncedTurnId;
-          continue;
-        }
-        if (isDefinitiveCodexSteerRejection(error) || actualTurnId) return null;
-        throw error;
+    try {
+      const response = await client.request(
+        "turn/steer",
+        {
+          threadId,
+          expectedTurnId: nativeTurnId,
+          input,
+          ...(options.clientMessageId ? { clientUserMessageId: options.clientMessageId } : {}),
+        },
+        TURN_START_TIMEOUT_MS,
+      );
+      const record = toObjectRecord(response);
+      const turn = record ? toObjectRecord(record.turn) : null;
+      const acknowledgedTurnId = nonEmptyString(record?.turnId) ?? nonEmptyString(turn?.id);
+      if (acknowledgedTurnId !== nativeTurnId) {
+        throw new Error("Codex returned an invalid steer acknowledgement");
       }
+      if (options.clearPendingPermissions) {
+        await this.clearPendingPermissionsForSteer();
+      }
+      return { status: "accepted" };
+    } catch (error) {
+      if (isDefinitiveCodexSteerRejection(error) || readCodexSteerTurnMismatch(error)) {
+        return { status: "unavailable" };
+      }
+      throw error;
     }
-    return null;
   }
 
   private resyncNativeTurn(
-    params: Pick<CodexSteerRequest, "client" | "threadId"> & { foregroundTurnId?: string },
+    params: { client: CodexAppServerClientLike; threadId: string },
     nativeTurnId: string,
     actualTurnId: string | null,
   ): string | null {
@@ -4373,9 +4336,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       !actualTurnId ||
       actualTurnId === nativeTurnId ||
       this.client !== params.client ||
-      this.currentThreadId !== params.threadId ||
-      (params.foregroundTurnId !== undefined &&
-        this.activeForegroundTurnId !== params.foregroundTurnId)
+      this.currentThreadId !== params.threadId
     ) {
       return null;
     }
@@ -4938,6 +4899,14 @@ export class CodexAppServerAgentSession implements AgentSession {
           },
           INTERRUPT_TIMEOUT_MS,
         );
+        const activeTurnId = this.currentTurnId;
+        if (activeTurnId && activeTurnId !== turnId) {
+          if (attempt === 0) {
+            turnId = activeTurnId;
+            continue;
+          }
+          throw new Error(`Codex active turn changed from ${turnId} to ${activeTurnId}`);
+        }
         return;
       } catch (error) {
         const actualTurnId = readCodexInterruptTurnMismatch(error);
