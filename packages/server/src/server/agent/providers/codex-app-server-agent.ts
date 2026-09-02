@@ -2245,9 +2245,11 @@ function getCodexEventTurnId(params: {
 const CodexEventTurnAbortedNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("turn_aborted"),
         reason: z.string().optional(),
       })
@@ -2258,9 +2260,11 @@ const CodexEventTurnAbortedNotificationSchema = z
 const CodexEventTaskCompleteNotificationSchema = z
   .object({
     ...CodexEventThreadIdFields,
+    ...CodexEventTurnIdFields,
     msg: z
       .object({
         ...CodexEventThreadIdFields,
+        ...CodexEventTurnIdFields,
         type: z.literal("task_complete"),
       })
       .passthrough(),
@@ -2438,6 +2442,7 @@ type ParsedCodexNotification =
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
+      turnId: string | null;
       status: string;
       errorMessage: string | null;
       threadId: string | null;
@@ -2590,6 +2595,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: params.turn.id ?? null,
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
@@ -3014,6 +3020,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "interrupted",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -3034,6 +3041,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        turnId: getCodexEventTurnId(params),
         status: "completed",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
@@ -4536,6 +4544,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         await client.request("thread/settings/update", params);
       } catch (error) {
         if (!isUnsupportedCodexThreadSettingsUpdate(error)) throw error;
+        // COMPAT(codexThreadSettingsUpdate): added in v0.7.0, remove after 2027-03-02
+        // once Codex 0.105 falls below the supported floor.
         return this.activeForegroundTurnId ? MODE_APPLIES_NEXT_TURN_NOTICE : undefined;
       }
 
@@ -6058,6 +6068,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         status = "canceled";
       }
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
+      return;
+    }
+    if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) {
       return;
     }
     this.completePendingRootCompactions();

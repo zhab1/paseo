@@ -2397,6 +2397,26 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
   }
 });
 
+test("keeps the two-second interrupt deadline for non-Codex sessions", async () => {
+  vi.useFakeTimers();
+  try {
+    const manager = new AgentManager({ logger });
+    const interrupt = (
+      manager as unknown as {
+        interruptSession(session: AgentSession, agentId: string): Promise<boolean>;
+      }
+    ).interruptSession.bind(manager);
+    const result = interrupt(
+      { provider: "claude", interrupt: () => new Promise<void>(() => {}) } as AgentSession,
+      "claude-agent",
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(result).resolves.toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("cancelAgentRun preserves the active turn when the provider rejects the interrupt", async () => {
   const fixture = await createControlledInterruptFixture({
     name: "interrupt-rejected",

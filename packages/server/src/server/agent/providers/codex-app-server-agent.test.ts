@@ -259,6 +259,11 @@ describe("Codex active-turn steering admission", () => {
     ).resolves.toEqual({ status: "accepted" });
     expect(steeredTurns).toEqual(["native-A", "native-B"]);
 
+    castInternals<CodexSessionTestAccess>(session).handleNotification("turn/completed", {
+      turn: { id: "native-A", status: "completed" },
+    });
+    expect(session.getActiveTurnId?.()).toBe(paseoTurnId);
+
     await session.close();
     appServer.assertNoErrors();
   });

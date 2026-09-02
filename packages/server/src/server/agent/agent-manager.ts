@@ -700,7 +700,10 @@ export class AgentManager {
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
-  private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
+  private readonly rescueTimeouts: {
+    reloadSessionCloseMs: number;
+    interruptSessionMs: number | null;
+  };
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
 
@@ -718,8 +721,7 @@ export class AgentManager {
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_REQUEST_TIMEOUT_MS,
+      interruptSessionMs: options.rescueTimeouts?.interruptSessionMs ?? null,
     };
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
@@ -2796,10 +2798,13 @@ export class AgentManager {
   }
 
   private async interruptSession(session: AgentSession, agentId: string): Promise<boolean> {
+    const timeoutMs =
+      this.rescueTimeouts.interruptSessionMs ??
+      (session.provider === "codex" ? INTERRUPT_REQUEST_TIMEOUT_MS : INTERRUPT_SESSION_TIMEOUT_MS);
     try {
       const result = await this.waitWithTimeout({
         operation: session.interrupt(),
-        timeoutMs: this.rescueTimeouts.interruptSessionMs,
+        timeoutMs,
         onLateError: (error) => {
           this.logger.warn(
             { err: error, agentId },
@@ -2809,10 +2814,7 @@ export class AgentManager {
       });
 
       if (result === "timed_out") {
-        this.logger.warn(
-          { agentId, timeoutMs: this.rescueTimeouts.interruptSessionMs },
-          "Timed out interrupting session during cancel",
-        );
+        this.logger.warn({ agentId, timeoutMs }, "Timed out interrupting session during cancel");
         return false;
       }
       return true;
