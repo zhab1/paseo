@@ -3506,6 +3506,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   // thread/resume can start an autonomous goal before AgentManager receives the session.
   private preSubscriptionEvents: BufferedCodexStreamEvent[] | null = [];
   private preSubscriptionReplayScheduled = false;
+  private resumeReopenedSubAgentCallIds = new Set<string>();
+  private resumeReopenedSubAgentIds = new Set<string>();
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
@@ -4018,11 +4020,29 @@ export class CodexAppServerAgentSession implements AgentSession {
         return key ? [[key, event.item] as const] : [];
       }),
     );
+    const latestReopenByCallId = new Map<string, AgentTimelineItem>();
+    for (const { event } of this.preSubscriptionEvents) {
+      if (
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.status === "running" &&
+        this.resumeReopenedSubAgentCallIds.has(event.item.callId)
+      ) {
+        latestReopenByCallId.set(event.item.callId, event.item);
+      }
+    }
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "timeline") return true;
       const key = timelineItemSnapshotKey(event.item);
       const snapshotItem = key ? snapshotItems.get(key) : undefined;
       if (!snapshotItem || !key) return true;
+      if (
+        event.item.type === "tool_call" &&
+        event.item.status === "running" &&
+        this.resumeReopenedSubAgentCallIds.has(event.item.callId)
+      ) {
+        return latestReopenByCallId.get(event.item.callId) === event.item;
+      }
       const reconciled = reconcileBufferedTimelineItem(event.item, snapshotItem, key, textCoverage);
       if (!reconciled) return false;
       event.item = reconciled;
@@ -4055,12 +4075,27 @@ export class CodexAppServerAgentSession implements AgentSession {
         return itemKey ? [[`${event.event.id}:${itemKey}`, event.event.item] as const] : [];
       }),
     );
+    const latestReopenBySubAgentId = new Map<string, AgentStreamEvent>();
+    for (const buffered of this.preSubscriptionEvents) {
+      const event = buffered.event;
+      if (
+        event.type === "provider_subagent" &&
+        event.event.type === "upsert" &&
+        event.event.status === "running" &&
+        this.resumeReopenedSubAgentIds.has(event.event.id)
+      ) {
+        latestReopenBySubAgentId.set(event.event.id, event);
+      }
+    }
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "provider_subagent") return true;
       const buffered = event.event;
       if (buffered.type === "upsert") {
         const snapshot = snapshotUpserts.get(buffered.id);
         if (!snapshot || snapshot.type !== "upsert") return true;
+        if (buffered.status === "running" && this.resumeReopenedSubAgentIds.has(buffered.id)) {
+          return latestReopenBySubAgentId.get(buffered.id) === event;
+        }
         return !(
           isDeepStrictEqual(buffered, snapshot) ||
           (buffered.status === "running" &&
@@ -5613,6 +5648,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     buffered.splice(0, consumed);
     if (buffered.length === 0) {
       this.preSubscriptionEvents = null;
+      this.resumeReopenedSubAgentCallIds.clear();
+      this.resumeReopenedSubAgentIds.clear();
     }
   }
 
@@ -6341,6 +6378,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   ): void {
     const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
     if (subAgentCallId) {
+      if (this.preSubscriptionEvents) {
+        this.resumeReopenedSubAgentCallIds.add(subAgentCallId);
+        if (parsed.threadId) this.resumeReopenedSubAgentIds.add(parsed.threadId);
+      }
       this.emitSubAgentActivityUpdate(subAgentCallId, "running", { reopen: true });
       return;
     }

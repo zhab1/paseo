@@ -4680,6 +4680,10 @@ describe("Codex app-server provider", () => {
       itemId: "reasoning-v2-child-thread",
       delta: "Checking child state",
     });
+    internals.handleNotification("turn/started", {
+      threadId: "v2-child-thread",
+      turn: { id: "v2-child-reopened-during-resume" },
+    });
 
     const history: AgentStreamEvent[] = [];
     session.subscribe((event) => history.push(event));
@@ -4699,6 +4703,7 @@ describe("Codex app-server provider", () => {
         title: "Sentinel child",
       },
       { type: "upsert", id: "v2-child-thread", status: "completed" },
+      { type: "upsert", id: "v2-child-thread", status: "running" },
     ]);
     expect(
       history.flatMap((event) =>
@@ -4754,6 +4759,11 @@ describe("Codex app-server provider", () => {
       {
         callId: "v2-spawn-history",
         status: "completed",
+        detail: { type: "sub_agent", log: "[Thought] Checking child state" },
+      },
+      {
+        callId: "v2-spawn-history",
+        status: "running",
         detail: { type: "sub_agent", log: "[Thought] Checking child state" },
       },
     ]);
