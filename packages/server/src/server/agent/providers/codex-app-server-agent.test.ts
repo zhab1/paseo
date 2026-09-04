@@ -2102,6 +2102,10 @@ describe("Codex app-server provider", () => {
             },
           })}\n`,
         );
+        appServer.startsCompaction({
+          threadId: "resumed-thread",
+          itemId: "resume-compaction",
+        });
         appServer.child.stdout.write(
           `${JSON.stringify({
             method: "item/reasoning/summaryTextDelta",
@@ -2121,6 +2125,26 @@ describe("Codex app-server provider", () => {
             },
           })}\n`,
         );
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/started",
+            params: {
+              threadId: "resumed-thread",
+              item: {
+                type: "commandExecution",
+                id: "resume-command",
+                status: "inProgress",
+                command: "printf ready",
+              },
+            },
+          })}\n`,
+        );
+        appServer.completesCommand({
+          threadId: "resumed-thread",
+          callId: "resume-command",
+          command: "printf ready",
+          output: "ready",
+        });
         return {};
       },
       "thread/read": () => ({
@@ -2146,6 +2170,14 @@ describe("Codex app-server provider", () => {
                 {
                   type: "contextCompaction",
                   id: "resume-compaction",
+                },
+                {
+                  type: "commandExecution",
+                  id: "resume-command",
+                  status: "completed",
+                  command: "printf ready",
+                  aggregatedOutput: "ready",
+                  exitCode: 0,
                 },
               ],
             },
@@ -2187,6 +2219,15 @@ describe("Codex app-server provider", () => {
       expect(
         events.filter((event) => event.type === "timeline" && event.item.type === "compaction"),
       ).toHaveLength(1);
+      expect(
+        events.flatMap((event) =>
+          event.type === "timeline" &&
+          event.item.type === "tool_call" &&
+          event.item.callId === "resume-command"
+            ? [event.item.status]
+            : [],
+        ),
+      ).toEqual(["completed"]);
       expect(
         events.filter(
           (event) =>

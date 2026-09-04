@@ -3358,6 +3358,19 @@ function timelineItemSnapshotKey(item: AgentTimelineItem): string | null {
   }
 }
 
+function snapshotSupersedesTimelineLifecycle(
+  bufferedItem: AgentTimelineItem,
+  snapshotItem: AgentTimelineItem,
+): boolean {
+  if (bufferedItem.type === "compaction" && snapshotItem.type === "compaction") {
+    return bufferedItem.status === "loading" && snapshotItem.status === "completed";
+  }
+  if (bufferedItem.type === "tool_call" && snapshotItem.type === "tool_call") {
+    return bufferedItem.status === "running" && snapshotItem.status !== "running";
+  }
+  return false;
+}
+
 interface DeliverToSubscribersOptions {
   event: AgentStreamEvent;
   recipients?: Iterable<CodexStreamSubscriber>;
@@ -3903,6 +3916,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const snapshotItem = key ? snapshotItems.get(key) : undefined;
       if (!snapshotItem || !key) return true;
       if (isDeepStrictEqual(event.item, snapshotItem)) return false;
+      if (snapshotSupersedesTimelineLifecycle(event.item, snapshotItem)) return false;
       if (
         (event.item.type === "assistant_message" || event.item.type === "reasoning") &&
         event.item.type === snapshotItem.type
