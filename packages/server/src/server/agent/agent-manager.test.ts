@@ -1268,6 +1268,61 @@ class McpCapableTestAgentClient extends TestAgentClient {
   }
 }
 
+class BufferedResumeSession extends TestAgentSession {
+  private bufferedEvents: AgentStreamEvent[];
+  private resumedTurnId: string | null;
+
+  constructor(config: AgentSessionConfig, events: AgentStreamEvent[]) {
+    super(config);
+    this.bufferedEvents = [...events];
+    this.resumedTurnId = events.find((event) => event.type === "turn_started")?.turnId ?? null;
+  }
+
+  override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    const unsubscribe = super.subscribe(callback);
+    queueMicrotask(() => this.flushPreSubscriptionEvents());
+    return unsubscribe;
+  }
+
+  flushPreSubscriptionEvents(): void {
+    const events = this.bufferedEvents;
+    this.bufferedEvents = [];
+    for (const event of events) {
+      this.pushEvent(event);
+    }
+  }
+
+  override async interrupt(): Promise<void> {
+    if (!this.resumedTurnId) return;
+    this.pushEvent({
+      type: "turn_canceled",
+      provider: this.provider,
+      turnId: this.resumedTurnId,
+      reason: "interrupted",
+    });
+    this.resumedTurnId = null;
+  }
+}
+
+class BufferedResumeClient extends TestAgentClient {
+  constructor(private readonly events: AgentStreamEvent[]) {
+    super();
+  }
+
+  override async resumeSession(
+    _handle: AgentPersistenceHandle,
+    config?: Partial<AgentSessionConfig>,
+  ): Promise<AgentSession> {
+    return new BufferedResumeSession(
+      {
+        provider: this.provider,
+        cwd: config?.cwd ?? process.cwd(),
+      },
+      this.events,
+    );
+  }
+}
+
 class ControlledInterruptSession extends TestAgentSession {
   interruptCalled = false;
 
@@ -3275,6 +3330,131 @@ test("resumeAgentFromPersistence drops stored internal paseo MCP when runtime in
 
   expect(client.resumeOverrides[0]?.mcpServers).toBeUndefined();
   expect(snapshot.config.mcpServers).toBeUndefined();
+});
+
+test("resumeAgentFromPersistence drains a buffered autonomous start before returning", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-start-"));
+  const agentId = "00000000-0000-4000-8000-000000000107";
+  const client = new BufferedResumeClient([
+    { type: "turn_started", provider: "codex", turnId: "goal-turn" },
+  ]);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+  const streamedEventTypes: string[] = [];
+  const lifecycleStates: ManagedAgent["lifecycle"][] = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "agent_stream" && event.agentId === agentId) {
+      streamedEventTypes.push(event.event.type);
+    }
+    if (event.type === "agent_state" && event.agent.id === agentId) {
+      lifecycleStates.push(event.agent.lifecycle);
+    }
+  });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence({
+      provider: "codex",
+      sessionId: "active-goal-session",
+      metadata: { cwd: workdir },
+    });
+
+    expect(snapshot.lifecycle).toBe("running");
+    expect(streamedEventTypes).toEqual(["turn_started"]);
+    expect(lifecycleStates).not.toContain("idle");
+    expect(lifecycleStates.at(-1)).toBe("running");
+    await expect(manager.runAgent(snapshot.id, "start another turn")).rejects.toThrow(
+      "already has an active run",
+    );
+  } finally {
+    unsubscribe();
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("replaceAgentRun interrupts a resumed autonomous turn before starting replacement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-replace-"));
+  const agentId = "00000000-0000-4000-8000-000000000109";
+  const manager = new AgentManager({
+    clients: {
+      codex: new BufferedResumeClient([
+        { type: "turn_started", provider: "codex", turnId: "goal-turn" },
+      ]),
+    },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence({
+      provider: "codex",
+      sessionId: "active-goal-session",
+      metadata: { cwd: workdir },
+    });
+
+    const replacement = await manager.replaceAgentRun(snapshot.id, "replacement prompt");
+    const events: AgentStreamEvent[] = [];
+    for await (const event of replacement) events.push(event);
+
+    expect(events.map((event) => event.type)).toEqual(["turn_started", "turn_completed"]);
+    expect(manager.getAgent(agentId)).toMatchObject({
+      lifecycle: "idle",
+      activeForegroundTurnId: null,
+    });
+  } finally {
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("resumeAgentFromPersistence replays a completed autonomous turn in order", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-complete-"));
+  const agentId = "00000000-0000-4000-8000-000000000108";
+  const client = new BufferedResumeClient([
+    { type: "turn_started", provider: "codex", turnId: "goal-turn" },
+    { type: "turn_completed", provider: "codex", turnId: "goal-turn" },
+  ]);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+  const streamedEventTypes: string[] = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "agent_stream" && event.agentId === agentId) {
+      streamedEventTypes.push(event.event.type);
+    }
+  });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence({
+      provider: "codex",
+      sessionId: "completed-goal-session",
+      metadata: { cwd: workdir },
+    });
+
+    expect(snapshot.lifecycle).toBe("idle");
+    expect(streamedEventTypes).toEqual(["turn_started", "turn_completed"]);
+    await expect(manager.runAgent(snapshot.id, "start the next turn")).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+  } finally {
+    unsubscribe();
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("createAgent preserves a user-provided paseo MCP config", async () => {
