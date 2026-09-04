@@ -3286,7 +3286,7 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
-      this.subscribeToSession(managed);
+      await this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
@@ -3300,8 +3300,6 @@ export class AgentManager {
       }
 
       await this.refreshSessionState(managed, { emit: false });
-      this.assertAgentRegistrationActive(managed);
-      await this.subscribeToSession(managed);
       this.assertAgentRegistrationActive(managed);
       managed.lifecycle = managed.activeTurnId ? "running" : "idle";
       this.touchUpdatedAt(managed);
