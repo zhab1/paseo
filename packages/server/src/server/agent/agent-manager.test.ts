@@ -1272,10 +1272,11 @@ class BufferedResumeSession extends TestAgentSession {
   private bufferedEvents: AgentStreamEvent[];
   private resumedTurnId: string | null;
 
-  constructor(config: AgentSessionConfig, events: AgentStreamEvent[]) {
+  constructor(config: AgentSessionConfig, events: AgentStreamEvent[], resumedTurnId?: string) {
     super(config);
     this.bufferedEvents = [...events];
-    this.resumedTurnId = events.find((event) => event.type === "turn_started")?.turnId ?? null;
+    this.resumedTurnId =
+      resumedTurnId ?? events.find((event) => event.type === "turn_started")?.turnId ?? null;
   }
 
   override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
@@ -3419,15 +3420,29 @@ test("replaceAgentRun interrupts a resumed autonomous turn before starting repla
 test("resumeAgentFromPersistence replays a completed autonomous turn in order", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-complete-"));
   const agentId = "00000000-0000-4000-8000-000000000108";
-  const client = new BufferedResumeClient([
-    { type: "turn_started", provider: "codex", turnId: "goal-turn" },
-    { type: "turn_completed", provider: "codex", turnId: "goal-turn" },
-  ]);
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new (class extends BufferedResumeSession {
+        override getActiveTurnId(): string | null {
+          return "goal-turn";
+        }
+      })(
+        { provider: "codex", cwd: config?.cwd ?? workdir },
+        [{ type: "turn_completed", provider: "codex", turnId: "goal-turn" }],
+        "goal-turn",
+      );
+    }
+  })();
+  const attentionReasons: string[] = [];
   const manager = new AgentManager({
     clients: { codex: client },
     registry: new AgentStorage(join(workdir, "agents"), logger),
     logger,
     idFactory: () => agentId,
+    onAgentAttention: ({ reason }) => attentionReasons.push(reason),
   });
   const streamedEventTypes: string[] = [];
   const unsubscribe = manager.subscribe((event) => {
@@ -3444,7 +3459,8 @@ test("resumeAgentFromPersistence replays a completed autonomous turn in order", 
     });
 
     expect(snapshot.lifecycle).toBe("idle");
-    expect(streamedEventTypes).toEqual(["turn_started", "turn_completed"]);
+    expect(streamedEventTypes).toEqual(["turn_completed"]);
+    expect(attentionReasons).toEqual(["finished"]);
     await expect(manager.runAgent(snapshot.id, "start the next turn")).resolves.toMatchObject({
       sessionId: expect.any(String),
     });

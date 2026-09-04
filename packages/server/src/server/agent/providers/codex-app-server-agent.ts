@@ -1652,7 +1652,8 @@ function mapCodexThreadReasoningItem(
   const summary = Array.isArray(normalizedItem.summary) ? normalizedItem.summary.join("\n") : "";
   const content = Array.isArray(normalizedItem.content) ? normalizedItem.content.join("\n") : "";
   const text = summary || content;
-  return text ? { type: "reasoning", text } : null;
+  const itemId = nonEmptyString(normalizedItem.id);
+  return text ? identifyCodexTimelineItem({ type: "reasoning", text }, itemId) : null;
 }
 
 function mapCodexThreadUserMessageItem(
@@ -3314,6 +3315,20 @@ interface ConsumedRootCompaction {
 }
 
 type CodexStreamSubscriber = (event: AgentStreamEvent) => void;
+const CODEX_TIMELINE_ITEM_ID = Symbol("codexTimelineItemId");
+type CodexIdentifiedTimelineItem = AgentTimelineItem & {
+  [CODEX_TIMELINE_ITEM_ID]?: string;
+};
+
+function identifyCodexTimelineItem(
+  item: AgentTimelineItem,
+  itemId: string | null | undefined,
+): AgentTimelineItem {
+  if (itemId) {
+    Object.defineProperty(item, CODEX_TIMELINE_ITEM_ID, { value: itemId });
+  }
+  return item;
+}
 
 interface BufferedCodexStreamEvent {
   event: AgentStreamEvent;
@@ -3327,6 +3342,10 @@ function timelineItemSnapshotKey(item: AgentTimelineItem): string | null {
       return item.messageId ? `${item.type}:${item.messageId}` : null;
     case "tool_call":
       return `tool_call:${item.callId}`;
+    case "reasoning": {
+      const itemId = (item as CodexIdentifiedTimelineItem)[CODEX_TIMELINE_ITEM_ID];
+      return itemId ? `reasoning:${itemId}` : null;
+    }
     case "plugin":
       return `plugin:${item.id}`;
     default:
@@ -3842,6 +3861,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         return readCodexThread(client, threadIdToRead);
       },
     });
+    const rootSnapshotBufferBoundary = this.preSubscriptionEvents?.length ?? 0;
     const { timeline, subAgentRoutes } = history;
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
@@ -3861,11 +3881,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.persistedHistory = timeline;
     this.historyPending = timeline.length > 0;
-    this.removeBufferedTimelineEventsCoveredByHistory();
+    this.removeBufferedTimelineEventsCoveredByHistory(rootSnapshotBufferBoundary);
   }
 
-  private removeBufferedTimelineEventsCoveredByHistory(): void {
-    if (!this.preSubscriptionEvents?.length) return;
+  private removeBufferedTimelineEventsCoveredByHistory(bufferBoundary: number): void {
+    if (!this.preSubscriptionEvents?.length || bufferBoundary <= 0) return;
     const snapshotKeys = new Set(
       this.persistedHistory.flatMap(({ item }) => {
         const key = timelineItemSnapshotKey(item);
@@ -3873,12 +3893,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       }),
     );
     if (snapshotKeys.size === 0) return;
-    const retained = this.preSubscriptionEvents.filter(({ event }) => {
+    const coveredEvents = this.preSubscriptionEvents.slice(0, bufferBoundary);
+    const retained = coveredEvents.filter(({ event }) => {
       if (event.type !== "timeline") return true;
       const key = timelineItemSnapshotKey(event.item);
       return !key || !snapshotKeys.has(key);
     });
-    this.preSubscriptionEvents.splice(0, this.preSubscriptionEvents.length, ...retained);
+    this.preSubscriptionEvents.splice(0, coveredEvents.length, ...retained);
   }
 
   private async loadPersistedSubAgentHistories(
@@ -3971,9 +3992,21 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private restoreActiveTurn(response: unknown): void {
     const turnId = readActiveCodexTurnId(response);
-    if (!turnId) return;
+    if (!turnId || this.hasBufferedTerminalForTurn(turnId)) return;
     this.currentTurnId = turnId;
     this.activeForegroundTurnId = turnId;
+  }
+
+  private hasBufferedTerminalForTurn(turnId: string): boolean {
+    return (
+      this.preSubscriptionEvents?.some(({ event }) => {
+        const terminal =
+          event.type === "turn_completed" ||
+          event.type === "turn_failed" ||
+          event.type === "turn_canceled";
+        return terminal && getAgentStreamEventTurnId(event) === turnId;
+      }) ?? false
+    );
   }
 
   private parseSlashCommandInput(text: string): { commandName: string; args?: string } | null {
@@ -6085,7 +6118,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitEvent({
         type: "timeline",
         provider: CODEX_PROVIDER,
-        item: { type: "reasoning", text: parsed.delta },
+        item: identifyCodexTimelineItem({ type: "reasoning", text: parsed.delta }, parsed.itemId),
       });
       return;
     }
@@ -6173,9 +6206,15 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_failed",
         provider: CODEX_PROVIDER,
         error: parsed.errorMessage ?? "Codex turn failed",
+        ...(parsed.turnId ? { turnId: parsed.turnId } : {}),
       });
     } else if (parsed.status === "interrupted") {
-      this.emitEvent({ type: "turn_canceled", provider: CODEX_PROVIDER, reason: "interrupted" });
+      this.emitEvent({
+        type: "turn_canceled",
+        provider: CODEX_PROVIDER,
+        reason: "interrupted",
+        ...(parsed.turnId ? { turnId: parsed.turnId } : {}),
+      });
     } else {
       if (this.planModeEnabled && this.latestPlanResult?.text) {
         this.emitSyntheticPlanApprovalRequest(this.latestPlanResult.text);
@@ -6184,6 +6223,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_completed",
         provider: CODEX_PROVIDER,
         usage: this.latestUsage,
+        ...(parsed.turnId ? { turnId: parsed.turnId } : {}),
       });
     }
     this.currentTurnId = null;
@@ -6659,7 +6699,10 @@ export class CodexAppServerAgentSession implements AgentSession {
           text: suffix,
           ...(timelineItem.messageId ? { messageId: timelineItem.messageId } : {}),
         }
-      : { type: timelineItem.type, text: suffix };
+      : identifyCodexTimelineItem(
+          { type: timelineItem.type, text: suffix },
+          (timelineItem as CodexIdentifiedTimelineItem)[CODEX_TIMELINE_ITEM_ID],
+        );
   }
 
   private applyBufferedDeltaTextToTimelineItem(

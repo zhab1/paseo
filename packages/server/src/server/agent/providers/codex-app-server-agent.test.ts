@@ -2085,6 +2085,16 @@ describe("Codex app-server provider", () => {
           itemId: "resume-message",
           text: "Continuing the active goal.",
         });
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/reasoning/summaryTextDelta",
+            params: {
+              threadId: "resumed-thread",
+              itemId: "resume-reasoning",
+              delta: "Checking recovery state.",
+            },
+          })}\n`,
+        );
         return {};
       },
       "thread/read": () => ({
@@ -2096,6 +2106,11 @@ describe("Codex app-server provider", () => {
                   type: "agentMessage",
                   id: "resume-message",
                   text: "Continuing the active goal.",
+                },
+                {
+                  type: "reasoning",
+                  id: "resume-reasoning",
+                  summary: ["Checking recovery state."],
                 },
               ],
             },
@@ -2126,10 +2141,105 @@ describe("Codex app-server provider", () => {
             event.item.messageId === "resume-message",
         ),
       ).toHaveLength(1);
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "reasoning" &&
+            event.item.text === "Checking recovery state.",
+        ),
+      ).toHaveLength(1);
       appServer.assertNoErrors();
     } finally {
       await session.close();
     }
+  });
+
+  test("preserves a same-item update emitted after the root history snapshot", async () => {
+    const session = createSession();
+    let releaseChildRead!: () => void;
+    const childRead = new Promise<unknown>((resolve) => {
+      releaseChildRead = () => resolve({ thread: { turns: [] } });
+    });
+    let childReadStarted!: () => void;
+    const childStarted = new Promise<void>((resolve) => {
+      childReadStarted = resolve;
+    });
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        if (method !== "thread/read") return {};
+        const threadId = (params as { threadId?: string }).threadId;
+        if (threadId === "history-child") {
+          childReadStarted();
+          return childRead;
+        }
+        return {
+          thread: {
+            turns: [
+              {
+                items: [
+                  { type: "agentMessage", id: "changing-message", text: "Before update" },
+                  {
+                    type: "subAgentActivity",
+                    id: "child-started",
+                    kind: "started",
+                    agentThreadId: "history-child",
+                    agentPath: "/root/history-child",
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }),
+    };
+
+    const loading = asInternals(session).loadPersistedHistory();
+    await childStarted;
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "test-thread",
+      itemId: "changing-message",
+      delta: "After snapshot",
+    });
+    releaseChildRead();
+    await loading;
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    session.flushPreSubscriptionEvents?.();
+    for await (const event of session.streamHistory()) events.push(event);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", messageId: "changing-message", text: "After snapshot" },
+      }),
+    );
+  });
+
+  test("does not restore an in-progress turn that completed during thread resume", async () => {
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => {
+        appServer.startsTurn({ threadId: "archived-thread-id", turnId: "stale-running-turn" });
+        appServer.completeTurn({ threadId: "archived-thread-id" });
+        return {
+          thread: {
+            id: "archived-thread-id",
+            turns: [{ id: "stale-running-turn", status: "inProgress", items: [] }],
+          },
+        };
+      },
+      "thread/read": () => ({ thread: { turns: [] } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+
+    const session = await provider.resumeSession(archivedThreadHandle());
+
+    expect(session.getActiveTurnId?.()).toBeNull();
+    await session.close();
+    appServer.assertNoErrors();
   });
 
   test("does not let a buffered autonomous completion settle the next direct run", async () => {
