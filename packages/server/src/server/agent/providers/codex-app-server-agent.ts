@@ -3892,11 +3892,24 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (key) snapshotItems.set(key, item);
     }
     if (snapshotItems.size === 0) return;
+    const snapshotCoveredTextByKey = new Map<string, string>();
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "timeline") return true;
       const key = timelineItemSnapshotKey(event.item);
       const snapshotItem = key ? snapshotItems.get(key) : undefined;
-      return !snapshotItem || !isDeepStrictEqual(event.item, snapshotItem);
+      if (!snapshotItem || !key) return true;
+      if (isDeepStrictEqual(event.item, snapshotItem)) return false;
+      if (
+        (event.item.type === "assistant_message" || event.item.type === "reasoning") &&
+        event.item.type === snapshotItem.type
+      ) {
+        const coveredText = (snapshotCoveredTextByKey.get(key) ?? "") + event.item.text;
+        if (snapshotItem.text.startsWith(coveredText)) {
+          snapshotCoveredTextByKey.set(key, coveredText);
+          return false;
+        }
+      }
+      return true;
     });
   }
 

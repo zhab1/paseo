@@ -2084,6 +2084,7 @@ describe("Codex app-server provider", () => {
           threadId: "resumed-thread",
           itemId: "resume-message",
           text: "Continuing the active goal.",
+          chunks: ["Continuing ", "the active goal."],
         });
         appServer.child.stdout.write(
           `${JSON.stringify({
@@ -2091,7 +2092,17 @@ describe("Codex app-server provider", () => {
             params: {
               threadId: "resumed-thread",
               itemId: "resume-reasoning",
-              delta: "Checking recovery state.",
+              delta: "Checking ",
+            },
+          })}\n`,
+        );
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/reasoning/summaryTextDelta",
+            params: {
+              threadId: "resumed-thread",
+              itemId: "resume-reasoning",
+              delta: "recovery state.",
             },
           })}\n`,
         );
