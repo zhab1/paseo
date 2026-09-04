@@ -2928,6 +2928,11 @@ export class AgentManager {
   ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    agent.session.flushPreSubscriptionEvents?.();
+    const hydrationTail = this.sessionEventTails.get(agentId);
+    if (hydrationTail) {
+      await hydrationTail;
+    }
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
@@ -3286,9 +3291,9 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
-      this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
+      this.subscribeToSession(managed);
       await this.refreshRuntimeInfo(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
       await this.persistSnapshot(managed, {
@@ -3301,7 +3306,9 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      if (managed.lifecycle !== "error") {
+        managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      }
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
