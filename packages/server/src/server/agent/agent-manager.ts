@@ -3286,9 +3286,9 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
-      this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
+      await this.subscribeToSession(managed);
       await this.refreshRuntimeInfo(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
       await this.persistSnapshot(managed, {
@@ -3301,7 +3301,9 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      if (managed.lifecycle !== "error") {
+        managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      }
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
@@ -3505,7 +3507,7 @@ export class AgentManager {
   private emitClosedAgent(agent: ManagedAgentClosed, options?: { persist?: boolean }): void {
     this.emitState(agent, options);
   }
-  private subscribeToSession(agent: ActiveManagedAgent): void {
+  private async subscribeToSession(agent: ActiveManagedAgent): Promise<void> {
     if (agent.unsubscribeSession) {
       return;
     }
@@ -3514,6 +3516,11 @@ export class AgentManager {
       this.enqueueSessionEvent(agentId, event);
     });
     agent.unsubscribeSession = unsubscribe;
+    agent.session.flushPreSubscriptionEvents?.();
+    const preSubscriptionTail = this.sessionEventTails.get(agentId);
+    if (preSubscriptionTail) {
+      await preSubscriptionTail;
+    }
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {

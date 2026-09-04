@@ -2024,6 +2024,265 @@ describe("Codex app-server provider", () => {
     appServer.assertNoErrors();
   });
 
+  test("replays an autonomous turn that starts while a resumed session connects", async () => {
+    let interruptParams: unknown;
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        appServer.startsTurn({ threadId: "resumed-thread", turnId: "goal-turn" });
+        return {};
+      },
+      "turn/interrupt": (params) => {
+        interruptParams = params;
+        appServer.completeTurn({ threadId: "resumed-thread" });
+        return {};
+      },
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ modeId: "full-access" }),
+      { sessionId: "resumed-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      await session.connect();
+
+      const events: AgentStreamEvent[] = [];
+      const turnStarted = new Promise<void>((resolve) => {
+        session.subscribe((event) => {
+          events.push(event);
+          if (event.type === "turn_started") {
+            resolve();
+          }
+        });
+      });
+      await turnStarted;
+
+      expect(events).toContainEqual({
+        type: "turn_started",
+        provider: "codex",
+        turnId: "goal-turn",
+      });
+      await session.startTurn("continue the active goal");
+      await session.interrupt();
+      expect(interruptParams).toEqual({
+        threadId: "resumed-thread",
+        turnId: "goal-turn",
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not replay resume-time items already covered by persisted history", async () => {
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        appServer.says({
+          threadId: "resumed-thread",
+          itemId: "resume-message",
+          text: "Continuing the active goal.",
+          chunks: ["Continuing ", "the active goal."],
+        });
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/reasoning/summaryTextDelta",
+            params: {
+              threadId: "resumed-thread",
+              itemId: "resume-reasoning",
+              delta: "Checking ",
+            },
+          })}\n`,
+        );
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/reasoning/summaryTextDelta",
+            params: {
+              threadId: "resumed-thread",
+              itemId: "resume-reasoning",
+              delta: "recovery state.",
+            },
+          })}\n`,
+        );
+        return {};
+      },
+      "thread/read": () => ({
+        thread: {
+          turns: [
+            {
+              items: [
+                {
+                  type: "agentMessage",
+                  id: "resume-message",
+                  text: "Continuing the active goal.",
+                },
+                {
+                  type: "reasoning",
+                  id: "resume-reasoning",
+                  summary: ["Checking recovery state."],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ modeId: "full-access" }),
+      { sessionId: "resumed-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      await session.connect();
+
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      session.flushPreSubscriptionEvents();
+      for await (const event of session.streamHistory()) events.push(event);
+
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "assistant_message" &&
+            event.item.messageId === "resume-message",
+        ),
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "reasoning" &&
+            event.item.text === "Checking recovery state.",
+        ),
+      ).toHaveLength(1);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("preserves a same-item update emitted after the root response is serialized", async () => {
+    const session = createSession();
+    const internals = asInternals(session);
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method !== "thread/read") return {};
+        return new Promise((resolve) => {
+          resolve({
+            thread: {
+              turns: [
+                {
+                  items: [{ type: "agentMessage", id: "changing-message", text: "Before update" }],
+                },
+              ],
+            },
+          });
+          internals.handleNotification("item/agentMessage/delta", {
+            threadId: "test-thread",
+            itemId: "changing-message",
+            delta: "After snapshot",
+          });
+        });
+      }),
+    };
+
+    await internals.loadPersistedHistory();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    session.flushPreSubscriptionEvents?.();
+    for await (const event of session.streamHistory()) events.push(event);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", messageId: "changing-message", text: "After snapshot" },
+      }),
+    );
+  });
+
+  test("does not restore an in-progress turn that completed during thread resume", async () => {
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => {
+        appServer.startsTurn({ threadId: "archived-thread-id", turnId: "stale-running-turn" });
+        appServer.completeTurn({ threadId: "archived-thread-id" });
+        return {
+          thread: {
+            id: "archived-thread-id",
+            turns: [{ id: "stale-running-turn", status: "inProgress", items: [] }],
+          },
+        };
+      },
+      "thread/read": () => ({ thread: { turns: [] } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+
+    const session = await provider.resumeSession(archivedThreadHandle());
+
+    expect(session.getActiveTurnId?.()).toBeNull();
+    await session.close();
+    appServer.assertNoErrors();
+  });
+
+  test("does not let a buffered autonomous completion settle the next direct run", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    const internals = asInternals(session);
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/loaded/list") {
+        return { data: ["test-thread"] };
+      }
+      if (method === "turn/start") {
+        internals.handleNotification("turn/started", {
+          threadId: "test-thread",
+          turn: { id: "next-native-turn" },
+        });
+        internals.handleNotification("item/completed", {
+          threadId: "test-thread",
+          item: {
+            id: "next-answer",
+            type: "agentMessage",
+            text: "Answer from the next turn",
+          },
+        });
+        internals.handleNotification("turn/completed", {
+          threadId: "test-thread",
+          turn: { status: "completed" },
+        });
+        return {};
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    session.client = { request };
+
+    internals.handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "completed-goal-turn" },
+    });
+    internals.handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { status: "completed" },
+    });
+
+    await expect(session.run("start a fresh turn")).resolves.toMatchObject({
+      finalText: "Answer from the next turn",
+      timeline: [
+        {
+          type: "assistant_message",
+          messageId: "next-answer",
+          text: "Answer from the next turn",
+        },
+      ],
+    });
+  });
+
   test("lists repo skills using WorkspaceGitService repo-root resolution", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "codex-skills-"));
     const cwd = path.join(tempDir, "repo", "packages", "app");
@@ -3875,6 +4134,25 @@ describe("Codex app-server provider", () => {
     appServer.assertNoErrors();
   });
 
+  test("acknowledges interruption after a native Codex turn completes", async () => {
+    const session = createSession();
+    const request = vi.fn(async () => ({}));
+    session.activeForegroundTurnId = null;
+    session.client = { request };
+
+    asInternals(session).handleNotification("turn/started", {
+      threadId: "test-thread",
+      turn: { id: "completed-turn" },
+    });
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { status: "completed" },
+    });
+
+    await expect(session.interrupt()).resolves.toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+  });
+
   test("never replaces the root identity with an early child thread start", () => {
     const session = createSession();
 
@@ -4893,9 +5171,75 @@ describe("Codex app-server provider", () => {
           threadId: "archived-thread-id",
           approvalPolicy: "on-request",
           sandbox: "workspace-write",
+          model: "gpt-5.4",
+          cwd: "/tmp/codex-question-test",
         },
       },
     ]);
+  });
+
+  test("applies the persisted access mode when resuming a Codex thread", async () => {
+    const session = createSession({ modeId: "full-access" });
+    session.currentThreadId = "full-access-thread";
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        if (method === "thread/loaded/list") {
+          return { data: [] };
+        }
+        return {};
+      }),
+    };
+
+    await asInternals(session).ensureThreadLoaded();
+
+    expect(requests).toContainEqual({
+      method: "thread/resume",
+      params: {
+        threadId: "full-access-thread",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        model: "gpt-5.4",
+        cwd: "/tmp/codex-question-test",
+      },
+    });
+  });
+
+  test("preserves auto-review and fast settings when resuming a Codex thread", async () => {
+    const session = createSession(
+      {
+        modeId: "auto-review",
+        featureValues: { fast_mode: true },
+      },
+      { autoReviewEnabled: true },
+    );
+    session.currentThreadId = "specialized-thread";
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        if (method === "thread/loaded/list") {
+          return { data: [] };
+        }
+        return {};
+      }),
+    };
+
+    await asInternals(session).ensureThreadLoaded();
+
+    expect(requests).toContainEqual({
+      method: "thread/resume",
+      params: {
+        threadId: "specialized-thread",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+        approvalsReviewer: "auto_review",
+        model: "gpt-5.4",
+        cwd: "/tmp/codex-question-test",
+        serviceTier: "fast",
+      },
+    });
   });
 
   test("appends blank-line spacing to /goal status messages", async () => {
