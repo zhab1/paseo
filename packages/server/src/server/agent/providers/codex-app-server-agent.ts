@@ -48,6 +48,7 @@ import { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { composeSystemPromptParts } from "../system-prompt.js";
@@ -3861,7 +3862,6 @@ export class CodexAppServerAgentSession implements AgentSession {
         return readCodexThread(client, threadIdToRead);
       },
     });
-    const rootSnapshotBufferBoundary = this.preSubscriptionEvents?.length ?? 0;
     const { timeline, subAgentRoutes } = history;
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
@@ -3881,25 +3881,23 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.persistedHistory = timeline;
     this.historyPending = timeline.length > 0;
-    this.removeBufferedTimelineEventsCoveredByHistory(rootSnapshotBufferBoundary);
+    this.removeBufferedTimelineEventsCoveredByHistory();
   }
 
-  private removeBufferedTimelineEventsCoveredByHistory(bufferBoundary: number): void {
-    if (!this.preSubscriptionEvents?.length || bufferBoundary <= 0) return;
-    const snapshotKeys = new Set(
-      this.persistedHistory.flatMap(({ item }) => {
-        const key = timelineItemSnapshotKey(item);
-        return key ? [key] : [];
-      }),
-    );
-    if (snapshotKeys.size === 0) return;
-    const coveredEvents = this.preSubscriptionEvents.slice(0, bufferBoundary);
-    const retained = coveredEvents.filter(({ event }) => {
+  private removeBufferedTimelineEventsCoveredByHistory(): void {
+    if (!this.preSubscriptionEvents?.length) return;
+    const snapshotItems = new Map<string, AgentTimelineItem>();
+    for (const { item } of this.persistedHistory) {
+      const key = timelineItemSnapshotKey(item);
+      if (key) snapshotItems.set(key, item);
+    }
+    if (snapshotItems.size === 0) return;
+    this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "timeline") return true;
       const key = timelineItemSnapshotKey(event.item);
-      return !key || !snapshotKeys.has(key);
+      const snapshotItem = key ? snapshotItems.get(key) : undefined;
+      return !snapshotItem || !isDeepStrictEqual(event.item, snapshotItem);
     });
-    this.preSubscriptionEvents.splice(0, coveredEvents.length, ...retained);
   }
 
   private async loadPersistedSubAgentHistories(

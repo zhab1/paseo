@@ -2155,54 +2155,32 @@ describe("Codex app-server provider", () => {
     }
   });
 
-  test("preserves a same-item update emitted after the root history snapshot", async () => {
+  test("preserves a same-item update emitted after the root response is serialized", async () => {
     const session = createSession();
-    let releaseChildRead!: () => void;
-    const childRead = new Promise<unknown>((resolve) => {
-      releaseChildRead = () => resolve({ thread: { turns: [] } });
-    });
-    let childReadStarted!: () => void;
-    const childStarted = new Promise<void>((resolve) => {
-      childReadStarted = resolve;
-    });
+    const internals = asInternals(session);
     session.client = {
-      request: vi.fn(async (method: string, params: unknown) => {
+      request: vi.fn(async (method: string) => {
         if (method !== "thread/read") return {};
-        const threadId = (params as { threadId?: string }).threadId;
-        if (threadId === "history-child") {
-          childReadStarted();
-          return childRead;
-        }
-        return {
-          thread: {
-            turns: [
-              {
-                items: [
-                  { type: "agentMessage", id: "changing-message", text: "Before update" },
-                  {
-                    type: "subAgentActivity",
-                    id: "child-started",
-                    kind: "started",
-                    agentThreadId: "history-child",
-                    agentPath: "/root/history-child",
-                  },
-                ],
-              },
-            ],
-          },
-        };
+        return new Promise((resolve) => {
+          resolve({
+            thread: {
+              turns: [
+                {
+                  items: [{ type: "agentMessage", id: "changing-message", text: "Before update" }],
+                },
+              ],
+            },
+          });
+          internals.handleNotification("item/agentMessage/delta", {
+            threadId: "test-thread",
+            itemId: "changing-message",
+            delta: "After snapshot",
+          });
+        });
       }),
     };
 
-    const loading = asInternals(session).loadPersistedHistory();
-    await childStarted;
-    asInternals(session).handleNotification("item/agentMessage/delta", {
-      threadId: "test-thread",
-      itemId: "changing-message",
-      delta: "After snapshot",
-    });
-    releaseChildRead();
-    await loading;
+    await internals.loadPersistedHistory();
 
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
