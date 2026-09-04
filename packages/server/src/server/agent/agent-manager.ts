@@ -3301,7 +3301,9 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      if (managed.lifecycle !== "error") {
+        managed.lifecycle = managed.activeTurnId ? "running" : "idle";
+      }
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);

@@ -2076,6 +2076,62 @@ describe("Codex app-server provider", () => {
     }
   });
 
+  test("does not replay resume-time items already covered by persisted history", async () => {
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        appServer.says({
+          threadId: "resumed-thread",
+          itemId: "resume-message",
+          text: "Continuing the active goal.",
+        });
+        return {};
+      },
+      "thread/read": () => ({
+        thread: {
+          turns: [
+            {
+              items: [
+                {
+                  type: "agentMessage",
+                  id: "resume-message",
+                  text: "Continuing the active goal.",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ modeId: "full-access" }),
+      { sessionId: "resumed-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      await session.connect();
+
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      session.flushPreSubscriptionEvents();
+      for await (const event of session.streamHistory()) events.push(event);
+
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "assistant_message" &&
+            event.item.messageId === "resume-message",
+        ),
+      ).toHaveLength(1);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("does not let a buffered autonomous completion settle the next direct run", async () => {
     const session = createSession();
     session.activeForegroundTurnId = null;

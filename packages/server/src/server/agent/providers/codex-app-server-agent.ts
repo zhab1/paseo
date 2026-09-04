@@ -3320,6 +3320,20 @@ interface BufferedCodexStreamEvent {
   recipients: Set<CodexStreamSubscriber> | null;
 }
 
+function timelineItemSnapshotKey(item: AgentTimelineItem): string | null {
+  switch (item.type) {
+    case "user_message":
+    case "assistant_message":
+      return item.messageId ? `${item.type}:${item.messageId}` : null;
+    case "tool_call":
+      return `tool_call:${item.callId}`;
+    case "plugin":
+      return `plugin:${item.id}`;
+    default:
+      return null;
+  }
+}
+
 interface DeliverToSubscribersOptions {
   event: AgentStreamEvent;
   recipients?: Iterable<CodexStreamSubscriber>;
@@ -3847,6 +3861,24 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.persistedHistory = timeline;
     this.historyPending = timeline.length > 0;
+    this.removeBufferedTimelineEventsCoveredByHistory();
+  }
+
+  private removeBufferedTimelineEventsCoveredByHistory(): void {
+    if (!this.preSubscriptionEvents?.length) return;
+    const snapshotKeys = new Set(
+      this.persistedHistory.flatMap(({ item }) => {
+        const key = timelineItemSnapshotKey(item);
+        return key ? [key] : [];
+      }),
+    );
+    if (snapshotKeys.size === 0) return;
+    const retained = this.preSubscriptionEvents.filter(({ event }) => {
+      if (event.type !== "timeline") return true;
+      const key = timelineItemSnapshotKey(event.item);
+      return !key || !snapshotKeys.has(key);
+    });
+    this.preSubscriptionEvents.splice(0, this.preSubscriptionEvents.length, ...retained);
   }
 
   private async loadPersistedSubAgentHistories(

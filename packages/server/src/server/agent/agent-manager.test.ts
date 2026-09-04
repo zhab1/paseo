@@ -3457,6 +3457,45 @@ test("resumeAgentFromPersistence replays a completed autonomous turn in order", 
   }
 });
 
+test("resumeAgentFromPersistence preserves a buffered autonomous failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-failure-"));
+  const agentId = "00000000-0000-4000-8000-000000000110";
+  const manager = new AgentManager({
+    clients: {
+      codex: new BufferedResumeClient([
+        { type: "turn_started", provider: "codex", turnId: "goal-turn" },
+        {
+          type: "turn_failed",
+          provider: "codex",
+          turnId: "goal-turn",
+          error: "Autonomous goal failed",
+        },
+      ]),
+    },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence({
+      provider: "codex",
+      sessionId: "failed-goal-session",
+      metadata: { cwd: workdir },
+    });
+
+    expect(snapshot).toMatchObject({
+      lifecycle: "error",
+      lastError: "Autonomous goal failed",
+    });
+  } finally {
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("createAgent preserves a user-provided paseo MCP config", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
