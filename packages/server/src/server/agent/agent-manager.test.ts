@@ -3379,6 +3379,61 @@ test("resumeAgentFromPersistence drains a buffered autonomous start before retur
   }
 });
 
+test("resumeAgentFromPersistence does not wait for events after the subscription boundary", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-boundary-"));
+  const agentId = "00000000-0000-4000-8000-000000000111";
+  const client = new BufferedResumeClient([
+    { type: "turn_started", provider: "codex", turnId: "goal-turn" },
+  ]);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+  const liveEventEntered = deferred<void>();
+  const releaseLiveEvent = deferred<void>();
+  const managerInternals = manager as unknown as {
+    dispatchSessionEvent: (agent: unknown, event: AgentStreamEvent) => Promise<void>;
+  };
+  const dispatchSessionEvent = managerInternals.dispatchSessionEvent.bind(manager);
+  managerInternals.dispatchSessionEvent = async (agent, event) => {
+    if (event.type === "turn_started" && event.turnId === "live-turn") {
+      liveEventEntered.resolve();
+      await releaseLiveEvent.promise;
+    }
+    await dispatchSessionEvent(agent, event);
+    if (event.type === "turn_started" && event.turnId === "goal-turn") {
+      const session = manager.getAgent(agentId)?.session;
+      if (session instanceof TestAgentSession) {
+        session.pushEvent({ type: "turn_started", provider: "codex", turnId: "live-turn" });
+      }
+    }
+  };
+
+  const resume = manager.resumeAgentFromPersistence({
+    provider: "codex",
+    sessionId: "active-goal-session",
+    metadata: { cwd: workdir },
+  });
+
+  try {
+    await liveEventEntered.promise;
+    const result = await Promise.race([
+      resume.then(() => "resumed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 250)),
+    ]);
+    expect(result).toBe("resumed");
+  } finally {
+    releaseLiveEvent.resolve();
+    await resume;
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun interrupts a resumed autonomous turn before starting replacement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-replace-"));
   const agentId = "00000000-0000-4000-8000-000000000109";

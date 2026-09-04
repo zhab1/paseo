@@ -3517,7 +3517,10 @@ export class AgentManager {
     });
     agent.unsubscribeSession = unsubscribe;
     agent.session.flushPreSubscriptionEvents?.();
-    await this.drainSessionEvents(agentId);
+    const preSubscriptionTail = this.sessionEventTails.get(agentId);
+    if (preSubscriptionTail) {
+      await preSubscriptionTail;
+    }
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
