@@ -2030,7 +2030,20 @@ describe("Codex app-server provider", () => {
     appServer = createFakeCodexAppServer({
       "thread/resume": () => {
         appServer.startsTurn({ threadId: "resumed-thread", turnId: "goal-turn" });
-        return {};
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "turn/completed",
+            params: {
+              threadId: "resumed-thread",
+              turn: { id: "stale-turn", status: "completed" },
+            },
+          })}\n`,
+        );
+        return {
+          thread: {
+            turns: [{ id: "stale-turn", status: "inProgress", items: [] }],
+          },
+        };
       },
       "turn/interrupt": (params) => {
         interruptParams = params;
@@ -2083,8 +2096,8 @@ describe("Codex app-server provider", () => {
         appServer.says({
           threadId: "resumed-thread",
           itemId: "resume-message",
-          text: "Continuing the active goal.",
-          chunks: ["Continuing ", "the active goal."],
+          text: "After",
+          chunks: ["Af", "ter"],
         });
         appServer.says({
           threadId: "resumed-thread",
@@ -2169,7 +2182,7 @@ describe("Codex app-server provider", () => {
                 {
                   type: "agentMessage",
                   id: "resume-message",
-                  text: "Continuing the active goal.",
+                  text: "BeforeAfter",
                 },
                 {
                   type: "reasoning",
@@ -2221,13 +2234,14 @@ describe("Codex app-server provider", () => {
       session.flushPreSubscriptionEvents();
 
       expect(
-        events.filter(
-          (event) =>
-            event.type === "timeline" &&
-            event.item.type === "assistant_message" &&
-            event.item.messageId === "resume-message",
+        events.flatMap((event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.messageId === "resume-message"
+            ? [event.item.text]
+            : [],
         ),
-      ).toHaveLength(1);
+      ).toEqual(["BeforeAfter"]);
       expect(
         events.filter(
           (event) =>
@@ -2353,7 +2367,7 @@ describe("Codex app-server provider", () => {
     ).toEqual(["Before update", "After snapshot", "After subscribe"]);
   });
 
-  test("retains an in-progress turn until its buffered completion is replayed", async () => {
+  test("does not restore a turn that completed while resume was in flight", async () => {
     let appServer: FakeCodexAppServer;
     appServer = createFakeCodexAppServer({
       "thread/loaded/list": () => ({ data: [] }),
@@ -2373,7 +2387,7 @@ describe("Codex app-server provider", () => {
 
     const session = await provider.resumeSession(archivedThreadHandle());
 
-    expect(session.getActiveTurnId?.()).toBe("stale-running-turn");
+    expect(session.getActiveTurnId?.()).toBeNull();
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
     for await (const event of session.streamHistory()) events.push(event);
@@ -4591,6 +4605,15 @@ describe("Codex app-server provider", () => {
                       id: `message-${threadId}`,
                       text: `History from ${threadId}`,
                     },
+                    ...(threadId === "v2-child-thread"
+                      ? [
+                          {
+                            type: "reasoning",
+                            id: "reasoning-v2-child-thread",
+                            summary: ["BeforeChecking child state"],
+                          },
+                        ]
+                      : []),
                   ],
                 },
               ],
@@ -4652,6 +4675,11 @@ describe("Codex app-server provider", () => {
     };
 
     await internals.loadPersistedHistory();
+    internals.handleNotification("item/reasoning/summaryTextDelta", {
+      threadId: "v2-child-thread",
+      itemId: "reasoning-v2-child-thread",
+      delta: "Checking child state",
+    });
 
     const history: AgentStreamEvent[] = [];
     session.subscribe((event) => history.push(event));
@@ -4695,6 +4723,14 @@ describe("Codex app-server provider", () => {
           text: "History from v2-child-thread",
         },
       },
+      {
+        type: "timeline",
+        id: "v2-child-thread",
+        item: {
+          type: "reasoning",
+          text: "BeforeChecking child state",
+        },
+      },
     ]);
     expect(
       history
@@ -4714,6 +4750,11 @@ describe("Codex app-server provider", () => {
         callId: "v2-spawn-history",
         status: "completed",
         detail: { type: "sub_agent", description: "v2-child" },
+      },
+      {
+        callId: "v2-spawn-history",
+        status: "completed",
+        detail: { type: "sub_agent", log: "[Thought] Checking child state" },
       },
     ]);
 
@@ -4747,7 +4788,10 @@ describe("Codex app-server provider", () => {
     );
     expect(liveToolCalls.at(-1)).toMatchObject({
       status: "running",
-      detail: { type: "sub_agent", log: "[Assistant] More findings after resume." },
+      detail: {
+        type: "sub_agent",
+        log: "[Assistant] More findings after resume.\n[Thought] Checking child state",
+      },
     });
 
     liveEvents.length = 0;

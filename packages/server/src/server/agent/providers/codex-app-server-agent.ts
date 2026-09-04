@@ -3389,34 +3389,84 @@ function snapshotSupersedesTimelineLifecycle(
   return false;
 }
 
-function snapshotCoversBufferedTimelineItem(
+function timelineReplayText(item: AgentTimelineItem): string | null {
+  if (item.type !== "assistant_message" && item.type !== "reasoning") return null;
+  return item.type === "assistant_message" &&
+    item.text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
+    ? item.text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
+    : item.text;
+}
+
+function snapshotCoveredBufferedPrefixLength(snapshotText: string, bufferedText: string): number {
+  if (!bufferedText) return 0;
+  const prefixLengths = Array.from({ length: bufferedText.length }, () => 0);
+  for (let index = 1; index < bufferedText.length; index += 1) {
+    let matched = prefixLengths[index - 1] ?? 0;
+    while (matched > 0 && bufferedText[index] !== bufferedText[matched]) {
+      matched = prefixLengths[matched - 1] ?? 0;
+    }
+    if (bufferedText[index] === bufferedText[matched]) matched += 1;
+    prefixLengths[index] = matched;
+  }
+  let matched = 0;
+  for (let index = 0; index < snapshotText.length; index += 1) {
+    const character = snapshotText[index];
+    while (matched > 0 && character !== bufferedText[matched]) {
+      matched = prefixLengths[matched - 1] ?? 0;
+    }
+    if (character === bufferedText[matched]) matched += 1;
+    if (matched === bufferedText.length && index < snapshotText.length - 1) {
+      matched = prefixLengths[matched - 1] ?? 0;
+    }
+  }
+  return matched;
+}
+
+function snapshotTextCoverage(
+  snapshotItems: Map<string, AgentTimelineItem>,
+  bufferedItems: Iterable<readonly [string, AgentTimelineItem]>,
+): Map<string, number> {
+  const bufferedTextByKey = new Map<string, string>();
+  for (const [key, item] of bufferedItems) {
+    const text = timelineReplayText(item);
+    if (text !== null) bufferedTextByKey.set(key, (bufferedTextByKey.get(key) ?? "") + text);
+  }
+  const coverage = new Map<string, number>();
+  for (const [key, bufferedText] of bufferedTextByKey) {
+    const snapshotItem = snapshotItems.get(key);
+    if (!snapshotItem) continue;
+    const snapshotText = timelineReplayText(snapshotItem);
+    if (snapshotText !== null) {
+      coverage.set(key, snapshotCoveredBufferedPrefixLength(snapshotText, bufferedText));
+    }
+  }
+  return coverage;
+}
+
+function reconcileBufferedTimelineItem(
   bufferedItem: AgentTimelineItem,
   snapshotItem: AgentTimelineItem,
   key: string,
-  coveredTextByKey: Map<string, string>,
-): boolean {
+  remainingTextCoverageByKey: Map<string, number>,
+): AgentTimelineItem | null {
   if (
     isDeepStrictEqual(bufferedItem, snapshotItem) ||
     snapshotSupersedesTimelineLifecycle(bufferedItem, snapshotItem)
   ) {
-    return true;
+    return null;
   }
-  if (
-    (bufferedItem.type === "assistant_message" || bufferedItem.type === "reasoning") &&
-    bufferedItem.type === snapshotItem.type
-  ) {
-    const text =
-      bufferedItem.type === "assistant_message" &&
-      bufferedItem.text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
-        ? bufferedItem.text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
-        : bufferedItem.text;
-    const coveredText = (coveredTextByKey.get(key) ?? "") + text;
-    if (snapshotItem.text.startsWith(coveredText)) {
-      coveredTextByKey.set(key, coveredText);
-      return true;
-    }
-  }
-  return false;
+  const text = timelineReplayText(bufferedItem);
+  const covered = Math.min(remainingTextCoverageByKey.get(key) ?? 0, text?.length ?? 0);
+  if (!text || covered === 0 || bufferedItem.type !== snapshotItem.type) return bufferedItem;
+  remainingTextCoverageByKey.set(key, (remainingTextCoverageByKey.get(key) ?? 0) - covered);
+  if (covered === text.length) return null;
+  const suffix = text.slice(covered);
+  return bufferedItem.type === "assistant_message"
+    ? { ...bufferedItem, text: suffix }
+    : identifyCodexTimelineItem(
+        { type: "reasoning", text: suffix },
+        (bufferedItem as CodexIdentifiedTimelineItem)[CODEX_TIMELINE_ITEM_ID],
+      );
 }
 
 interface DeliverToSubscribersOptions {
@@ -3439,6 +3489,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
+  private rootTurnRevision = 0;
   private pendingForegroundTurnIdentification: {
     foregroundTurnId: string;
     promise: Promise<string | null>;
@@ -3959,18 +4010,23 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (key) snapshotItems.set(key, item);
     }
     if (snapshotItems.size === 0) return;
-    const snapshotCoveredTextByKey = new Map<string, string>();
+    const textCoverage = snapshotTextCoverage(
+      snapshotItems,
+      this.preSubscriptionEvents.flatMap(({ event }) => {
+        if (event.type !== "timeline") return [];
+        const key = timelineItemSnapshotKey(event.item);
+        return key ? [[key, event.item] as const] : [];
+      }),
+    );
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "timeline") return true;
       const key = timelineItemSnapshotKey(event.item);
       const snapshotItem = key ? snapshotItems.get(key) : undefined;
       if (!snapshotItem || !key) return true;
-      return !snapshotCoversBufferedTimelineItem(
-        event.item,
-        snapshotItem,
-        key,
-        snapshotCoveredTextByKey,
-      );
+      const reconciled = reconcileBufferedTimelineItem(event.item, snapshotItem, key, textCoverage);
+      if (!reconciled) return false;
+      event.item = reconciled;
+      return true;
     });
   }
 
@@ -3991,7 +4047,14 @@ export class CodexAppServerAgentSession implements AgentSession {
         if (key) snapshotTimelineItems.set(`${event.id}:${key}`, event.item);
       }
     }
-    const snapshotCoveredTextByKey = new Map<string, string>();
+    const textCoverage = snapshotTextCoverage(
+      snapshotTimelineItems,
+      this.preSubscriptionEvents.flatMap(({ event }) => {
+        if (event.type !== "provider_subagent" || event.event.type !== "timeline") return [];
+        const itemKey = timelineItemSnapshotKey(event.event.item);
+        return itemKey ? [[`${event.event.id}:${itemKey}`, event.event.item] as const] : [];
+      }),
+    );
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
       if (event.type !== "provider_subagent") return true;
       const buffered = event.event;
@@ -4009,11 +4072,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       const itemKey = timelineItemSnapshotKey(buffered.item);
       const key = itemKey ? `${buffered.id}:${itemKey}` : null;
       const snapshot = key ? snapshotTimelineItems.get(key) : undefined;
-      return !(
-        key &&
-        snapshot &&
-        snapshotCoversBufferedTimelineItem(buffered.item, snapshot, key, snapshotCoveredTextByKey)
-      );
+      if (!key || !snapshot) return true;
+      const reconciled = reconcileBufferedTimelineItem(buffered.item, snapshot, key, textCoverage);
+      if (!reconciled) return false;
+      buffered.item = reconciled;
+      return true;
     });
   }
 
@@ -4064,15 +4127,26 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.serviceTier) {
       params.serviceTier = this.serviceTier;
     }
+    const resumeThread = async (): Promise<void> => {
+      const rootTurnRevision = this.rootTurnRevision;
+      const response = await this.client!.request("thread/resume", params);
+      this.rememberResolvedSandboxPolicy(response);
+      const responseTurnId = readActiveCodexTurnId(response);
+      if (
+        responseTurnId &&
+        this.rootTurnRevision === rootTurnRevision &&
+        (!this.currentTurnId || this.currentTurnId === responseTurnId)
+      ) {
+        this.restoreActiveTurn(response);
+      }
+    };
     try {
       const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
       if (ids.includes(this.currentThreadId)) {
         return;
       }
-      const response = await this.client.request("thread/resume", params);
-      this.rememberResolvedSandboxPolicy(response);
-      this.restoreActiveTurn(response);
+      await resumeThread();
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
@@ -4094,9 +4168,7 @@ export class CodexAppServerAgentSession implements AgentSession {
             throw unarchiveError;
           }
         }
-        const response = await this.client.request("thread/resume", params);
-        this.rememberResolvedSandboxPolicy(response);
-        this.restoreActiveTurn(response);
+        await resumeThread();
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
         return;
       }
@@ -5536,32 +5608,12 @@ export class CodexAppServerAgentSession implements AgentSession {
       const next = buffered[consumed++];
       if (next?.recipients) {
         this.deliverToSubscribers({ event: next.event, recipients: next.recipients });
-        this.clearRestoredTurnAfterBufferedTerminal(next.event);
       }
     }
     buffered.splice(0, consumed);
     if (buffered.length === 0) {
       this.preSubscriptionEvents = null;
     }
-  }
-
-  private clearRestoredTurnAfterBufferedTerminal(event: AgentStreamEvent): void {
-    if (
-      event.type !== "turn_completed" &&
-      event.type !== "turn_failed" &&
-      event.type !== "turn_canceled"
-    ) {
-      return;
-    }
-    const turnId = getAgentStreamEventTurnId(event);
-    if (turnId && turnId !== this.currentTurnId) {
-      return;
-    }
-    this.currentTurnId = null;
-    this.activeForegroundTurnId = null;
-    this.activeClientMessageId = null;
-    this.pendingForegroundTurnIdentification?.resolve(null);
-    this.pendingForegroundTurnIdentification = null;
   }
 
   private deliverToSubscribers({
@@ -6234,10 +6286,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       const subAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
       if (subAgentCallId) {
         if (parsed.threadId) {
-          this.emitProviderSubagentTimeline(parsed.threadId, {
-            type: "reasoning",
-            text: parsed.delta,
-          });
+          this.emitProviderSubagentTimeline(
+            parsed.threadId,
+            identifyCodexTimelineItem({ type: "reasoning", text: parsed.delta }, parsed.itemId),
+          );
         }
         this.upsertSubAgentChildItem(subAgentCallId, parsed.itemId, {
           type: "reasoning",
@@ -6294,6 +6346,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     const previousTurnId = this.currentTurnId;
     if (previousTurnId === parsed.turnId) return;
+    this.rootTurnRevision += 1;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
     if (
       !pendingIdentification &&
@@ -6330,6 +6383,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
+    this.rootTurnRevision += 1;
     this.pendingInterruptRollover?.(null);
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
