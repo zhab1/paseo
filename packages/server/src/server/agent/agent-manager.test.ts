@@ -3514,8 +3514,9 @@ test("resumeAgentFromPersistence replays a completed autonomous turn in order", 
       sessionId: "completed-goal-session",
       metadata: { cwd: workdir },
     });
-    await manager.hydrateTimelineFromProvider(snapshot.id);
+    const hydrated = await manager.hydrateTimelineFromProvider(snapshot.id);
 
+    expect(hydrated.lifecycle).toBe("idle");
     expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
     expect(streamedEventTypes).toEqual(["turn_completed"]);
     expect(attentionReasons).toEqual(["finished"]);
@@ -3557,8 +3558,12 @@ test("resumeAgentFromPersistence preserves a buffered autonomous failure", async
       sessionId: "failed-goal-session",
       metadata: { cwd: workdir },
     });
-    await manager.hydrateTimelineFromProvider(snapshot.id);
+    const hydrated = await manager.hydrateTimelineFromProvider(snapshot.id);
 
+    expect(hydrated).toMatchObject({
+      lifecycle: "error",
+      lastError: "Autonomous goal failed",
+    });
     expect(manager.getAgent(snapshot.id)).toMatchObject({
       lifecycle: "error",
       lastError: "Autonomous goal failed",

@@ -2145,6 +2145,20 @@ describe("Codex app-server provider", () => {
           command: "printf ready",
           output: "ready",
         });
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/completed",
+            params: {
+              threadId: "resumed-thread",
+              item: {
+                type: "imageGeneration",
+                id: "resume-image",
+                status: "completed",
+                savedPath: "/tmp/resume-image.png",
+              },
+            },
+          })}\n`,
+        );
         return {};
       },
       "thread/read": () => ({
@@ -2178,6 +2192,12 @@ describe("Codex app-server provider", () => {
                   command: "printf ready",
                   aggregatedOutput: "ready",
                   exitCode: 0,
+                },
+                {
+                  type: "imageGeneration",
+                  id: "resume-image",
+                  status: "completed",
+                  savedPath: "/tmp/resume-image.png",
                 },
               ],
             },
@@ -2232,6 +2252,14 @@ describe("Codex app-server provider", () => {
         events.filter(
           (event) =>
             event.type === "timeline" &&
+            event.item.type === "assistant_message" &&
+            event.item.messageId === "resume-image",
+        ),
+      ).toHaveLength(1);
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
             event.item.type === "reasoning" &&
             event.item.text === "Checking recovery state.",
         ),
@@ -2240,6 +2268,42 @@ describe("Codex app-server provider", () => {
     } finally {
       await session.close();
     }
+  });
+
+  test("keeps resume-time items when provider history is not consumed", async () => {
+    const session = createSession();
+    const internals = asInternals(session);
+    session.client = {
+      request: vi.fn(async () => {
+        internals.handleNotification("item/completed", {
+          threadId: "test-thread",
+          item: { type: "agentMessage", id: "unconsumed-message", text: "New output" },
+        });
+        return {
+          thread: {
+            turns: [
+              {
+                items: [{ type: "agentMessage", id: "unconsumed-message", text: "New output" }],
+              },
+            ],
+          },
+        };
+      }),
+    };
+
+    await internals.loadPersistedHistory();
+
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    session.flushPreSubscriptionEvents?.();
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.messageId === "unconsumed-message",
+      ),
+    ).toHaveLength(1);
   });
 
   test("preserves a same-item update emitted after the root response is serialized", async () => {
@@ -4509,6 +4573,7 @@ describe("Codex app-server provider", () => {
 
   test("loads mixed legacy and MultiAgentV2 sub-agent history", async () => {
     const session = createSession();
+    const internals = asInternals(session);
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
         if (method !== "thread/read") {
@@ -4532,6 +4597,24 @@ describe("Codex app-server provider", () => {
             },
           };
         }
+        internals.handleNotification("item/completed", {
+          threadId: "test-thread",
+          item: {
+            type: "subAgentActivity",
+            id: "v2-spawn-history",
+            kind: "started",
+            agentThreadId: "v2-child-thread",
+            agentPath: "/root/v2-child",
+          },
+        });
+        internals.handleNotification("item/completed", {
+          threadId: "v2-child-thread",
+          item: {
+            type: "agentMessage",
+            id: "message-v2-child-thread",
+            text: "History from v2-child-thread",
+          },
+        });
         return {
           thread: {
             turns: [
@@ -4568,12 +4651,14 @@ describe("Codex app-server provider", () => {
       }),
     };
 
-    await asInternals(session).loadPersistedHistory();
+    await internals.loadPersistedHistory();
 
     const history: AgentStreamEvent[] = [];
+    session.subscribe((event) => history.push(event));
     for await (const event of session.streamHistory()) {
       history.push(event);
     }
+    session.flushPreSubscriptionEvents?.();
     expect(
       history.flatMap((event) =>
         event.type === "provider_subagent" && event.event.type === "upsert" ? [event.event] : [],
@@ -5864,6 +5949,7 @@ describe("Codex app-server provider", () => {
         turnId: "test-turn",
         item: {
           type: "assistant_message",
+          messageId: "image-view-1",
           text: "![Image](file:///tmp/paseo%20image.png)",
         },
       },
@@ -5896,6 +5982,7 @@ describe("Codex app-server provider", () => {
           turnId: "test-turn",
           item: {
             type: "assistant_message",
+            messageId: `image-generation-${_fieldName}`,
             text: `![Image](${expectedPath})`,
           },
         },
@@ -6038,7 +6125,10 @@ describe("Codex app-server provider", () => {
           type: "timeline",
           provider: "codex",
           turnId,
-          item: expect.objectContaining({ type: "assistant_message" }),
+          item: expect.objectContaining({
+            type: "assistant_message",
+            messageId: "mcp-browser-screenshot:image:0",
+          }),
         },
       ]);
       const imageEvent = timelineEvents[1];

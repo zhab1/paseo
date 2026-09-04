@@ -1838,26 +1838,40 @@ function codexImageOutputFromResult(result: unknown): ProviderImageOutput | null
   };
 }
 
+function identifyCodexImageTimelineItem(
+  item: AgentTimelineItem | null,
+  messageId: string | null | undefined,
+): AgentTimelineItem | null {
+  return item?.type === "assistant_message" && messageId ? { ...item, messageId } : item;
+}
+
 function mapCodexThreadImageItem(
   normalizedType: string,
   normalizedItem: Record<string, unknown>,
 ): AgentTimelineItem | null {
+  const messageId = nonEmptyString(normalizedItem.id);
   if (normalizedType === "imageView") {
-    return renderProviderImageOutputAsAssistantMarkdown({
-      path: firstStringField(normalizedItem, ["path"]),
-    });
+    return identifyCodexImageTimelineItem(
+      renderProviderImageOutputAsAssistantMarkdown({
+        path: firstStringField(normalizedItem, ["path"]),
+      }),
+      messageId,
+    );
   }
 
   const savedPath = firstStringField(normalizedItem, ["savedPath", "saved_path"]);
   const result = codexImageOutputFromResult(normalizedItem.result);
-  return renderProviderImageOutputAsAssistantMarkdown(
-    {
-      path: savedPath ?? result?.path ?? null,
-      url: result?.url ?? null,
-      data: result?.data ?? null,
-      mimeType: result?.mimeType ?? null,
-    },
-    { materialize: materializeProviderImage },
+  return identifyCodexImageTimelineItem(
+    renderProviderImageOutputAsAssistantMarkdown(
+      {
+        path: savedPath ?? result?.path ?? null,
+        url: result?.url ?? null,
+        data: result?.data ?? null,
+        mimeType: result?.mimeType ?? null,
+      },
+      { materialize: materializeProviderImage },
+    ),
+    messageId,
   );
 }
 
@@ -1922,11 +1936,15 @@ function mcpToolResultImagesToTimeline(item: unknown): AgentTimelineItem[] {
   }
 
   const { images } = splitCodexMcpToolResultImages(itemRecord.result);
+  const itemId = nonEmptyString(itemRecord.id);
   return images
-    .map((image) =>
-      renderProviderImageOutputAsAssistantMarkdown(image, {
-        materialize: materializeProviderImage,
-      }),
+    .map((image, index) =>
+      identifyCodexImageTimelineItem(
+        renderProviderImageOutputAsAssistantMarkdown(image, {
+          materialize: materializeProviderImage,
+        }),
+        itemId ? `${itemId}:image:${index}` : null,
+      ),
     )
     .filter((timelineItem): timelineItem is AgentTimelineItem => timelineItem !== null);
 }
@@ -3371,6 +3389,36 @@ function snapshotSupersedesTimelineLifecycle(
   return false;
 }
 
+function snapshotCoversBufferedTimelineItem(
+  bufferedItem: AgentTimelineItem,
+  snapshotItem: AgentTimelineItem,
+  key: string,
+  coveredTextByKey: Map<string, string>,
+): boolean {
+  if (
+    isDeepStrictEqual(bufferedItem, snapshotItem) ||
+    snapshotSupersedesTimelineLifecycle(bufferedItem, snapshotItem)
+  ) {
+    return true;
+  }
+  if (
+    (bufferedItem.type === "assistant_message" || bufferedItem.type === "reasoning") &&
+    bufferedItem.type === snapshotItem.type
+  ) {
+    const text =
+      bufferedItem.type === "assistant_message" &&
+      bufferedItem.text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
+        ? bufferedItem.text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
+        : bufferedItem.text;
+    const coveredText = (coveredTextByKey.get(key) ?? "") + text;
+    if (snapshotItem.text.startsWith(coveredText)) {
+      coveredTextByKey.set(key, coveredText);
+      return true;
+    }
+  }
+  return false;
+}
+
 interface DeliverToSubscribersOptions {
   event: AgentStreamEvent;
   recipients?: Iterable<CodexStreamSubscriber>;
@@ -3416,7 +3464,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   private historyPending = false;
   private persistedHistory: PersistedTimelineEntry[] = [];
   private loadingPersistedHistory = false;
-  private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
+  private persistedProviderSubagentEvents: Extract<
+    AgentStreamEvent,
+    { type: "provider_subagent" }
+  >[] = [];
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private mcpElicitationPermissionIds = new Map<number, string>();
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
@@ -3897,8 +3948,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
     }
     this.persistedHistory = timeline;
-    this.historyPending = timeline.length > 0;
-    this.removeBufferedTimelineEventsCoveredByHistory();
+    this.historyPending = timeline.length > 0 || this.persistedProviderSubagentEvents.length > 0;
   }
 
   private removeBufferedTimelineEventsCoveredByHistory(): void {
@@ -3915,24 +3965,55 @@ export class CodexAppServerAgentSession implements AgentSession {
       const key = timelineItemSnapshotKey(event.item);
       const snapshotItem = key ? snapshotItems.get(key) : undefined;
       if (!snapshotItem || !key) return true;
-      if (isDeepStrictEqual(event.item, snapshotItem)) return false;
-      if (snapshotSupersedesTimelineLifecycle(event.item, snapshotItem)) return false;
-      if (
-        (event.item.type === "assistant_message" || event.item.type === "reasoning") &&
-        event.item.type === snapshotItem.type
-      ) {
-        const eventText =
-          event.item.type === "assistant_message" &&
-          event.item.text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
-            ? event.item.text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
-            : event.item.text;
-        const coveredText = (snapshotCoveredTextByKey.get(key) ?? "") + eventText;
-        if (snapshotItem.text.startsWith(coveredText)) {
-          snapshotCoveredTextByKey.set(key, coveredText);
-          return false;
-        }
+      return !snapshotCoversBufferedTimelineItem(
+        event.item,
+        snapshotItem,
+        key,
+        snapshotCoveredTextByKey,
+      );
+    });
+  }
+
+  private removeBufferedProviderSubagentEventsCoveredByHistory(): void {
+    if (!this.preSubscriptionEvents?.length || this.persistedProviderSubagentEvents.length === 0) {
+      return;
+    }
+    const snapshotUpserts = new Map<
+      string,
+      Extract<AgentStreamEvent, { type: "provider_subagent" }>["event"]
+    >();
+    const snapshotTimelineItems = new Map<string, AgentTimelineItem>();
+    for (const { event } of this.persistedProviderSubagentEvents) {
+      if (event.type === "upsert") {
+        snapshotUpserts.set(event.id, event);
+      } else if (event.type === "timeline") {
+        const key = timelineItemSnapshotKey(event.item);
+        if (key) snapshotTimelineItems.set(`${event.id}:${key}`, event.item);
       }
-      return true;
+    }
+    const snapshotCoveredTextByKey = new Map<string, string>();
+    this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
+      if (event.type !== "provider_subagent") return true;
+      const buffered = event.event;
+      if (buffered.type === "upsert") {
+        const snapshot = snapshotUpserts.get(buffered.id);
+        if (!snapshot || snapshot.type !== "upsert") return true;
+        return !(
+          isDeepStrictEqual(buffered, snapshot) ||
+          (buffered.status === "running" &&
+            snapshot.status !== undefined &&
+            snapshot.status !== "running")
+        );
+      }
+      if (buffered.type !== "timeline") return true;
+      const itemKey = timelineItemSnapshotKey(buffered.item);
+      const key = itemKey ? `${buffered.id}:${itemKey}` : null;
+      const snapshot = key ? snapshotTimelineItems.get(key) : undefined;
+      return !(
+        key &&
+        snapshot &&
+        snapshotCoversBufferedTimelineItem(buffered.item, snapshot, key, snapshotCoveredTextByKey)
+      );
     });
   }
 
@@ -4496,6 +4577,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   flushPreSubscriptionEvents(): void {
+    this.persistedHistory = [];
+    this.persistedProviderSubagentEvents = [];
+    this.historyPending = false;
     this.replayPreSubscriptionEvents();
   }
 
@@ -4506,6 +4590,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     ) {
       return;
     }
+    this.removeBufferedTimelineEventsCoveredByHistory();
+    this.removeBufferedProviderSubagentEventsCoveredByHistory();
     const history = this.persistedHistory;
     const providerSubagents = this.persistedProviderSubagentEvents;
     this.persistedHistory = [];

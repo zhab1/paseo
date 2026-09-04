@@ -2925,7 +2925,7 @@ export class AgentManager {
   async hydrateTimelineFromProvider(
     agentId: string,
     options?: HydrateTimelineOptions,
-  ): Promise<void> {
+  ): Promise<ManagedAgent> {
     const agent = this.requireSessionAgent(agentId);
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
     agent.session.flushPreSubscriptionEvents?.();
@@ -2933,6 +2933,7 @@ export class AgentManager {
     if (hydrationTail) {
       await hydrationTail;
     }
+    return { ...this.requireSessionAgent(agentId) };
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
