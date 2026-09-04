@@ -2404,6 +2404,38 @@ describe("Codex app-server provider", () => {
     appServer.assertNoErrors();
   });
 
+  test("restores an active turn when an older turn completes during resume", async () => {
+    let appServer: FakeCodexAppServer;
+    appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/resume": () => {
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "turn/completed",
+            params: {
+              threadId: "archived-thread-id",
+              turn: { id: "older-completed-turn", status: "completed" },
+            },
+          })}\n`,
+        );
+        return {
+          thread: {
+            id: "archived-thread-id",
+            turns: [{ id: "native-running-turn", status: "inProgress", items: [] }],
+          },
+        };
+      },
+      "thread/read": () => ({ thread: { turns: [] } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+
+    const session = await provider.resumeSession(archivedThreadHandle());
+
+    expect(session.getActiveTurnId?.()).toBe("native-running-turn");
+    await session.close();
+    appServer.assertNoErrors();
+  });
+
   test("does not let a buffered autonomous completion settle the next direct run", async () => {
     const session = createSession();
     session.activeForegroundTurnId = null;
@@ -4666,6 +4698,13 @@ describe("Codex app-server provider", () => {
                     agentThreadId: "v2-child-thread",
                     agentPath: "/root/v2-child",
                   },
+                  {
+                    type: "subAgentActivity",
+                    id: "v2-spawn-completed-history",
+                    kind: "started",
+                    agentThreadId: "v2-completed-child-thread",
+                    agentPath: "/root/v2-completed-child",
+                  },
                 ],
               },
             ],
@@ -4683,6 +4722,14 @@ describe("Codex app-server provider", () => {
     internals.handleNotification("turn/started", {
       threadId: "v2-child-thread",
       turn: { id: "v2-child-reopened-during-resume" },
+    });
+    internals.handleNotification("turn/started", {
+      threadId: "v2-completed-child-thread",
+      turn: { id: "v2-child-completed-during-resume" },
+    });
+    internals.handleNotification("turn/completed", {
+      threadId: "v2-completed-child-thread",
+      turn: { id: "v2-child-completed-during-resume", status: "completed" },
     });
 
     const history: AgentStreamEvent[] = [];
@@ -4703,6 +4750,7 @@ describe("Codex app-server provider", () => {
         title: "Sentinel child",
       },
       { type: "upsert", id: "v2-child-thread", status: "completed" },
+      { type: "upsert", id: "v2-completed-child-thread", status: "completed" },
       { type: "upsert", id: "v2-child-thread", status: "running" },
     ]);
     expect(
@@ -4736,6 +4784,15 @@ describe("Codex app-server provider", () => {
           text: "BeforeChecking child state",
         },
       },
+      {
+        type: "timeline",
+        id: "v2-completed-child-thread",
+        item: {
+          type: "assistant_message",
+          messageId: "message-v2-completed-child-thread",
+          text: "History from v2-completed-child-thread",
+        },
+      },
     ]);
     expect(
       history
@@ -4755,6 +4812,11 @@ describe("Codex app-server provider", () => {
         callId: "v2-spawn-history",
         status: "completed",
         detail: { type: "sub_agent", description: "v2-child" },
+      },
+      {
+        callId: "v2-spawn-completed-history",
+        status: "completed",
+        detail: { type: "sub_agent", description: "v2-completed-child" },
       },
       {
         callId: "v2-spawn-history",

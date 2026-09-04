@@ -3489,7 +3489,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
-  private rootTurnRevision = 0;
+  private resumeRootTurnEvents: Array<{
+    kind: "started" | "completed";
+    turnId: string | null;
+  }> | null = null;
   private pendingForegroundTurnIdentification: {
     foregroundTurnId: string;
     promise: Promise<string | null>;
@@ -4020,15 +4023,14 @@ export class CodexAppServerAgentSession implements AgentSession {
         return key ? [[key, event.item] as const] : [];
       }),
     );
-    const latestReopenByCallId = new Map<string, AgentTimelineItem>();
+    const latestLifecycleByCallId = new Map<string, AgentTimelineItem>();
     for (const { event } of this.preSubscriptionEvents) {
       if (
         event.type === "timeline" &&
         event.item.type === "tool_call" &&
-        event.item.status === "running" &&
         this.resumeReopenedSubAgentCallIds.has(event.item.callId)
       ) {
-        latestReopenByCallId.set(event.item.callId, event.item);
+        latestLifecycleByCallId.set(event.item.callId, event.item);
       }
     }
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
@@ -4041,7 +4043,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         event.item.status === "running" &&
         this.resumeReopenedSubAgentCallIds.has(event.item.callId)
       ) {
-        return latestReopenByCallId.get(event.item.callId) === event.item;
+        return latestLifecycleByCallId.get(event.item.callId) === event.item;
       }
       const reconciled = reconcileBufferedTimelineItem(event.item, snapshotItem, key, textCoverage);
       if (!reconciled) return false;
@@ -4075,16 +4077,15 @@ export class CodexAppServerAgentSession implements AgentSession {
         return itemKey ? [[`${event.event.id}:${itemKey}`, event.event.item] as const] : [];
       }),
     );
-    const latestReopenBySubAgentId = new Map<string, AgentStreamEvent>();
+    const latestLifecycleBySubAgentId = new Map<string, AgentStreamEvent>();
     for (const buffered of this.preSubscriptionEvents) {
       const event = buffered.event;
       if (
         event.type === "provider_subagent" &&
         event.event.type === "upsert" &&
-        event.event.status === "running" &&
         this.resumeReopenedSubAgentIds.has(event.event.id)
       ) {
-        latestReopenBySubAgentId.set(event.event.id, event);
+        latestLifecycleBySubAgentId.set(event.event.id, event);
       }
     }
     this.preSubscriptionEvents = this.preSubscriptionEvents.filter(({ event }) => {
@@ -4094,7 +4095,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         const snapshot = snapshotUpserts.get(buffered.id);
         if (!snapshot || snapshot.type !== "upsert") return true;
         if (buffered.status === "running" && this.resumeReopenedSubAgentIds.has(buffered.id)) {
-          return latestReopenBySubAgentId.get(buffered.id) === event;
+          return latestLifecycleBySubAgentId.get(buffered.id) === event;
         }
         return !(
           isDeepStrictEqual(buffered, snapshot) ||
@@ -4163,13 +4164,26 @@ export class CodexAppServerAgentSession implements AgentSession {
       params.serviceTier = this.serviceTier;
     }
     const resumeThread = async (): Promise<void> => {
-      const rootTurnRevision = this.rootTurnRevision;
-      const response = await this.client!.request("thread/resume", params);
+      const observedTurnEvents: NonNullable<typeof this.resumeRootTurnEvents> = [];
+      this.resumeRootTurnEvents = observedTurnEvents;
+      let response: unknown;
+      try {
+        response = await this.client!.request("thread/resume", params);
+      } finally {
+        if (this.resumeRootTurnEvents === observedTurnEvents) {
+          this.resumeRootTurnEvents = null;
+        }
+      }
       this.rememberResolvedSandboxPolicy(response);
       const responseTurnId = readActiveCodexTurnId(response);
+      const responseWasSuperseded = observedTurnEvents.some(
+        (event) =>
+          (event.kind === "started" && event.turnId !== responseTurnId) ||
+          (event.kind === "completed" && (!event.turnId || event.turnId === responseTurnId)),
+      );
       if (
         responseTurnId &&
-        this.rootTurnRevision === rootTurnRevision &&
+        !responseWasSuperseded &&
         (!this.currentTurnId || this.currentTurnId === responseTurnId)
       ) {
         this.restoreActiveTurn(response);
@@ -6387,7 +6401,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     const previousTurnId = this.currentTurnId;
     if (previousTurnId === parsed.turnId) return;
-    this.rootTurnRevision += 1;
+    this.resumeRootTurnEvents?.push({ kind: "started", turnId: parsed.turnId });
     const pendingIdentification = this.pendingForegroundTurnIdentification;
     if (
       !pendingIdentification &&
@@ -6424,7 +6438,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
-    this.rootTurnRevision += 1;
+    this.resumeRootTurnEvents?.push({ kind: "completed", turnId: parsed.turnId ?? null });
     this.pendingInterruptRollover?.(null);
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
