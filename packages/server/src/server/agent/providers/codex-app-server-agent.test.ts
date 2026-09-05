@@ -3887,6 +3887,34 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("recovers a missing autonomous turn id when interrupting", async () => {
+    const session = createSession();
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.activeForegroundTurnId = null;
+    session.currentTurnId = null;
+    session.client = {
+      request: async (method, params) => {
+        requests.push({ method, params });
+        return method === "thread/read"
+          ? { thread: { turns: [{ id: "recovered-turn", status: "inProgress" }] } }
+          : {};
+      },
+    };
+
+    const interrupt = session.interrupt();
+    await Promise.resolve();
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { id: "recovered-turn", status: "interrupted", items: [] },
+    });
+    await interrupt;
+
+    expect(requests).toEqual([
+      { method: "thread/read", params: { threadId: "test-thread", includeTurns: true } },
+      { method: "turn/interrupt", params: { threadId: "test-thread", turnId: "recovered-turn" } },
+    ]);
+  });
+
   test("tracks Codex rollovers across interrupt mismatches and acknowledgements", async () => {
     const interruptedTurns: string[] = [];
     let bInterrupts = 0;

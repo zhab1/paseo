@@ -4852,6 +4852,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       throw new Error("Cannot interrupt Codex before the active thread is initialized");
     }
+    if (!this.currentTurnId && !this.pendingForegroundTurnIdentification) {
+      const recoveredTurnId = readActiveCodexTurnId(
+        await readCodexThread(this.client, this.currentThreadId),
+      );
+      this.currentTurnId = recoveredTurnId;
+      this.activeForegroundTurnId = recoveredTurnId;
+    }
     let turnId = this.currentTurnId;
     const foregroundTurnId = this.activeForegroundTurnId;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
