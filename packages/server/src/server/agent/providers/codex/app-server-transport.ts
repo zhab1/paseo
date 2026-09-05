@@ -31,7 +31,6 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
-  onResponseReceived?: () => void;
 }
 
 export class CodexAppServerRpcError extends Error {
@@ -224,12 +223,7 @@ export class CodexAppServerClient {
     this.requestHandlers.set(method, handler);
   }
 
-  request(
-    method: string,
-    params?: unknown,
-    timeoutMs = DEFAULT_TIMEOUT_MS,
-    onResponseReceived?: () => void,
-  ): Promise<unknown> {
+  request(method: string, params?: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
     if (this.disposed) {
       return Promise.reject(new Error("Codex app-server client is closed"));
     }
@@ -242,7 +236,7 @@ export class CodexAppServerClient {
         this.pending.delete(id);
         reject(new Error(`Codex app-server request timed out for ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, onResponseReceived });
+      this.pending.set(id, { resolve, reject, timer });
     });
   }
 
@@ -360,7 +354,6 @@ export class CodexAppServerClient {
             ),
           );
         } else {
-          pending.onResponseReceived?.();
           pending.resolve(raw.result);
         }
         return;

@@ -22,25 +22,6 @@ describe("Codex app-server transport", () => {
     child.stdin.end();
   });
 
-  test("marks a response boundary before dispatching later notifications", async () => {
-    const child = createCodexAppServerChildProcess();
-    const client = new CodexAppServerClient(child, createTestLogger());
-    const order: string[] = [];
-    client.setNotificationHandler(() => order.push("notification"));
-
-    const request = client.request("thread/read", {}, undefined, () => order.push("response"));
-    child.stdout.write(
-      '{"id":1,"result":{"thread":{"turns":[]}}}\n' +
-        '{"method":"item/agentMessage/delta","params":{}}\n',
-    );
-
-    await request;
-    expect(order).toEqual(["response", "notification"]);
-    child.stdout.end();
-    child.stderr.end();
-    child.stdin.end();
-  });
-
   test("dispose rejects pending requests instead of leaving them hanging", async () => {
     const child = createCodexAppServerChildProcess();
     const client = new CodexAppServerClient(child, createTestLogger());

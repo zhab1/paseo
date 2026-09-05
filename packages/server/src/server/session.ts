@@ -3771,7 +3771,7 @@ export class Session {
         throw error;
       }
       await unarchiveAgentState(this.agentStorage, this.agentManager, snapshot.id);
-      snapshot = await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
+      await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(snapshot.id).length;
       if (requestId) {
@@ -3920,7 +3920,7 @@ export class Session {
           logger: this.sessionLogger,
         });
       }
-      snapshot = await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(agentId).length;
       if (requestId) {

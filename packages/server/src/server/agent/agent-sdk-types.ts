@@ -666,8 +666,6 @@ export interface AgentSession {
   startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<{ turnId: string }>;
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
-  /** Synchronously deliver events captured before the first subscriber attached. */
-  flushPreSubscriptionEvents?(committedTimeline?: readonly AgentTimelineItem[]): void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   /** Return the provider turn rejoined during session resume, if one is still running. */

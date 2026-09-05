@@ -452,8 +452,6 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     run: (prompt, options) => inner.run(prompt, options),
     startTurn: (prompt, options) => inner.startTurn(prompt, options),
     subscribe: (callback) => inner.subscribe((event) => callback(mapStreamEvent(provider, event))),
-    getActiveTurnId: inner.getActiveTurnId?.bind(inner),
-    flushPreSubscriptionEvents: inner.flushPreSubscriptionEvents?.bind(inner),
     async *streamHistory() {
       for await (const event of inner.streamHistory()) {
         yield mapStreamEvent(provider, event);

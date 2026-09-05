@@ -2925,19 +2925,9 @@ export class AgentManager {
   async hydrateTimelineFromProvider(
     agentId: string,
     options?: HydrateTimelineOptions,
-  ): Promise<ManagedAgent> {
+  ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
-    const committedTimeline =
-      agent.historyPrimed && !options?.force
-        ? (await this.getTimelineRows(agentId)).map((row) => row.item)
-        : undefined;
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
-    agent.session.flushPreSubscriptionEvents?.(committedTimeline);
-    const hydrationTail = this.sessionEventTails.get(agentId);
-    if (hydrationTail) {
-      await hydrationTail;
-    }
-    return { ...this.requireSessionAgent(agentId) };
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
@@ -3296,15 +3286,9 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
+      this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
-      if (managed.historyPrimed) {
-        const committedTimeline = (await this.getTimelineRows(resolvedAgentId)).map(
-          (row) => row.item,
-        );
-        session.flushPreSubscriptionEvents?.(committedTimeline);
-      }
-      this.subscribeToSession(managed);
       await this.refreshRuntimeInfo(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
       await this.persistSnapshot(managed, {
@@ -3317,9 +3301,7 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      if (managed.lifecycle !== "error") {
-        managed.lifecycle = managed.activeTurnId ? "running" : "idle";
-      }
+      managed.lifecycle = managed.activeTurnId ? "running" : "idle";
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
