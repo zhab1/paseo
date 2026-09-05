@@ -3535,10 +3535,6 @@ interface ReasoningSnapshotCursor {
   text: string;
 }
 
-interface CompactionSnapshotCursor {
-  index: number;
-}
-
 function matchReasoningSnapshotKey(
   item: Extract<AgentTimelineItem, { type: "reasoning" }>,
   providerReasoning: readonly { key: string; item: AgentTimelineItem }[],
@@ -3564,17 +3560,6 @@ function matchReasoningSnapshotKey(
   return null;
 }
 
-function matchCompactionSnapshotKey(
-  item: Extract<AgentTimelineItem, { type: "compaction" }>,
-  providerCompactions: readonly { key: string }[],
-  cursor: CompactionSnapshotCursor,
-): string | null {
-  const candidate = providerCompactions[cursor.index];
-  if (!candidate) return null;
-  if (item.status === "completed") cursor.index += 1;
-  return candidate.key;
-}
-
 function committedTimelineSnapshotItems(
   committedTimeline: readonly AgentTimelineItem[],
   providerHistory: readonly PersistedTimelineEntry[],
@@ -3589,7 +3574,7 @@ function committedTimelineSnapshotItems(
     return key ? [{ key }] : [];
   });
   const reasoningCursor: ReasoningSnapshotCursor = { index: 0, text: "" };
-  const compactionCursor: CompactionSnapshotCursor = { index: 0 };
+  let compactionIndex = 0;
 
   for (const item of committedTimeline) {
     let key = timelineItemSnapshotKey(item);
@@ -3597,7 +3582,8 @@ function committedTimelineSnapshotItems(
       key = matchReasoningSnapshotKey(item, providerReasoning, reasoningCursor);
     }
     if (!key && item.type === "compaction") {
-      key = matchCompactionSnapshotKey(item, providerCompactions, compactionCursor);
+      key = providerCompactions[compactionIndex]?.key ?? null;
+      if (key && item.status === "completed") compactionIndex += 1;
     }
     if (!key) continue;
     snapshotItems.set(key, appendTimelineSnapshotText(snapshotItems.get(key), item));
