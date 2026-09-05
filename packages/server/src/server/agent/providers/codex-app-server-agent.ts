@@ -4879,6 +4879,13 @@ export class CodexAppServerAgentSession implements AgentSession {
   flushPreSubscriptionEvents(committedTimeline?: readonly AgentTimelineItem[]): void {
     this.removeBufferedTimelineEventsCoveredByHistory(committedTimeline);
     this.removeBufferedProviderSubagentEventsCoveredByHistory();
+    if (committedTimeline && this.persistedProviderSubagentEvents.length > 0) {
+      const recipients = this.subscribers.size > 0 ? new Set(this.subscribers) : null;
+      this.preSubscriptionEvents ??= [];
+      this.preSubscriptionEvents.unshift(
+        ...this.persistedProviderSubagentEvents.map((event) => ({ event, recipients })),
+      );
+    }
     this.persistedHistory = [];
     this.persistedProviderSubagentEvents = [];
     this.historyPending = false;

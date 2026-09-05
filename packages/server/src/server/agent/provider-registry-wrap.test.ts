@@ -18,6 +18,7 @@ type OptionalAgentSessionMethodName = {
 }[keyof AgentSession];
 
 const OPTIONAL_AGENT_SESSION_METHOD_NAMES = [
+  "getActiveTurnId",
   "flushPreSubscriptionEvents",
   "listCommands",
   "setModel",
@@ -79,6 +80,11 @@ class FakeSession implements AgentSession {
 
   flushPreSubscriptionEvents() {
     this.recordedCalls.push("flushPreSubscriptionEvents");
+  }
+
+  getActiveTurnId() {
+    this.recordedCalls.push("getActiveTurnId");
+    return "turn-1";
   }
 
   async *streamHistory() {
@@ -177,6 +183,7 @@ describe("wrapSessionProvider", () => {
     const session = new FakeSession();
     const wrapped = wrapSessionProvider("custom-claude", session);
 
+    expect(wrapped.getActiveTurnId?.()).toBe("turn-1");
     wrapped.flushPreSubscriptionEvents?.();
     await wrapped.listCommands?.();
     await wrapped.setModel?.("sonnet");
@@ -189,6 +196,7 @@ describe("wrapSessionProvider", () => {
     await handler?.run({ emit: () => {} });
 
     expect(session.recordedCalls).toEqual([
+      "getActiveTurnId",
       "flushPreSubscriptionEvents",
       "listCommands",
       "setModel",

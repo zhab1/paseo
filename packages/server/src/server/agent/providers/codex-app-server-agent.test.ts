@@ -112,6 +112,7 @@ interface CodexSessionTestAccess {
   handleToolApprovalRequest(params: unknown): Promise<unknown>;
   handleNotification(method: string, params: unknown): void;
   loadPersistedHistory(): Promise<void>;
+  persistedProviderSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[];
   refreshResolvedCollaborationMode(): void;
   serviceTier: "fast" | null;
   planModeEnabled: boolean;
@@ -2372,6 +2373,29 @@ describe("Codex app-server provider", () => {
     session.subscribe((event) => events.push(event));
     await Promise.resolve();
     expect(events).toEqual([]);
+  });
+
+  test("replays provider subagents when root history is already committed", async () => {
+    const session = createSession();
+    const internals = asInternals(session);
+    const restoredChild: Extract<AgentStreamEvent, { type: "provider_subagent" }> = {
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "restored-child",
+        title: "Restored child",
+        status: "running",
+      },
+    };
+    internals.persistedProviderSubagentEvents = [restoredChild];
+
+    session.flushPreSubscriptionEvents?.([{ type: "user_message", text: "Already committed" }]);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await Promise.resolve();
+
+    expect(events).toEqual([restoredChild]);
   });
 
   test("does not replay a committed compaction whose provider id was not serialized", async () => {
