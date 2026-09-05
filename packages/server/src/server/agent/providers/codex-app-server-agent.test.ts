@@ -2374,6 +2374,40 @@ describe("Codex app-server provider", () => {
     expect(events).toEqual([]);
   });
 
+  test("does not replay a committed compaction whose provider id was not serialized", async () => {
+    const session = createSession();
+    const internals = asInternals(session);
+    session.client = {
+      request: vi.fn(async () => {
+        internals.handleNotification("item/started", {
+          threadId: "test-thread",
+          item: { type: "contextCompaction", id: "committed-compaction" },
+        });
+        internals.handleNotification("item/completed", {
+          threadId: "test-thread",
+          item: { type: "contextCompaction", id: "committed-compaction" },
+        });
+        return {
+          thread: {
+            turns: [
+              {
+                items: [{ type: "contextCompaction", id: "committed-compaction" }],
+              },
+            ],
+          },
+        };
+      }),
+    };
+
+    await internals.loadPersistedHistory();
+
+    const events: AgentStreamEvent[] = [];
+    session.flushPreSubscriptionEvents?.([{ type: "compaction", status: "completed" }]);
+    session.subscribe((event) => events.push(event));
+    await Promise.resolve();
+    expect(events).toEqual([]);
+  });
+
   test("preserves a matching delta emitted after the root response is serialized", async () => {
     const session = createSession();
     const internals = asInternals(session);
