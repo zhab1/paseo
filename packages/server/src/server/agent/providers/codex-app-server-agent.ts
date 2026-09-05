@@ -446,6 +446,7 @@ interface PersistedSubAgentRoute {
 interface CodexThreadHistoryProjection {
   timeline: PersistedTimelineEntry[];
   subAgentRoutes: PersistedSubAgentRoute[];
+  activeTurnId: string | null;
 }
 
 function mergeCodexConfiguredDefaults(
@@ -2056,7 +2057,7 @@ async function loadCodexThreadHistoryTimeline(params: {
         : [];
     },
   );
-  return { timeline, subAgentRoutes };
+  return { timeline, subAgentRoutes, activeTurnId: readActiveCodexTurnId(response) };
 }
 
 function readCodexThread(
@@ -3513,6 +3514,74 @@ function reconcileBufferedTimelineItem(
       );
 }
 
+function appendTimelineSnapshotText(
+  previous: AgentTimelineItem | undefined,
+  item: AgentTimelineItem,
+): AgentTimelineItem {
+  if (
+    previous?.type === item.type &&
+    (item.type === "assistant_message" || item.type === "reasoning")
+  ) {
+    return {
+      ...item,
+      text: `${timelineReplayText(previous) ?? ""}${timelineReplayText(item) ?? ""}`,
+    };
+  }
+  return item;
+}
+
+interface ReasoningSnapshotCursor {
+  index: number;
+  text: string;
+}
+
+function matchReasoningSnapshotKey(
+  item: Extract<AgentTimelineItem, { type: "reasoning" }>,
+  providerReasoning: readonly { key: string; item: AgentTimelineItem }[],
+  cursor: ReasoningSnapshotCursor,
+): string | null {
+  while (cursor.index < providerReasoning.length) {
+    const candidate = providerReasoning[cursor.index];
+    if (!candidate) return null;
+    const nextText = cursor.text + item.text;
+    const candidateText = timelineReplayText(candidate.item) ?? "";
+    if (!candidateText.startsWith(nextText)) {
+      cursor.index += 1;
+      cursor.text = "";
+      continue;
+    }
+    cursor.text = nextText;
+    if (nextText === candidateText) {
+      cursor.index += 1;
+      cursor.text = "";
+    }
+    return candidate.key;
+  }
+  return null;
+}
+
+function committedTimelineSnapshotItems(
+  committedTimeline: readonly AgentTimelineItem[],
+  providerHistory: readonly PersistedTimelineEntry[],
+): Map<string, AgentTimelineItem> {
+  const snapshotItems = new Map<string, AgentTimelineItem>();
+  const providerReasoning = providerHistory.flatMap(({ item }) => {
+    const key = item.type === "reasoning" ? timelineItemSnapshotKey(item) : null;
+    return key ? [{ key, item }] : [];
+  });
+  const reasoningCursor: ReasoningSnapshotCursor = { index: 0, text: "" };
+
+  for (const item of committedTimeline) {
+    let key = timelineItemSnapshotKey(item);
+    if (!key && item.type === "reasoning") {
+      key = matchReasoningSnapshotKey(item, providerReasoning, reasoningCursor);
+    }
+    if (!key) continue;
+    snapshotItems.set(key, appendTimelineSnapshotText(snapshotItems.get(key), item));
+  }
+  return snapshotItems;
+}
+
 interface DeliverToSubscribersOptions {
   event: AgentStreamEvent;
   recipients?: Iterable<CodexStreamSubscriber>;
@@ -4025,15 +4094,37 @@ export class CodexAppServerAgentSession implements AgentSession {
     const threadId = this.currentThreadId;
     this.historySnapshotThreadIds.clear();
 
-    const history = await loadCodexThreadHistoryTimeline({
-      threadId,
-      cwd: this.config.cwd ?? null,
-      requestThread: (threadIdToRead) =>
-        readCodexThread(client, threadIdToRead, () => {
-          this.historySnapshotThreadIds.add(threadIdToRead);
-        }),
-    });
-    const { timeline, subAgentRoutes } = history;
+    const observedTurnEvents: NonNullable<typeof this.resumeRootTurnEvents> = [];
+    this.resumeRootTurnEvents = observedTurnEvents;
+    let history: CodexThreadHistoryProjection;
+    try {
+      history = await loadCodexThreadHistoryTimeline({
+        threadId,
+        cwd: this.config.cwd ?? null,
+        requestThread: (threadIdToRead) =>
+          readCodexThread(client, threadIdToRead, () => {
+            this.historySnapshotThreadIds.add(threadIdToRead);
+          }),
+      });
+    } finally {
+      if (this.resumeRootTurnEvents === observedTurnEvents) {
+        this.resumeRootTurnEvents = null;
+      }
+    }
+    const { timeline, subAgentRoutes, activeTurnId } = history;
+    const activeTurnWasSuperseded = observedTurnEvents.some(
+      (event) =>
+        (event.kind === "started" && event.turnId !== activeTurnId) ||
+        (event.kind === "completed" && (!event.turnId || event.turnId === activeTurnId)),
+    );
+    if (
+      activeTurnId &&
+      !activeTurnWasSuperseded &&
+      (!this.currentTurnId || this.currentTurnId === activeTurnId)
+    ) {
+      this.currentTurnId = activeTurnId;
+      this.activeForegroundTurnId = activeTurnId;
+    }
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
     this.pendingSubAgentNotificationsByThreadId.clear();
@@ -4054,13 +4145,16 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.historyPending = timeline.length > 0 || this.persistedProviderSubagentEvents.length > 0;
   }
 
-  private removeBufferedTimelineEventsCoveredByHistory(): void {
+  private removeBufferedTimelineEventsCoveredByHistory(
+    committedTimeline?: readonly AgentTimelineItem[],
+  ): void {
     if (!this.preSubscriptionEvents?.length) return;
-    const snapshotItems = new Map<string, AgentTimelineItem>();
-    for (const { item } of this.persistedHistory) {
-      const key = timelineItemSnapshotKey(item);
-      if (key) snapshotItems.set(key, item);
-    }
+    const snapshotItems = committedTimeline
+      ? committedTimelineSnapshotItems(committedTimeline, this.persistedHistory)
+      : committedTimelineSnapshotItems(
+          this.persistedHistory.map(({ item }) => item),
+          this.persistedHistory,
+        );
     if (snapshotItems.size === 0) return;
     const textCoverage = snapshotTextCoverage(
       snapshotItems,
@@ -4235,7 +4329,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.client || !this.currentThreadId) return;
     const { params } = this.buildThreadRequest(this.config.model);
     params.threadId = this.currentThreadId;
-    if (this.serviceTier) {
+    if (this.config.featureValues?.fast_mode !== undefined) {
       params.serviceTier = this.serviceTier;
     }
     const resumeThread = async (): Promise<void> => {
@@ -4773,7 +4867,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
-  flushPreSubscriptionEvents(): void {
+  flushPreSubscriptionEvents(committedTimeline?: readonly AgentTimelineItem[]): void {
+    this.removeBufferedTimelineEventsCoveredByHistory(committedTimeline);
+    this.removeBufferedProviderSubagentEventsCoveredByHistory();
     this.persistedHistory = [];
     this.persistedProviderSubagentEvents = [];
     this.historyPending = false;

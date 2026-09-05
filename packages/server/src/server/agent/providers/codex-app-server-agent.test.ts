@@ -2285,20 +2285,37 @@ describe("Codex app-server provider", () => {
     }
   });
 
-  test("keeps resume-time items when provider history is not consumed", async () => {
+  test("replays only resume-time suffixes missing from the committed timeline", async () => {
     const session = createSession();
     const internals = asInternals(session);
     session.client = {
       request: vi.fn(async () => {
-        internals.handleNotification("item/completed", {
+        internals.handleNotification("item/agentMessage/delta", {
           threadId: "test-thread",
-          item: { type: "agentMessage", id: "unconsumed-message", text: "New output" },
+          itemId: "partially-committed-message",
+          delta: "After",
+        });
+        internals.handleNotification("item/reasoning/summaryTextDelta", {
+          threadId: "test-thread",
+          itemId: "partially-committed-reasoning",
+          delta: "After",
         });
         return {
           thread: {
             turns: [
               {
-                items: [{ type: "agentMessage", id: "unconsumed-message", text: "New output" }],
+                items: [
+                  {
+                    type: "agentMessage",
+                    id: "partially-committed-message",
+                    text: "BeforeAfter",
+                  },
+                  {
+                    type: "reasoning",
+                    id: "partially-committed-reasoning",
+                    summary: ["BeforeAfter"],
+                  },
+                ],
               },
             ],
           },
@@ -2310,15 +2327,22 @@ describe("Codex app-server provider", () => {
 
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
-    session.flushPreSubscriptionEvents?.();
+    session.flushPreSubscriptionEvents?.([
+      {
+        type: "assistant_message",
+        messageId: "partially-committed-message",
+        text: "Before",
+      },
+      { type: "reasoning", text: "Before" },
+    ]);
     expect(
-      events.filter(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "assistant_message" &&
-          event.item.messageId === "unconsumed-message",
+      events.flatMap((event) =>
+        event.type === "timeline" &&
+        (event.item.type === "assistant_message" || event.item.type === "reasoning")
+          ? [event.item.text]
+          : [],
       ),
-    ).toHaveLength(1);
+    ).toEqual(["After", "After"]);
   });
 
   test("preserves a matching delta emitted after the root response is serialized", async () => {
@@ -2368,6 +2392,50 @@ describe("Codex app-server provider", () => {
           : [],
       ),
     ).toEqual(["done", "done", "After subscribe"]);
+  });
+
+  test("restores an active turn from history when the thread is already loaded", async () => {
+    const session = createSession();
+    session.activeForegroundTurnId = null;
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        if (method === "thread/loaded/list") {
+          return { data: ["test-thread"] };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              turns: [{ id: "already-running-turn", status: "inProgress", items: [] }],
+            },
+          };
+        }
+        return {};
+      }),
+    };
+
+    await asInternals(session).ensureThreadLoaded();
+    await asInternals(session).loadPersistedHistory();
+
+    expect(session.getActiveTurnId?.()).toBe("already-running-turn");
+    const interruption = session.interrupt();
+    await vi.waitFor(() => {
+      expect(requests).toContainEqual({
+        method: "turn/interrupt",
+        params: { threadId: "test-thread", turnId: "already-running-turn" },
+      });
+    });
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { id: "already-running-turn", status: "interrupted" },
+    });
+    await interruption;
+    expect(requests).toContainEqual({
+      method: "turn/interrupt",
+      params: { threadId: "test-thread", turnId: "already-running-turn" },
+    });
+    expect(requests.some(({ method }) => method === "thread/resume")).toBe(false);
   });
 
   test("does not restore a turn that completed while resume was in flight", async () => {
@@ -5681,6 +5749,28 @@ describe("Codex app-server provider", () => {
         cwd: "/tmp/codex-question-test",
         serviceTier: "fast",
       },
+    });
+  });
+
+  test("explicitly disables a persisted fast tier when resuming a Codex thread", async () => {
+    const session = createSession({ featureValues: { fast_mode: false } });
+    session.currentThreadId = "standard-tier-thread";
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        return method === "thread/loaded/list" ? { data: [] } : {};
+      }),
+    };
+
+    await asInternals(session).ensureThreadLoaded();
+
+    expect(requests).toContainEqual({
+      method: "thread/resume",
+      params: expect.objectContaining({
+        threadId: "standard-tier-thread",
+        serviceTier: null,
+      }),
     });
   });
 

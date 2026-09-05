@@ -2927,8 +2927,12 @@ export class AgentManager {
     options?: HydrateTimelineOptions,
   ): Promise<ManagedAgent> {
     const agent = this.requireSessionAgent(agentId);
+    const committedTimeline =
+      agent.historyPrimed && !options?.force
+        ? (await this.getTimelineRows(agentId)).map((row) => row.item)
+        : undefined;
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
-    agent.session.flushPreSubscriptionEvents?.();
+    agent.session.flushPreSubscriptionEvents?.(committedTimeline);
     const hydrationTail = this.sessionEventTails.get(agentId);
     if (hydrationTail) {
       await hydrationTail;

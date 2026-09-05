@@ -1271,6 +1271,7 @@ class McpCapableTestAgentClient extends TestAgentClient {
 class BufferedResumeSession extends TestAgentSession {
   private bufferedEvents: AgentStreamEvent[];
   private resumedTurnId: string | null;
+  flushedCommittedTimeline: readonly AgentTimelineItem[] | undefined;
 
   constructor(config: AgentSessionConfig, events: AgentStreamEvent[], resumedTurnId?: string) {
     super(config);
@@ -1283,7 +1284,8 @@ class BufferedResumeSession extends TestAgentSession {
     return this.resumedTurnId;
   }
 
-  flushPreSubscriptionEvents(): void {
+  flushPreSubscriptionEvents(committedTimeline?: readonly AgentTimelineItem[]): void {
+    this.flushedCommittedTimeline = committedTimeline;
     const events = this.bufferedEvents;
     this.bufferedEvents = [];
     for (const event of events) {
@@ -3371,6 +3373,59 @@ test("hydrateTimelineFromProvider drains a buffered autonomous start", async () 
     );
   } finally {
     unsubscribe();
+    if (manager.getAgent(agentId)) {
+      await manager.closeAgent(agentId);
+    }
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("hydrateTimelineFromProvider gives buffered replay the committed timeline", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-committed-"));
+  const agentId = "00000000-0000-4000-8000-000000000118";
+  const store = new RecordingTimelineStore();
+  await store.appendCommitted(agentId, {
+    type: "assistant_message",
+    messageId: "partial-message",
+    text: "Before",
+  });
+  let resumedSession: BufferedResumeSession | null = null;
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumedSession = new BufferedResumeSession(
+        { provider: "codex", cwd: config?.cwd ?? workdir },
+        [],
+      );
+      return resumedSession;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    durableTimelineStore: store,
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence({
+      provider: "codex",
+      sessionId: "partial-session",
+      metadata: { cwd: workdir },
+    });
+    await manager.hydrateTimelineFromProvider(snapshot.id);
+
+    expect(resumedSession?.flushedCommittedTimeline).toEqual([
+      {
+        type: "assistant_message",
+        messageId: "partial-message",
+        text: "Before",
+      },
+    ]);
+  } finally {
     if (manager.getAgent(agentId)) {
       await manager.closeAgent(agentId);
     }
