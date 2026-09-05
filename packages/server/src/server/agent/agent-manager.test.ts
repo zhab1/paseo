@@ -1272,6 +1272,7 @@ class BufferedResumeSession extends TestAgentSession {
   private bufferedEvents: AgentStreamEvent[];
   private resumedTurnId: string | null;
   flushedCommittedTimeline: readonly AgentTimelineItem[] | undefined;
+  flushCount = 0;
 
   constructor(config: AgentSessionConfig, events: AgentStreamEvent[], resumedTurnId?: string) {
     super(config);
@@ -1285,6 +1286,7 @@ class BufferedResumeSession extends TestAgentSession {
   }
 
   flushPreSubscriptionEvents(committedTimeline?: readonly AgentTimelineItem[]): void {
+    this.flushCount += 1;
     this.flushedCommittedTimeline = committedTimeline;
     const events = this.bufferedEvents;
     this.bufferedEvents = [];
@@ -3416,8 +3418,17 @@ test("hydrateTimelineFromProvider gives buffered replay the committed timeline",
       sessionId: "partial-session",
       metadata: { cwd: workdir },
     });
+    expect(resumedSession?.flushCount).toBe(1);
+    expect(resumedSession?.flushedCommittedTimeline).toEqual([
+      {
+        type: "assistant_message",
+        messageId: "partial-message",
+        text: "Before",
+      },
+    ]);
     await manager.hydrateTimelineFromProvider(snapshot.id);
 
+    expect(resumedSession?.flushCount).toBe(2);
     expect(resumedSession?.flushedCommittedTimeline).toEqual([
       {
         type: "assistant_message",

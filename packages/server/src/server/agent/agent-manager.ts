@@ -3298,6 +3298,12 @@ export class AgentManager {
       registered = true;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
+      if (managed.historyPrimed) {
+        const committedTimeline = (await this.getTimelineRows(resolvedAgentId)).map(
+          (row) => row.item,
+        );
+        session.flushPreSubscriptionEvents?.(committedTimeline);
+      }
       this.subscribeToSession(managed);
       await this.refreshRuntimeInfo(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);

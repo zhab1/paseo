@@ -2345,6 +2345,35 @@ describe("Codex app-server provider", () => {
     ).toEqual(["After", "After"]);
   });
 
+  test("holds empty-history resume events until committed history is reconciled", async () => {
+    const session = createSession();
+    const internals = asInternals(session);
+    session.client = {
+      request: vi.fn(async () => {
+        internals.handleNotification("item/agentMessage/delta", {
+          threadId: "test-thread",
+          itemId: "already-committed-message",
+          delta: "Committed",
+        });
+        return { thread: { turns: [] } };
+      }),
+    };
+
+    await internals.loadPersistedHistory();
+
+    const events: AgentStreamEvent[] = [];
+    session.flushPreSubscriptionEvents?.([
+      {
+        type: "assistant_message",
+        messageId: "already-committed-message",
+        text: "Committed",
+      },
+    ]);
+    session.subscribe((event) => events.push(event));
+    await Promise.resolve();
+    expect(events).toEqual([]);
+  });
+
   test("preserves a matching delta emitted after the root response is serialized", async () => {
     const session = createSession();
     const internals = asInternals(session);
