@@ -923,6 +923,13 @@ export async function createPaseoDaemon(
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
   });
+  const syncPluginProviders = () => {
+    agentManager.updateProviderRegistry(
+      providerSnapshotManager.replacePluginProviders(pluginRuntime.getProviderRegistrations()),
+    );
+  };
+  const unsubscribePluginProviders =
+    pluginRuntime.subscribeProviderRegistrations(syncPluginProviders);
 
   const detachAgentStoragePersistence = attachAgentStoragePersistence(
     logger,
@@ -1754,6 +1761,7 @@ export async function createPaseoDaemon(
         logger,
       });
     } catch (error) {
+      unsubscribePluginProviders();
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
       await agentProviderRuntime.shutdown().catch(() => undefined);
@@ -1767,6 +1775,7 @@ export async function createPaseoDaemon(
 
   const stop = async () => {
     await pluginRuntime.stopAllPlugins();
+    unsubscribePluginProviders();
     await hubRelationships.stop();
     workspaceReconciliation.dispose();
     scriptHealthMonitor.stop();
