@@ -579,6 +579,7 @@ function createSessionForWorkspaceTests(
     listAgents: () => [],
     listProviderSubagentActivity: () => [],
     getAgent: () => null,
+    closeAgent: async () => {},
     archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
     archiveSnapshot: async () => ({}),
     unarchiveSnapshot: async () => true,
@@ -5209,7 +5210,7 @@ test("workspace recovery stays accepted when git observer warming fails", async 
   });
 });
 
-test("refresh_agent_request leaves workspace archival independent when its directory exists", async () => {
+test("refresh_agent_request serializes archived history and preserves loaded non-persistent refresh", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests({
     onMessage: (message) => {
@@ -5281,9 +5282,23 @@ test("refresh_agent_request leaves workspace archival independent when its direc
     lifecycle: "idle",
     updatedAt: "2026-03-10T00:00:00.000Z",
   });
-  session.agentManager.getAgent = () => managed;
-  session.interruptAgentIfRunning = async () => undefined;
-  session.agentManager.reloadAgentSession = async () => managed;
+  const lifecycleOperations: string[] = [];
+  let currentAgent: typeof managed | null = managed;
+  session.agentManager.getAgent = () => currentAgent;
+  session.interruptAgentIfRunning = async () => {
+    lifecycleOperations.push("interrupt");
+  };
+  session.agentManager.unarchiveSnapshot = async () => {
+    lifecycleOperations.push("unarchive");
+    return true;
+  };
+  session.agentManager.reloadAgentSession = async (_id, _overrides, options) => {
+    expect(options).toEqual({ rehydrateFromDisk: true, unarchive: true });
+    lifecycleOperations.push("close");
+    await session.agentManager.unarchiveSnapshot(agentId);
+    lifecycleOperations.push("reload");
+    return managed;
+  };
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
   session.agentManager.getTimeline = () => [];
   session.agentUpdates.forwardLiveAgent = async () => undefined;
@@ -5304,7 +5319,31 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   expect(workspaces.get(workspaceId)?.archivedAt).toBe("2026-03-10T00:00:00.000Z");
   expect(projects.get(cwd)?.archivedAt).toBe("2026-03-10T00:00:00.000Z");
   expect(unarchivedWorkspaceIds).toEqual([]);
+  expect(lifecycleOperations).toEqual(["interrupt", "close", "unarchive", "reload"]);
   expect(findByType(emitted, "rpc_error")).toBeUndefined();
+
+  lifecycleOperations.length = 0;
+  emitted.length = 0;
+  currentAgent = null;
+  storedAgent.persistence = { provider: "codex", sessionId: "thread-archived" };
+  Object.assign(session.agentManager, {
+    getRegisteredProviderIds: () => ["codex"],
+    waitForAgentClose: async () => {},
+  });
+  session.agentManager.resumeAgentFromPersistence = async () => {
+    lifecycleOperations.push("history");
+    currentAgent = managed;
+    return managed;
+  };
+
+  await session.handleMessage({
+    type: "refresh_agent_request",
+    agentId,
+    requestId: "req-refresh-pending-history",
+  });
+
+  expect(findByType(emitted, "rpc_error")).toBeUndefined();
+  expect(lifecycleOperations).toEqual(["history", "interrupt", "close", "unarchive", "reload"]);
 });
 
 test("refresh_agent_request leaves workspace archival independent when its directory is missing", async () => {
