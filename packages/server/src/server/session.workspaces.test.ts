@@ -579,6 +579,7 @@ function createSessionForWorkspaceTests(
     listAgents: () => [],
     listProviderSubagentActivity: () => [],
     getAgent: () => null,
+    closeAgent: async () => {},
     archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
     archiveSnapshot: async () => ({}),
     unarchiveSnapshot: async () => true,
@@ -5209,7 +5210,7 @@ test("workspace recovery stays accepted when git observer warming fails", async 
   });
 });
 
-test("refresh_agent_request leaves workspace archival independent when its directory exists", async () => {
+test("refresh_agent_request releases an archived runtime before unarchive without changing workspace archival", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests({
     onMessage: (message) => {
@@ -5281,9 +5282,22 @@ test("refresh_agent_request leaves workspace archival independent when its direc
     lifecycle: "idle",
     updatedAt: "2026-03-10T00:00:00.000Z",
   });
+  const lifecycleOperations: string[] = [];
   session.agentManager.getAgent = () => managed;
-  session.interruptAgentIfRunning = async () => undefined;
-  session.agentManager.reloadAgentSession = async () => managed;
+  session.interruptAgentIfRunning = async () => {
+    lifecycleOperations.push("interrupt");
+  };
+  session.agentManager.closeAgent = async () => {
+    lifecycleOperations.push("close");
+  };
+  session.agentManager.unarchiveSnapshot = async () => {
+    lifecycleOperations.push("unarchive");
+    return true;
+  };
+  session.agentManager.reloadAgentSession = async () => {
+    lifecycleOperations.push("reload");
+    return managed;
+  };
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
   session.agentManager.getTimeline = () => [];
   session.agentUpdates.forwardLiveAgent = async () => undefined;
@@ -5304,6 +5318,7 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   expect(workspaces.get(workspaceId)?.archivedAt).toBe("2026-03-10T00:00:00.000Z");
   expect(projects.get(cwd)?.archivedAt).toBe("2026-03-10T00:00:00.000Z");
   expect(unarchivedWorkspaceIds).toEqual([]);
+  expect(lifecycleOperations).toEqual(["interrupt", "close", "unarchive", "interrupt", "reload"]);
   expect(findByType(emitted, "rpc_error")).toBeUndefined();
 });
 

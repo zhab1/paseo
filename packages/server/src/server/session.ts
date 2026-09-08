@@ -3958,6 +3958,11 @@ export class Session {
 
     try {
       await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
+      const storedBeforeUnarchive = await this.agentStorage.get(agentId);
+      if (storedBeforeUnarchive?.archivedAt && this.agentManager.getAgent(agentId)) {
+        await this.interruptAgentIfRunning(agentId);
+        await this.agentManager.closeAgent(agentId);
+      }
       await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
       let snapshot: ManagedAgent;
       const existing = this.agentManager.getAgent(agentId);
