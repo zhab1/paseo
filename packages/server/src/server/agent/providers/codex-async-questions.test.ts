@@ -368,8 +368,10 @@ test("Stop dismisses async questions before cancellation and keeps them dismisse
         metadata = first.session.describePersistence()!.metadata;
       }
     });
-    await first.session.interrupt();
+    const interrupting = first.session.interrupt();
+    await first.appServer.waitForRequest("turn/interrupt");
     await first.finish("interrupted");
+    await interrupting;
     expect(first.session.getPendingPermissions()).toEqual([]);
     expect(metadata?.asyncQuestions).toEqual([
       expect.objectContaining({ resolution: "dismissed" }),

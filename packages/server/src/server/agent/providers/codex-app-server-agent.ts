@@ -4291,7 +4291,23 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (pendingStart.cancelRequested) {
         throw new Error("Codex turn start was interrupted before reaching Codex");
       }
-      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      const response = await this.client.request(
+        "turn/start",
+        turnStart.params,
+        TURN_START_TIMEOUT_MS,
+      );
+      const acceptedTurn = toObjectRecord(toObjectRecord(response)?.turn);
+      // Input can join an existing turn without another turn/started notification.
+      // Identify it without resetting any state already populated by streamed events.
+      if (
+        this.pendingForegroundTurnIdentification?.foregroundTurnId === turnId &&
+        typeof acceptedTurn?.id === "string"
+      ) {
+        this.currentTurnId = acceptedTurn.id;
+        this.pendingForegroundTurnIdentification.resolve(acceptedTurn.id);
+        this.pendingForegroundTurnIdentification = null;
+        this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: acceptedTurn.id });
+      }
       return { turnId };
     } catch (error) {
       this.pendingForegroundTurnIdentification?.resolve(null);

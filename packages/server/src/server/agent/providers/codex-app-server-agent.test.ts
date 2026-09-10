@@ -3742,6 +3742,87 @@ describe("Codex app-server provider", () => {
     }
   });
 
+  test.each([null, "newer-turn"])(
+    "interrupts the accepted turn with prior notification %s",
+    async (notifiedTurnId) => {
+      const interruptedTurns: unknown[] = [];
+      const appServer = createFakeCodexAppServer({
+        "turn/start": () => {
+          if (notifiedTurnId) {
+            appServer.startsTurn({ threadId: "thread-1", turnId: notifiedTurnId });
+          }
+          asInternals(session).handleNotification("item/agentMessage/delta", {
+            threadId: "thread-1",
+            itemId: "message-1",
+            delta: "Already ",
+          });
+          return { turn: { id: "existing-turn", status: "inProgress", items: [] } };
+        },
+        "turn/interrupt": (params) => {
+          interruptedTurns.push(params);
+          appServer.completeTurn({ status: "interrupted" });
+          return {};
+        },
+      });
+      const session = new CodexAppServerAgentSession(
+        createConfig({ cwd: "/workspace/project" }),
+        null,
+        createTestLogger(),
+        async () => appServer.child,
+      );
+
+      try {
+        const events: AgentStreamEvent[] = [];
+        session.subscribe((event) => events.push(event));
+        await session.startTurn("Continue working.");
+        asInternals(session).handleNotification("item/completed", {
+          threadId: "thread-1",
+          item: { type: "agentMessage", id: "message-1", text: "Already working." },
+        });
+        expect(
+          events.flatMap((event) =>
+            event.type === "timeline" && event.item.type === "assistant_message"
+              ? [event.item.text]
+              : [],
+          ),
+        ).toEqual(["Already ", "working."]);
+        await session.interrupt();
+        expect(interruptedTurns).toEqual([
+          { threadId: "thread-1", turnId: notifiedTurnId ?? "existing-turn" },
+        ]);
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test("does not revive a turn completed before its start response", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/start": () => {
+        appServer.completeTurn();
+        return { turn: { id: "completed-turn", status: "inProgress", items: [] } };
+      },
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+
+    try {
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      await session.startTurn("Finish immediately.");
+      expect(events.filter((event) => event.type === "turn_started")).toEqual([]);
+      expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("waits for Codex to identify an accepted turn before interrupting it", async () => {
     const interruptedTurns: unknown[] = [];
     const appServer = createFakeCodexAppServer({
