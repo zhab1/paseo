@@ -1454,7 +1454,7 @@ export class AgentManager {
   }
 
   private async unarchiveForReload(agentId: string, requested = false): Promise<void> {
-    if (requested) await this.unarchiveSnapshot(agentId);
+    if (requested) await this.unarchiveSnapshotAfterClose(agentId);
   }
 
   private async reloadAgentSessionInternal(
@@ -2153,14 +2153,21 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
+    // Archived history may have loaded a runtime that still owns the native writer.
+    await this.closeAgent(agentId);
+    return this.unarchiveSnapshotAfterClose(agentId, updates);
+  }
+
+  private async unarchiveSnapshotAfterClose(
+    agentId: string,
+    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
+  ): Promise<boolean> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
     if (!record || !record.archivedAt) {
       return false;
     }
 
-    // Archived history may have loaded a runtime that still owns the native writer.
-    await this.closeAgent(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
     await registry.upsert({
