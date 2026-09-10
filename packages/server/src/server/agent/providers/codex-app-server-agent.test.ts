@@ -3751,6 +3751,11 @@ describe("Codex app-server provider", () => {
           if (notifiedTurnId) {
             appServer.startsTurn({ threadId: "thread-1", turnId: notifiedTurnId });
           }
+          asInternals(session).handleNotification("item/agentMessage/delta", {
+            threadId: "thread-1",
+            itemId: "message-1",
+            delta: "Already ",
+          });
           return { turn: { id: "existing-turn", status: "inProgress", items: [] } };
         },
         "turn/interrupt": (params) => {
@@ -3767,7 +3772,20 @@ describe("Codex app-server provider", () => {
       );
 
       try {
+        const events: AgentStreamEvent[] = [];
+        session.subscribe((event) => events.push(event));
         await session.startTurn("Continue working.");
+        asInternals(session).handleNotification("item/completed", {
+          threadId: "thread-1",
+          item: { type: "agentMessage", id: "message-1", text: "Already working." },
+        });
+        expect(
+          events.flatMap((event) =>
+            event.type === "timeline" && event.item.type === "assistant_message"
+              ? [event.item.text]
+              : [],
+          ),
+        ).toEqual(["Already ", "working."]);
         await session.interrupt();
         expect(interruptedTurns).toEqual([
           { threadId: "thread-1", turnId: notifiedTurnId ?? "existing-turn" },

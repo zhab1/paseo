@@ -4298,17 +4298,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       );
       const acceptedTurn = toObjectRecord(toObjectRecord(response)?.turn);
       // Input can join an existing turn without another turn/started notification.
-      // A notification already received takes precedence over this response.
+      // Identify it without resetting any state already populated by streamed events.
       if (
         this.pendingForegroundTurnIdentification?.foregroundTurnId === turnId &&
-        typeof acceptedTurn?.id === "string" &&
-        this.currentThreadId
+        typeof acceptedTurn?.id === "string"
       ) {
-        this.handleTurnStartedNotification({
-          kind: "turn_started",
-          threadId: this.currentThreadId,
-          turnId: acceptedTurn.id,
-        });
+        this.currentTurnId = acceptedTurn.id;
+        this.pendingForegroundTurnIdentification.resolve(acceptedTurn.id);
+        this.pendingForegroundTurnIdentification = null;
+        this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: acceptedTurn.id });
       }
       return { turnId };
     } catch (error) {
