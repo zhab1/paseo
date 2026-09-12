@@ -2360,7 +2360,6 @@ test("reload releases the original writer before resuming the same session", asy
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   class ExclusiveWriterClient extends TestAgentClient {
     current: CloseRecordingTestAgentSession | undefined;
-    unarchiveCalls = 0;
     override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
       this.current = new CloseRecordingTestAgentSession(config);
       return this.current;
@@ -2379,12 +2378,6 @@ test("reload releases the original writer before resuming the same session", asy
       this.current.describePersistence = () => ({ provider: "codex", sessionId: handle.sessionId });
       return this.current;
     }
-    override async unarchiveNativeSession(): Promise<void> {
-      if (this.current && !this.current.closed) {
-        throw new Error("thread already has an active writer");
-      }
-      this.unarchiveCalls += 1;
-    }
   }
   const client = new ExclusiveWriterClient();
   const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
@@ -2392,17 +2385,13 @@ test("reload releases the original writer before resuming the same session", asy
     const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
-    await manager.archiveSnapshot(created.id, "2026-09-08T00:00:00.000Z");
     for (let i = 0; i < 3; i++) {
       const reloaded = await manager.reloadAgentSession(created.id, undefined, {
         rehydrateFromDisk: true,
-        unarchive: i === 0,
       });
       expect(reloaded.id).toBe(created.id);
       expect(reloaded.persistence?.sessionId).toBe(created.persistence?.sessionId);
     }
-    expect(client.unarchiveCalls).toBe(1);
-    expect((await storage.get(created.id))?.archivedAt).toBeNull();
     await manager.closeAgent(created.id);
   } finally {
     await client.current?.close();

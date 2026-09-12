@@ -3961,24 +3961,15 @@ export class Session {
 
     try {
       await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
-      const storedBeforeUnarchive = await this.agentStorage.get(agentId);
-      let existing = this.agentManager.getAgent(agentId);
-      if (storedBeforeUnarchive?.archivedAt && !existing && storedBeforeUnarchive.persistence) {
-        existing = await ensureAgentLoaded(agentId, {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-        });
-      }
+      await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
       let snapshot: ManagedAgent;
+      const existing = this.agentManager.getAgent(agentId);
       if (existing) {
         await this.interruptAgentIfRunning(agentId);
         snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
           rehydrateFromDisk: true,
-          unarchive: Boolean(storedBeforeUnarchive?.archivedAt),
         });
       } else {
-        await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
         const record = await this.agentStorage.get(agentId);
         if (!record) {
           throw new Error(`Agent not found: ${agentId}`);

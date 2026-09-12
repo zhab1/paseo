@@ -1444,7 +1444,7 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean; unarchive?: boolean },
+    options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, () =>
@@ -1453,14 +1453,10 @@ export class AgentManager {
     );
   }
 
-  private async unarchiveForReload(agentId: string, requested = false): Promise<void> {
-    if (requested) await this.unarchiveSnapshotAfterClose(agentId);
-  }
-
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options: { rehydrateFromDisk?: boolean; unarchive?: boolean } = {},
+    options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -1468,7 +1464,7 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
     }
-    const rehydrateFromDisk = options.rehydrateFromDisk ?? false;
+    const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
@@ -1513,7 +1509,6 @@ export class AgentManager {
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
       await this.persistSnapshot(closedExisting);
-      await this.unarchiveForReload(agentId, options.unarchive);
       this.assertAcceptingAgentRegistrations();
 
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
@@ -2153,21 +2148,14 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
-    // Archived history may have loaded a runtime that still owns the native writer.
-    await this.closeAgent(agentId);
-    return this.unarchiveSnapshotAfterClose(agentId, updates);
-  }
-
-  private async unarchiveSnapshotAfterClose(
-    agentId: string,
-    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
-  ): Promise<boolean> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
     if (!record || !record.archivedAt) {
       return false;
     }
 
+    // Archived history may have loaded a runtime that still owns the native writer.
+    await this.closeAgent(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
     await registry.upsert({
