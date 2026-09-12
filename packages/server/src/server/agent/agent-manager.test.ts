@@ -37,6 +37,7 @@ import type {
   AgentProvider,
   AgentPersistenceHandle,
   AgentRunOptions,
+  AgentResumeSessionOptions,
   AgentRunResult,
   AgentSession,
   AgentSessionConfig,
@@ -2360,7 +2361,6 @@ test("reload releases the original writer before resuming the same session", asy
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   class ExclusiveWriterClient extends TestAgentClient {
     current: CloseRecordingTestAgentSession | undefined;
-    unarchiveCalls = 0;
     override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
       this.current = new CloseRecordingTestAgentSession(config);
       return this.current;
@@ -2379,12 +2379,6 @@ test("reload releases the original writer before resuming the same session", asy
       this.current.describePersistence = () => ({ provider: "codex", sessionId: handle.sessionId });
       return this.current;
     }
-    override async unarchiveNativeSession(): Promise<void> {
-      if (this.current && !this.current.closed) {
-        throw new Error("thread already has an active writer");
-      }
-      this.unarchiveCalls += 1;
-    }
   }
   const client = new ExclusiveWriterClient();
   const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
@@ -2392,17 +2386,13 @@ test("reload releases the original writer before resuming the same session", asy
     const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
-    await manager.archiveSnapshot(created.id, "2026-09-08T00:00:00.000Z");
     for (let i = 0; i < 3; i++) {
       const reloaded = await manager.reloadAgentSession(created.id, undefined, {
         rehydrateFromDisk: true,
-        unarchive: i === 0,
       });
       expect(reloaded.id).toBe(created.id);
       expect(reloaded.persistence?.sessionId).toBe(created.persistence?.sessionId);
     }
-    expect(client.unarchiveCalls).toBe(1);
-    expect((await storage.get(created.id))?.archivedAt).toBeNull();
     await manager.closeAgent(created.id);
   } finally {
     await client.current?.close();
@@ -5185,14 +5175,14 @@ test("archiveSnapshot clears persisted attention and normalizes running status",
   const archivedRecord = await manager.archiveSnapshot(snapshot.id, archivedAt);
 
   expect(archivedRecord.archivedAt).toBe(archivedAt);
-  expect(archivedRecord.lastStatus).toBe("idle");
+  expect(archivedRecord.lastStatus).toBe("closed");
   expect(archivedRecord.requiresAttention).toBe(false);
   expect(archivedRecord.attentionReason).toBeNull();
   expect(archivedRecord.attentionTimestamp).toBeNull();
 
   const persisted = await storage.get(snapshot.id);
   expect(persisted?.archivedAt).toBe(archivedAt);
-  expect(persisted?.lastStatus).toBe("idle");
+  expect(persisted?.lastStatus).toBe("closed");
   expect(persisted?.requiresAttention).toBe(false);
   expect(persisted?.attentionReason).toBeNull();
   expect(persisted?.attentionTimestamp).toBeNull();
@@ -9706,7 +9696,7 @@ test("ensureUnarchivedAgentLoaded does not resume an archived agent", async () =
   }
 });
 
-test("ensureUnarchivedAgentLoaded closes a runtime archived while it resumes", async () => {
+test("a stored-only archive waits for an in-flight resume and then closes it", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-resume-race-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const resumeStarted = deferred<void>();
@@ -9730,16 +9720,17 @@ test("ensureUnarchivedAgentLoaded closes a runtime archived while it resumes", a
     });
     await manager.closeAgent(agent.id);
 
-    const load = ensureUnarchivedAgentLoaded(agent.id, {
+    const load = ensureAgentLoaded(agent.id, {
       agentManager: manager,
       agentStorage: storage,
       logger,
     });
     await resumeStarted.promise;
-    await manager.archiveSnapshot(agent.id, new Date().toISOString());
+    const archive = manager.archiveSnapshot(agent.id, new Date().toISOString());
     resumeAllowed.resolve();
+    await archive;
 
-    await expect(load).rejects.toThrow(`Agent is archived: ${agent.id}`);
+    await expect(load).resolves.toMatchObject({ id: agent.id });
     expect(manager.getAgent(agent.id)).toBeNull();
     expect((await storage.get(agent.id))?.archivedAt).toEqual(expect.any(String));
   } finally {
@@ -9749,7 +9740,7 @@ test("ensureUnarchivedAgentLoaded closes a runtime archived while it resumes", a
   }
 });
 
-test("ensureUnarchivedAgentLoaded fences an archived agent after joining a shared resume", async () => {
+test("a stored-only archive closes a shared resume before a later protected load returns", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-shared-resume-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const resumeStarted = deferred<void>();
@@ -9784,8 +9775,9 @@ test("ensureUnarchivedAgentLoaded fences an archived agent after joining a share
       agentStorage: storage,
       logger,
     });
-    await manager.archiveSnapshot(agent.id, new Date().toISOString());
+    const archive = manager.archiveSnapshot(agent.id, new Date().toISOString());
     resumeAllowed.resolve();
+    await archive;
 
     await sharedLoad;
     await expect(protectedLoad).rejects.toThrow(`Agent is archived: ${agent.id}`);
@@ -10023,7 +10015,7 @@ test("concurrent explicit closes tear down the runtime once", async () => {
   }
 });
 
-test("provider close failure still persists and emits a resumable closed agent", async () => {
+test("provider close failure retains the runtime for cleanup instead of allowing another writer", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-close-failure-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const client = new (class extends TestAgentClient {
@@ -10043,12 +10035,10 @@ test("provider close failure still persists and emits a resumable closed agent",
       "00000000-0000-4000-8000-000000000217",
       { workspaceId: undefined },
     );
-    const closed = waitForAgentLifecycle(manager, created.id, "closed");
-
     await expect(manager.closeAgent(created.id)).rejects.toThrow("provider cleanup failed");
-    await closed;
+    expect(manager.getAgent(created.id)?.session).toBe(created.session);
     const stored = await storage.get(created.id);
-    expect(stored).toMatchObject({ lastStatus: "closed" });
+    expect(stored).toMatchObject({ lastStatus: "idle" });
     expect(stored?.archivedAt).toBeFalsy();
 
     await expect(
@@ -11062,4 +11052,55 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
   await manager.runAgent(snapshot.id, { text: "merge it" });
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
+});
+
+test("concurrent native restores run once before resuming the same agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-unarchive-ownership-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const restoreStarted = deferred<void>();
+  const restoreAllowed = deferred<void>();
+  const operations: string[] = [];
+  const client = new (class extends TestAgentClient {
+    async unarchiveNativeSession(): Promise<void> {
+      operations.push("restore");
+      restoreStarted.resolve();
+      await restoreAllowed.promise;
+    }
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+      _launchContext?: AgentLaunchContext,
+      options?: AgentResumeSessionOptions,
+    ): Promise<AgentSession> {
+      operations.push(`resume:${options?.purpose}`);
+      return super.resumeSession(handle, config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  let agentId: string | undefined;
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = created.id;
+    await manager.archiveAgent(agentId);
+    const first = manager.unarchiveSnapshot(agentId);
+    await restoreStarted.promise;
+    const second = manager.unarchiveSnapshot(agentId);
+    const load = ensureAgentLoaded(agentId, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    restoreAllowed.resolve();
+    await Promise.all([first, second, load]);
+    expect(operations).toEqual(["restore", "resume:interactive"]);
+    expect((await storage.get(agentId))?.archivedAt).toBeNull();
+    expect(manager.getAgent(agentId)?.persistence?.sessionId).toBe(created.persistence?.sessionId);
+  } finally {
+    restoreAllowed.resolve();
+    if (agentId) await manager.closeAgent(agentId);
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
