@@ -441,6 +441,7 @@ interface PersistedSubAgentRoute {
 interface CodexThreadHistoryProjection {
   timeline: PersistedTimelineEntry[];
   subAgentRoutes: PersistedSubAgentRoute[];
+  latestTurnStatus: ToolCallTimelineItem["status"] | null;
 }
 
 function mergeCodexConfiguredDefaults(
@@ -1972,6 +1973,24 @@ const CodexThreadReadResponseSchema = z
 type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
 type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
 
+function readCodexHistoricalTurnStatus(
+  turns: CodexThreadReadResponse["thread"]["turns"],
+): ToolCallTimelineItem["status"] | null {
+  const latestTurn = toObjectRecord(turns.at(-1));
+  switch (latestTurn?.status) {
+    case "completed":
+      return "completed";
+    case "interrupted":
+      return "canceled";
+    case "failed":
+      return "failed";
+    case "inProgress":
+      return "running";
+    default:
+      return null;
+  }
+}
+
 async function requestCodexThreadHistory(
   requestThread: CodexThreadReadRequest,
   threadId: string,
@@ -2037,7 +2056,11 @@ async function loadCodexThreadHistoryTimeline(params: {
         : [];
     },
   );
-  return { timeline, subAgentRoutes };
+  return {
+    timeline,
+    subAgentRoutes,
+    latestTurnStatus: readCodexHistoricalTurnStatus(response.thread.turns),
+  };
 }
 
 function readCodexThread(client: CodexAppServerClientLike, threadId: string): Promise<unknown> {
@@ -3914,6 +3937,18 @@ export class CodexAppServerAgentSession implements AgentSession {
         });
         for (const entry of childHistory.timeline) {
           this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);
+        }
+        if (childHistory.latestTurnStatus) {
+          next.route.toolCall.status = childHistory.latestTurnStatus;
+          next.route.toolCall.error =
+            childHistory.latestTurnStatus === "failed" ? { message: "Sub-agent failed" } : null;
+          this.emitSubAgentActivityUpdate(
+            next.route.toolCall.callId,
+            childHistory.latestTurnStatus,
+            {
+              reopen: true,
+            },
+          );
         }
         for (const route of childHistory.subAgentRoutes) {
           queue.push({

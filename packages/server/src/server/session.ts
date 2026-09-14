@@ -7893,25 +7893,14 @@ export class Session {
             window: timeline.window,
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
-            rows: supportsProjection
-              ? rows.map((row) => ({
-                  item: row.item,
-                  timestamp: row.timestamp,
-                  seq: row.seqEnd,
-                  seqStart: row.seqStart,
-                  seqEnd: row.seqEnd,
-                  sourceSeqRanges: row.sourceSeqRanges,
-                }))
-              : [
-                  {
-                    seq: timeline.window.maxSeq,
-                    timestamp: new Date().toISOString(),
-                    item: {
-                      type: "assistant_message",
-                      text: "Please upgrade the Paseo app to view this subagent conversation.",
-                    },
-                  },
-                ],
+            rows: rows.map((row) => ({
+              item: row.item,
+              timestamp: row.timestamp,
+              seq: row.seqEnd,
+              seqStart: row.seqStart,
+              seqEnd: row.seqEnd,
+              sourceSeqRanges: row.sourceSeqRanges,
+            })),
             error: null,
           },
         },
