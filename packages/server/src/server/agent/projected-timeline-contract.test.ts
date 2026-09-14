@@ -9,7 +9,7 @@ import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createMessageCollector } from "../test-utils/message-collector.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
-import type { AgentClient } from "./agent-sdk-types.js";
+import type { AgentClient, AgentStreamEvent } from "./agent-sdk-types.js";
 
 test("projects Codex child history and confines old-client degradation to the child transcript", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-projected-contract-"));
@@ -80,9 +80,9 @@ test("projects Codex child history and confines old-client degradation to the ch
     });
     expect(catchUp.rows).toMatchObject([{ item: { text: "ABC" } }]);
     const oldChild = await legacy.fetchProviderSubagentTimeline(agent.id, "child-thread");
-    expect(oldChild.rows).toMatchObject([
-      { item: { type: "assistant_message", text: expect.stringContaining("upgrade") } },
-    ]);
+    expect(oldChild.rows).toMatchObject([{ seq: 3, item: { text: "ABC" } }]);
+    expect(oldChild.hasOlder).toBe(false);
+    expect(oldChild.hasNewer).toBe(false);
     expect((await legacy.listProviderSubagents(agent.id)).subagents).toHaveLength(1);
     expect(
       messages.messages.some(
@@ -113,59 +113,87 @@ test("projects Codex child history and confines old-client degradation to the ch
   }
 }, 30_000);
 
-test("resuming Codex restores child descriptors and complete messages without historical deltas", async () => {
-  const app = createFakeCodexAppServer({
-    "thread/read": (params) => {
-      const { threadId } = params as { threadId: string };
-      return {
-        thread: {
-          id: threadId,
-          turns: [
-            {
-              id: "turn",
-              items:
-                threadId === "root"
-                  ? [
-                      {
-                        type: "subAgentActivity",
-                        id: "spawn",
-                        kind: "started",
-                        agentThreadId: "child",
-                        agentPath: "explore",
-                      },
-                    ]
-                  : [{ type: "agentMessage", id: "message", text: "Complete child answer" }],
-            },
-          ],
-        },
-      };
-    },
-  });
-  const session = new CodexAppServerAgentSession(
-    { provider: "codex", cwd: tmpdir() },
-    { sessionId: "root" },
-    pino({ level: "silent" }),
-    async () => app.child,
-  );
-  try {
-    await session.connect();
-    const children = [];
-    for await (const event of session.streamHistory()) {
-      if (event.type === "provider_subagent") children.push(event.event);
-    }
-    expect(children).toMatchObject([
-      { type: "upsert", id: "child", status: "completed" },
-      {
-        type: "timeline",
-        id: "child",
-        item: { type: "assistant_message", text: "Complete child answer" },
+test.each([
+  ["completed", "completed"],
+  ["interrupted", "canceled"],
+  ["failed", "failed"],
+  ["inProgress", "running"],
+] as const)(
+  "resuming Codex derives child status from its latest %s turn",
+  async (turnStatus, status) => {
+    const app = createFakeCodexAppServer({
+      "thread/read": (params) => {
+        const { threadId } = params as { threadId: string };
+        return {
+          thread: {
+            id: threadId,
+            turns: [
+              {
+                id: "turn",
+                status: threadId === "child" ? turnStatus : "completed",
+                items:
+                  threadId === "root"
+                    ? [
+                        {
+                          type: "collabAgentToolCall",
+                          id: "spawn",
+                          tool: "spawnAgent",
+                          status: "completed",
+                          prompt: "Explore the regression",
+                          receiverThreadIds: ["child"],
+                          agentsStates: { child: { status: "pendingInit", message: null } },
+                        },
+                      ]
+                    : [{ type: "agentMessage", id: "message", text: "Complete child answer" }],
+              },
+            ],
+          },
+        };
       },
-    ]);
-    app.assertNoErrors();
-  } finally {
-    await session.close();
-  }
-});
+    });
+    const session = new CodexAppServerAgentSession(
+      { provider: "codex", cwd: tmpdir() },
+      { sessionId: "root" },
+      pino({ level: "silent" }),
+      async () => app.child,
+    );
+    try {
+      await session.connect();
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) {
+        history.push(event);
+      }
+      const childEvents = history.flatMap((event) =>
+        event.type === "provider_subagent" ? [event.event] : [],
+      );
+      expect(childEvents.findLast((event) => event.type === "upsert")).toMatchObject({
+        id: "child",
+        status,
+      });
+      expect(childEvents).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          id: "child",
+          item: expect.objectContaining({
+            type: "assistant_message",
+            text: "Complete child answer",
+          }),
+        }),
+      );
+      expect(
+        history.find(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "tool_call" &&
+            event.item.callId === "spawn",
+        ),
+      ).toMatchObject({ item: { status } });
+      app.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  },
+);
 
 test("retains only the latest cumulative Pi tool progress payload", async () => {
   const { parseToolArgs, parseToolResult, mapToolDetail } =

@@ -107,10 +107,9 @@ uses the projected display anchor; live updates advance the source cursor withou
 Clients advertising `projected_subagent_timeline` receive child streams and projected fetches.
 Updated clients require `features.projectedSubagentTimeline` for child history; older hosts show
 an update-host notice for that pane.
-Older clients retain child names/status and receive an upgrade message when opening a child
-conversation. This gate affects only the child transcript; it does not gate the connection,
-main conversation, or current-context forks. A legacy `canonical` root request still receives
-projected items.
+Older clients retain child names/status and receive the latest bounded child snapshot. The gate
+affects only child paging and live updates; it does not gate the connection, main conversation, or
+current-context forks. A legacy `canonical` root request still receives projected items.
 
 ## Client replica lifetime
 
