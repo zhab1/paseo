@@ -1550,17 +1550,18 @@ describe("Codex app-server provider", () => {
       "thread/resume": (params) => {
         requests.push({ method: "thread/resume", params });
         return {
-          thread: {
-            id: "archived-thread-id",
-            turns: [
-              { id: "completed-turn", status: "completed", items: [] },
-              { id: "native-running-turn", status: "inProgress", items: [] },
-            ],
+          thread: { id: "archived-thread-id", turns: [] },
+          initialTurnsPage: {
+            data: [{ id: "native-running-turn", status: "inProgress", items: [] }],
+            nextCursor: null,
+            backwardsCursor: null,
           },
           sandbox: { type: "dangerFullAccess" },
         };
       },
-      "thread/read": () => ({ thread: { turns: [] } }),
+      "thread/read": () => {
+        throw new Error("history should not be loaded");
+      },
       "turn/interrupt": (params) => {
         requests.push({ method: "turn/interrupt", params });
         return {};
@@ -1568,9 +1569,12 @@ describe("Codex app-server provider", () => {
     });
     const provider = createProviderWithFakeAppServer(appServer);
 
-    const session = await provider.resumeSession(archivedThreadHandle(), {
-      modeId: "full-access",
-    });
+    const session = await provider.resumeSession(
+      archivedThreadHandle(),
+      { modeId: "full-access" },
+      undefined,
+      { loadHistory: false },
+    );
 
     expect(session.getActiveTurnId?.()).toBe("native-running-turn");
     const interrupt = session.interrupt();
@@ -1583,6 +1587,8 @@ describe("Codex app-server provider", () => {
           threadId: "archived-thread-id",
           approvalPolicy: "never",
           sandbox: "danger-full-access",
+          excludeTurns: true,
+          initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
         }),
       },
       {
@@ -5151,6 +5157,8 @@ describe("Codex app-server provider", () => {
           threadId: "archived-thread-id",
           approvalPolicy: "on-request",
           sandbox: "workspace-write",
+          excludeTurns: true,
+          initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
         },
       },
     ]);

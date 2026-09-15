@@ -2071,8 +2071,13 @@ function readCodexThread(client: CodexAppServerClientLike, threadId: string): Pr
 }
 
 function readActiveCodexTurnId(response: unknown): string | null {
-  const thread = toObjectRecord(toObjectRecord(response)?.thread);
-  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const responseRecord = toObjectRecord(response);
+  const thread = toObjectRecord(responseRecord?.thread);
+  const initialTurnsPage = toObjectRecord(responseRecord?.initialTurnsPage);
+  const turns = [
+    ...(Array.isArray(thread?.turns) ? thread.turns : []),
+    ...(Array.isArray(initialTurnsPage?.data) ? initialTurnsPage.data : []),
+  ];
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = toObjectRecord(turns[index]);
     if (turn?.status === "inProgress" && typeof turn.id === "string") {
@@ -3461,6 +3466,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly autoReviewEnabled: boolean = false,
     private readonly agentId?: string,
     private readonly initialResumePurpose: "interactive" | "history" = "interactive",
+    private readonly loadHistoryOnResume: boolean = true,
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3485,7 +3491,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     if (this.resumeHandle?.sessionId) {
       this.currentThreadId = this.resumeHandle.sessionId;
-      this.historyPending = true;
+      this.historyPending = this.loadHistoryOnResume;
     }
   }
 
@@ -3531,7 +3537,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async establishConnection(): Promise<void> {
     if (this.initialResumePurpose === "history") {
-      await this.readArchivedHistory();
+      if (this.loadHistoryOnResume) await this.readArchivedHistory();
       this.connectionState = "history-ready";
       return;
     }
@@ -3558,7 +3564,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
       if (this.currentThreadId) {
         await this.ensureThreadLoaded();
-        await this.loadPersistedHistory(this.client);
+        if (this.loadHistoryOnResume) await this.loadPersistedHistory(this.client);
       }
 
       if (this.closed) {
@@ -3968,7 +3974,11 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async ensureThreadLoaded(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
-    const params: Record<string, unknown> = { threadId: this.currentThreadId };
+    const params: Record<string, unknown> = {
+      threadId: this.currentThreadId,
+      excludeTurns: true,
+      initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
+    };
     const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
     if (this.hasWorkflowModeOverride) {
       if (this.providerOptions.approval_policy === undefined) {
@@ -7377,6 +7387,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       autoReviewEnabled,
       launchContext?.agentId,
       options?.purpose ?? "interactive",
+      options?.loadHistory !== false,
     );
     await session.connect();
     return session;

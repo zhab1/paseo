@@ -647,6 +647,8 @@ export interface AgentCreateSessionOptions {
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: "interactive" | "history";
+  /** Skip provider history when Paseo already has the durable timeline. */
+  loadHistory?: boolean;
 }
 
 /**
