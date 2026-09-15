@@ -4370,6 +4370,8 @@ test("reloadAgentSession preserves timeline and does not force history replay", 
   const storage = new AgentStorage(storagePath, logger);
 
   class HistoryProbeSession extends TestAgentSession {
+    discardPendingHistoryCalls = 0;
+
     constructor(
       config: AgentSessionConfig,
       private readonly historyText: string | null,
@@ -4387,7 +4389,13 @@ test("reloadAgentSession preserves timeline and does not force history replay", 
         item: { type: "assistant_message", text: this.historyText },
       };
     }
+
+    discardPendingHistory(): void {
+      this.discardPendingHistoryCalls += 1;
+    }
   }
+
+  let resumedSession: HistoryProbeSession | null = null;
 
   class HistoryProbeClient implements AgentClient {
     readonly provider = "codex" as const;
@@ -4412,7 +4420,8 @@ test("reloadAgentSession preserves timeline and does not force history replay", 
         provider: "codex",
         cwd: overrides?.cwd ?? metadata.cwd ?? process.cwd(),
       };
-      return new HistoryProbeSession(merged, "history replay from provider");
+      resumedSession = new HistoryProbeSession(merged, "history replay from provider");
+      return resumedSession;
     }
   }
 
@@ -4452,6 +4461,7 @@ test("reloadAgentSession preserves timeline and does not force history replay", 
   await manager.hydrateTimelineFromProvider(snapshot.id);
   const afterHydrate = manager.getTimeline(snapshot.id);
   expect(afterHydrate).toEqual(beforeReload);
+  expect(resumedSession?.discardPendingHistoryCalls).toBe(1);
 });
 
 test("reloadAgentSession clears provider children before rehydrating from disk", async () => {

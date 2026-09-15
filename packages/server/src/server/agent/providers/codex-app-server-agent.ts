@@ -52,6 +52,7 @@ import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { composeSystemPromptParts } from "../system-prompt.js";
 import { curateAgentActivity } from "../activity-curator.js";
+import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
 import { CodexAsyncQuestions, codexAsyncQuestionToTimeline } from "./codex/async-questions.js";
 import {
   mapCodexToolCallEnvelope,
@@ -1973,11 +1974,24 @@ const CodexThreadReadResponseSchema = z
 type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
 type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
 
+const CodexThreadTimelineListResponseSchema = z
+  .object({
+    data: z.array(z.unknown()),
+    nextCursor: z.string().nullable(),
+  })
+  .passthrough();
+
+const CODEX_THREAD_TIMELINE_PAGE_SIZE = 25;
+
 function readCodexHistoricalTurnStatus(
   turns: CodexThreadReadResponse["thread"]["turns"],
 ): ToolCallTimelineItem["status"] | null {
   const latestTurn = toObjectRecord(turns.at(-1));
-  switch (latestTurn?.status) {
+  return codexTurnStatusToTimelineStatus(latestTurn?.status);
+}
+
+function codexTurnStatusToTimelineStatus(status: unknown): ToolCallTimelineItem["status"] | null {
+  switch (status) {
     case "completed":
       return "completed";
     case "interrupted":
@@ -2000,6 +2014,26 @@ async function requestCodexThreadHistory(
 }
 
 async function loadCodexThreadHistoryTimeline(params: {
+  threadId: string;
+  cwd: string | null;
+  client: CodexAppServerClientLike;
+}): Promise<CodexThreadHistoryProjection> {
+  try {
+    return await loadPaginatedCodexThreadHistoryTimeline(params);
+  } catch (error) {
+    if (!(error instanceof CodexAppServerRpcError) || error.code !== -32601) {
+      throw error;
+    }
+  }
+
+  return loadLegacyCodexThreadHistoryTimeline({
+    threadId: params.threadId,
+    cwd: params.cwd,
+    requestThread: (threadId) => readCodexThread(params.client, threadId),
+  });
+}
+
+async function loadLegacyCodexThreadHistoryTimeline(params: {
   threadId: string;
   cwd: string | null;
   requestThread: CodexThreadReadRequest;
@@ -2063,6 +2097,117 @@ async function loadCodexThreadHistoryTimeline(params: {
   };
 }
 
+async function loadPaginatedCodexThreadHistoryTimeline(params: {
+  threadId: string;
+  cwd: string | null;
+  client: CodexAppServerClientLike;
+}): Promise<CodexThreadHistoryProjection> {
+  const timeline: PersistedTimelineEntry[] = [];
+  const subAgentTimelineIndexByThreadId = new Map<string, number>();
+  const turnById = new Map<string, Record<string, unknown>>();
+  const unstampedTimelineIndexesByTurnId = new Map<string, number[]>();
+  const seenCursors = new Set<string>();
+  let latestTurnStatus: ToolCallTimelineItem["status"] | null = null;
+  let cursor: string | null = null;
+
+  const stampCompletedTurn = (turnId: string): void => {
+    const turn = turnById.get(turnId);
+    for (const index of unstampedTimelineIndexesByTurnId.get(turnId) ?? []) {
+      const entry = timeline[index];
+      if (entry && !entry.timestamp) {
+        entry.timestamp = readCodexTurnHistoryTimestamp(turn, entry.item) ?? undefined;
+      }
+    }
+    unstampedTimelineIndexesByTurnId.delete(turnId);
+  };
+
+  do {
+    const response = CodexThreadTimelineListResponseSchema.parse(
+      await params.client.request("thread/timeline/list", {
+        threadId: params.threadId,
+        cursor,
+        limit: CODEX_THREAD_TIMELINE_PAGE_SIZE,
+      }),
+    );
+    for (const rawEntry of response.data) {
+      const entry = toObjectRecord(rawEntry);
+      if (!entry) continue;
+      const turnId = typeof entry.turnId === "string" ? entry.turnId : null;
+      if (entry.type === "turnStarted" && turnId) {
+        turnById.set(turnId, entry);
+        latestTurnStatus = "running";
+        continue;
+      }
+      if (entry.type === "turnCompleted" && turnId) {
+        turnById.set(turnId, { ...turnById.get(turnId), ...entry });
+        latestTurnStatus = codexTurnStatusToTimelineStatus(entry.status);
+        stampCompletedTurn(turnId);
+        continue;
+      }
+      if (entry.type !== "item" || !turnId) continue;
+
+      const item = entry.item;
+      const historicalSubAgentActivity = readCodexSubAgentActivity(item);
+      if (historicalSubAgentActivity) {
+        const existingIndex = subAgentTimelineIndexByThreadId.get(
+          historicalSubAgentActivity.agentThreadId,
+        );
+        if (existingIndex !== undefined) {
+          const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
+          updateHistoricalSubAgentActivity(
+            timeline,
+            existingIndex,
+            historicalSubAgentActivity.kind,
+            activityTimelineItem?.type === "tool_call" &&
+              activityTimelineItem.detail.type === "sub_agent"
+              ? activityTimelineItem.detail.subAgentType
+              : undefined,
+          );
+          continue;
+        }
+      }
+      for (const rawTimelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+        const timelineItem = limitAgentTimelineItemContent(rawTimelineItem);
+        const itemTimestamp = readCodexHistoryTimestamp(item);
+        timeline.push({
+          item:
+            historicalSubAgentActivity && timelineItem.type === "tool_call"
+              ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
+              : timelineItem,
+          timestamp: itemTimestamp ?? undefined,
+          ...(timelineItem.type === "user_message" ? { providerTurnId: turnId } : {}),
+        });
+        if (!itemTimestamp) {
+          const indexes = unstampedTimelineIndexesByTurnId.get(turnId) ?? [];
+          indexes.push(timeline.length - 1);
+          unstampedTimelineIndexesByTurnId.set(turnId, indexes);
+        }
+        for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
+          subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
+        }
+      }
+    }
+    cursor = response.nextCursor;
+    if (cursor && seenCursors.has(cursor)) {
+      throw new Error(`Codex thread timeline repeated cursor ${cursor}`);
+    }
+    if (cursor) seenCursors.add(cursor);
+  } while (cursor);
+
+  for (const turnId of unstampedTimelineIndexesByTurnId.keys()) {
+    stampCompletedTurn(turnId);
+  }
+  const subAgentRoutes = Array.from(subAgentTimelineIndexByThreadId.entries()).flatMap(
+    ([childThreadId, timelineIndex]): PersistedSubAgentRoute[] => {
+      const item = timeline[timelineIndex]?.item;
+      return item?.type === "tool_call" && item.detail.type === "sub_agent"
+        ? [{ childThreadId, toolCall: item }]
+        : [];
+    },
+  );
+  return { timeline, subAgentRoutes, latestTurnStatus };
+}
+
 function readCodexThread(client: CodexAppServerClientLike, threadId: string): Promise<unknown> {
   return client.request("thread/read", {
     threadId,
@@ -2071,8 +2216,13 @@ function readCodexThread(client: CodexAppServerClientLike, threadId: string): Pr
 }
 
 function readActiveCodexTurnId(response: unknown): string | null {
-  const thread = toObjectRecord(toObjectRecord(response)?.thread);
-  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const responseRecord = toObjectRecord(response);
+  const thread = toObjectRecord(responseRecord?.thread);
+  const initialTurnsPage = toObjectRecord(responseRecord?.initialTurnsPage);
+  const turns = [
+    ...(Array.isArray(thread?.turns) ? thread.turns : []),
+    ...(Array.isArray(initialTurnsPage?.data) ? initialTurnsPage.data : []),
+  ];
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = toObjectRecord(turns[index]);
     if (turn?.status === "inProgress" && typeof turn.id === "string") {
@@ -3879,9 +4029,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const history = await loadCodexThreadHistoryTimeline({
       threadId,
       cwd: this.config.cwd ?? null,
-      requestThread: (threadIdToRead) => {
-        return readCodexThread(client, threadIdToRead);
-      },
+      client,
     });
     const { timeline, subAgentRoutes } = history;
     this.subAgentCallsByCallId.clear();
@@ -3933,7 +4081,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         const childHistory = await loadCodexThreadHistoryTimeline({
           threadId: next.route.childThreadId,
           cwd: this.config.cwd ?? null,
-          requestThread: (childThreadId) => readCodexThread(client, childThreadId),
+          client,
         });
         for (const entry of childHistory.timeline) {
           this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);
@@ -3968,7 +4116,11 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async ensureThreadLoaded(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
-    const params: Record<string, unknown> = { threadId: this.currentThreadId };
+    const params: Record<string, unknown> = {
+      threadId: this.currentThreadId,
+      excludeTurns: true,
+      initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
+    };
     const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
     if (this.hasWorkflowModeOverride) {
       if (this.providerOptions.approval_policy === undefined) {
@@ -4517,6 +4669,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         timestamp: entry.timestamp,
       };
     }
+  }
+
+  discardPendingHistory(): void {
+    this.persistedHistory = [];
+    this.persistedProviderSubagentEvents = [];
+    this.historyPending = false;
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {

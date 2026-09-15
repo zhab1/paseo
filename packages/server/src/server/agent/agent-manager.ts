@@ -3915,6 +3915,7 @@ export class AgentManager {
     options?: HydrateTimelineOptions,
   ): Promise<void> {
     if (agent.historyPrimed && !options?.force) {
+      agent.session.discardPendingHistory?.();
       return;
     }
 

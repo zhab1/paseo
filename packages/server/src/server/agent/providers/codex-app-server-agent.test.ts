@@ -123,6 +123,12 @@ interface CodexClientLike {
   request: (method: string, ...rest: unknown[]) => Promise<unknown>;
 }
 
+function rejectUnsupportedTimelineList(method: string): void {
+  if (method === "thread/timeline/list") {
+    throw new CodexAppServerRpcError("Method not found", -32601, null);
+  }
+}
+
 type CodexTestSession = AgentSession & {
   connectionState: "disconnected" | "history-ready" | "connected";
   currentThreadId: string | null;
@@ -1550,12 +1556,11 @@ describe("Codex app-server provider", () => {
       "thread/resume": (params) => {
         requests.push({ method: "thread/resume", params });
         return {
-          thread: {
-            id: "archived-thread-id",
-            turns: [
-              { id: "completed-turn", status: "completed", items: [] },
-              { id: "native-running-turn", status: "inProgress", items: [] },
-            ],
+          thread: { id: "archived-thread-id", turns: [] },
+          initialTurnsPage: {
+            data: [{ id: "native-running-turn", status: "inProgress", items: [] }],
+            nextCursor: null,
+            backwardsCursor: null,
           },
           sandbox: { type: "dangerFullAccess" },
         };
@@ -1583,6 +1588,8 @@ describe("Codex app-server provider", () => {
           threadId: "archived-thread-id",
           approvalPolicy: "never",
           sandbox: "danger-full-access",
+          excludeTurns: true,
+          initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
         }),
       },
       {
@@ -4240,6 +4247,7 @@ describe("Codex app-server provider", () => {
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
         requests.push({ method, params });
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -4275,6 +4283,7 @@ describe("Codex app-server provider", () => {
     }
 
     expect(requests.map((request) => [request.method, request.params])).toEqual([
+      ["thread/timeline/list", { threadId: "test-thread", cursor: null, limit: 25 }],
       ["thread/read", { threadId: "test-thread", includeTurns: true }],
     ]);
     expect(history).toEqual([
@@ -4300,25 +4309,120 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("loads Codex persisted history in bounded timeline pages", async () => {
+    const session = createSession();
+    const requests: Array<{ method: string; params: unknown }> = [];
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        requests.push({ method, params });
+        expect(method).toBe("thread/timeline/list");
+        const cursor = (params as { cursor?: string | null }).cursor;
+        if (!cursor) {
+          return {
+            data: [
+              {
+                type: "turnStarted",
+                position: 0,
+                turnId: "native-turn-1",
+                startedAt: 1_778_832_941,
+              },
+              {
+                type: "item",
+                position: 1,
+                turnId: "native-turn-1",
+                item: {
+                  type: "userMessage",
+                  id: "user-history",
+                  content: [{ type: "text", text: "Load this history." }],
+                },
+              },
+            ],
+            nextCursor: "page-2",
+          };
+        }
+        return {
+          data: [
+            {
+              type: "item",
+              position: 2,
+              turnId: "native-turn-1",
+              item: { type: "agentMessage", id: "message-history", text: "History loaded." },
+            },
+            {
+              type: "turnCompleted",
+              position: 3,
+              turnId: "native-turn-1",
+              status: "completed",
+              completedAt: 1_778_833_094,
+            },
+          ],
+          nextCursor: null,
+        };
+      }),
+    };
+
+    await asInternals(session).loadPersistedHistory(session.client);
+
+    const history: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) {
+      history.push(event);
+    }
+    expect(requests).toEqual([
+      {
+        method: "thread/timeline/list",
+        params: { threadId: "test-thread", cursor: null, limit: 25 },
+      },
+      {
+        method: "thread/timeline/list",
+        params: { threadId: "test-thread", cursor: "page-2", limit: 25 },
+      },
+    ]);
+    expect(history).toEqual([
+      {
+        type: "timeline",
+        provider: "codex",
+        timestamp: "2026-05-15T08:15:41.000Z",
+        item: {
+          type: "user_message",
+          text: "Load this history.",
+          messageId: "user-history",
+        },
+      },
+      {
+        type: "timeline",
+        provider: "codex",
+        timestamp: "2026-05-15T08:18:14.000Z",
+        item: {
+          type: "assistant_message",
+          text: "History loaded.",
+          messageId: "message-history",
+        },
+      },
+    ]);
+  });
+
   test("retains native turn ids from persisted user messages", async () => {
     const session = createSession();
     session.client = {
-      request: vi.fn(async () => ({
-        thread: {
-          turns: [
-            {
-              id: "native-turn-1",
-              items: [
-                {
-                  type: "userMessage",
-                  id: "message-history",
-                  content: [{ type: "text", text: "History prompt" }],
-                },
-              ],
-            },
-          ],
-        },
-      })),
+      request: vi.fn(async (method: string) => {
+        rejectUnsupportedTimelineList(method);
+        return {
+          thread: {
+            turns: [
+              {
+                id: "native-turn-1",
+                items: [
+                  {
+                    type: "userMessage",
+                    id: "message-history",
+                    content: [{ type: "text", text: "History prompt" }],
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }),
     };
 
     await asInternals(session).loadPersistedHistory(session.client);
@@ -4333,6 +4437,7 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -4511,6 +4616,7 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -4574,6 +4680,7 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -4763,6 +4870,7 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string) => {
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -4826,6 +4934,7 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string) => {
+        rejectUnsupportedTimelineList(method);
         if (method !== "thread/read") {
           return {};
         }
@@ -5151,6 +5260,8 @@ describe("Codex app-server provider", () => {
           threadId: "archived-thread-id",
           approvalPolicy: "on-request",
           sandbox: "workspace-write",
+          excludeTurns: true,
+          initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
         },
       },
     ]);
