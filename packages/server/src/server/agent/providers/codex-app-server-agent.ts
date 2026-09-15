@@ -895,17 +895,6 @@ function isUnsupportedCodexThreadSettingsUpdate(error: unknown): boolean {
   );
 }
 
-function isUnsupportedCodexThreadTimelineList(error: unknown): boolean {
-  return (
-    error instanceof CodexAppServerRpcError &&
-    (error.code === -32601 ||
-      (error.code === -32600 &&
-        error.message.startsWith(
-          "Invalid request: unknown variant `thread/timeline/list`, expected one of ",
-        )))
-  );
-}
-
 // Codex app-server API response types
 interface CodexReasoningEffortEntry {
   reasoningEffort?: string;
@@ -2032,7 +2021,9 @@ async function loadCodexThreadHistoryTimeline(params: {
   try {
     return await loadPaginatedCodexThreadHistoryTimeline(params);
   } catch (error) {
-    if (!isUnsupportedCodexThreadTimelineList(error)) throw error;
+    if (!(error instanceof CodexAppServerRpcError) || error.code !== -32601) {
+      throw error;
+    }
   }
 
   return loadLegacyCodexThreadHistoryTimeline({

@@ -188,11 +188,7 @@ export function createFakeCodexAppServer(
     },
     "thread/read": () => ({ thread: { turns: [] } }),
     "thread/timeline/list": () => ({
-      __jsonRpcError: {
-        code: -32600,
-        message:
-          "Invalid request: unknown variant `thread/timeline/list`, expected one of `thread/read`",
-      },
+      __jsonRpcError: { code: -32601, message: "Method not found" },
     }),
     ...handlers,
   };
