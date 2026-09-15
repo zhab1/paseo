@@ -2121,6 +2121,64 @@ async function loadPaginatedCodexThreadHistoryTimeline(params: {
     unstampedTimelineIndexesByTurnId.delete(turnId);
   };
 
+  const updateExistingSubAgent = (item: unknown, activity: CodexSubAgentActivity): boolean => {
+    const existingIndex = subAgentTimelineIndexByThreadId.get(activity.agentThreadId);
+    if (existingIndex === undefined) return false;
+    const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
+    updateHistoricalSubAgentActivity(
+      timeline,
+      existingIndex,
+      activity.kind,
+      activityTimelineItem?.type === "tool_call" && activityTimelineItem.detail.type === "sub_agent"
+        ? activityTimelineItem.detail.subAgentType
+        : undefined,
+    );
+    return true;
+  };
+
+  const appendEntry = (rawEntry: unknown): void => {
+    const entry = toObjectRecord(rawEntry);
+    if (!entry) return;
+    const turnId = typeof entry.turnId === "string" ? entry.turnId : null;
+    if (entry.type === "turnStarted" && turnId) {
+      turnById.set(turnId, entry);
+      latestTurnStatus = "running";
+      return;
+    }
+    if (entry.type === "turnCompleted" && turnId) {
+      turnById.set(turnId, { ...turnById.get(turnId), ...entry });
+      latestTurnStatus = codexTurnStatusToTimelineStatus(entry.status);
+      stampCompletedTurn(turnId);
+      return;
+    }
+    if (entry.type !== "item" || !turnId) return;
+
+    const item = entry.item;
+    const historicalSubAgentActivity = readCodexSubAgentActivity(item);
+    if (historicalSubAgentActivity && updateExistingSubAgent(item, historicalSubAgentActivity))
+      return;
+    for (const rawTimelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+      const timelineItem = limitAgentTimelineItemContent(rawTimelineItem);
+      const itemTimestamp = readCodexHistoryTimestamp(item);
+      timeline.push({
+        item:
+          historicalSubAgentActivity && timelineItem.type === "tool_call"
+            ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
+            : timelineItem,
+        timestamp: itemTimestamp ?? undefined,
+        ...(timelineItem.type === "user_message" ? { providerTurnId: turnId } : {}),
+      });
+      if (!itemTimestamp) {
+        const indexes = unstampedTimelineIndexesByTurnId.get(turnId) ?? [];
+        indexes.push(timeline.length - 1);
+        unstampedTimelineIndexesByTurnId.set(turnId, indexes);
+      }
+      for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
+        subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
+      }
+    }
+  };
+
   do {
     const response = CodexThreadTimelineListResponseSchema.parse(
       await params.client.request("thread/timeline/list", {
@@ -2129,64 +2187,7 @@ async function loadPaginatedCodexThreadHistoryTimeline(params: {
         limit: CODEX_THREAD_TIMELINE_PAGE_SIZE,
       }),
     );
-    for (const rawEntry of response.data) {
-      const entry = toObjectRecord(rawEntry);
-      if (!entry) continue;
-      const turnId = typeof entry.turnId === "string" ? entry.turnId : null;
-      if (entry.type === "turnStarted" && turnId) {
-        turnById.set(turnId, entry);
-        latestTurnStatus = "running";
-        continue;
-      }
-      if (entry.type === "turnCompleted" && turnId) {
-        turnById.set(turnId, { ...turnById.get(turnId), ...entry });
-        latestTurnStatus = codexTurnStatusToTimelineStatus(entry.status);
-        stampCompletedTurn(turnId);
-        continue;
-      }
-      if (entry.type !== "item" || !turnId) continue;
-
-      const item = entry.item;
-      const historicalSubAgentActivity = readCodexSubAgentActivity(item);
-      if (historicalSubAgentActivity) {
-        const existingIndex = subAgentTimelineIndexByThreadId.get(
-          historicalSubAgentActivity.agentThreadId,
-        );
-        if (existingIndex !== undefined) {
-          const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
-          updateHistoricalSubAgentActivity(
-            timeline,
-            existingIndex,
-            historicalSubAgentActivity.kind,
-            activityTimelineItem?.type === "tool_call" &&
-              activityTimelineItem.detail.type === "sub_agent"
-              ? activityTimelineItem.detail.subAgentType
-              : undefined,
-          );
-          continue;
-        }
-      }
-      for (const rawTimelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
-        const timelineItem = limitAgentTimelineItemContent(rawTimelineItem);
-        const itemTimestamp = readCodexHistoryTimestamp(item);
-        timeline.push({
-          item:
-            historicalSubAgentActivity && timelineItem.type === "tool_call"
-              ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
-              : timelineItem,
-          timestamp: itemTimestamp ?? undefined,
-          ...(timelineItem.type === "user_message" ? { providerTurnId: turnId } : {}),
-        });
-        if (!itemTimestamp) {
-          const indexes = unstampedTimelineIndexesByTurnId.get(turnId) ?? [];
-          indexes.push(timeline.length - 1);
-          unstampedTimelineIndexesByTurnId.set(turnId, indexes);
-        }
-        for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
-          subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
-        }
-      }
-    }
+    response.data.forEach(appendEntry);
     cursor = response.nextCursor;
     if (cursor && seenCursors.has(cursor)) {
       throw new Error(`Codex thread timeline repeated cursor ${cursor}`);
