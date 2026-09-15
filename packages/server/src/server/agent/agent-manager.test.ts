@@ -694,6 +694,48 @@ test("uses an injected timeline store without making it a production requirement
   }
 });
 
+test("skips provider history when a resumed agent already has durable timeline rows", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-durable-resume-"));
+  const agentId = "00000000-0000-4000-8000-000000000114";
+  const store = new RecordingTimelineStore();
+  await store.appendCommitted(agentId, { type: "assistant_message", text: "durable history" });
+  let resumeOptions: AgentResumeSessionOptions | undefined;
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+      _launchContext?: AgentLaunchContext,
+      options?: AgentResumeSessionOptions,
+    ): Promise<AgentSession> {
+      resumeOptions = options;
+      return new TestAgentSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    durableTimelineStore: store,
+    logger,
+  });
+
+  try {
+    await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "durable-resume" },
+      { cwd: workdir },
+      agentId,
+    );
+    expect(resumeOptions?.loadHistory).toBe(false);
+    await expect(manager.getTimelineRows(agentId)).resolves.toContainEqual(
+      expect.objectContaining({
+        item: { type: "assistant_message", text: "durable history" },
+      }),
+    );
+    expect(manager.getAgent(agentId)?.historyPrimed).toBe(true);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("retries provider history hydration after a stream failure", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-retry-"));
   let attempts = 0;

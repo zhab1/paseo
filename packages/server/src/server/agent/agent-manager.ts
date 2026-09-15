@@ -1340,8 +1340,16 @@ export class AgentManager {
     // have read the record before a queued archive or restore completed.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
     const currentResumeOptions = record
-      ? { purpose: record.archivedAt ? ("history" as const) : ("interactive" as const) }
+      ? {
+          ...resumeOptions,
+          purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+        }
       : resumeOptions;
+    const loadHistory =
+      currentResumeOptions?.loadHistory ??
+      (!this.timelineStore.has(resolvedAgentId) &&
+        (!this.durableTimelineStore ||
+          (await this.durableTimelineStore.getLatestCommittedSeq(resolvedAgentId)) === 0));
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
@@ -1363,12 +1371,10 @@ export class AgentManager {
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const session = await client.resumeSession(
-      handle,
-      providerLaunchConfig,
-      launchContext,
-      currentResumeOptions,
-    );
+    const session = await client.resumeSession(handle, providerLaunchConfig, launchContext, {
+      ...currentResumeOptions,
+      loadHistory,
+    });
     await this.requireExternalMcpSupport(session, storedConfig);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
@@ -1488,6 +1494,7 @@ export class AgentManager {
     }
     const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
     const preservedHistoryPrimed = existing.historyPrimed;
+    const resumedHistoryPrimed = rehydrateFromDisk ? false : preservedHistoryPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
     const preservedAttention = existing.attention;
@@ -1535,7 +1542,9 @@ export class AgentManager {
 
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
       session = handle
-        ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
+        ? await client.resumeSession(handle, providerLaunchConfig, launchContext, {
+            loadHistory: !resumedHistoryPrimed,
+          })
         : await client.createSession(providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, storedConfig);
       this.assertAcceptingAgentRegistrations();
@@ -1558,7 +1567,7 @@ export class AgentManager {
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
-        historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
+        historyPrimed: resumedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
         attention: preservedAttention,
