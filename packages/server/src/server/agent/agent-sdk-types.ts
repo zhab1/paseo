@@ -667,8 +667,6 @@ export interface AgentSession {
   steerActiveTurn?(prompt: AgentPromptInput, options: SteerActiveTurnOptions): Promise<SteerResult>;
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
-  /** Release provider history that the manager already restored from its durable timeline. */
-  discardPendingHistory?(): void;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   /** Return the provider turn rejoined during session resume, if one is still running. */
   getActiveTurnId?(): string | null;
