@@ -5415,7 +5415,7 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo"]);
 });
 
-test("timestamps an identified assistant message after an id-less notice", () => {
+test("does not insert a timestamp when the message id changes within one assistant stream", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5439,7 +5439,7 @@ test("timestamps an identified assistant message after an id-less notice", () =>
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", text: "Notice" },
+      item: { type: "assistant_message", messageId: "message-a", text: "The" },
     },
   });
   listener({
@@ -5449,7 +5449,11 @@ test("timestamps an identified assistant message after an id-less notice", () =>
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", messageId: "message-a", text: "# Answer" },
+      item: {
+        type: "assistant_message",
+        messageId: "message-b",
+        text: " documentation PR is being checked",
+      },
     },
   });
 
@@ -5461,7 +5465,7 @@ test("timestamps an identified assistant message after an id-less notice", () =>
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:20 UTC: Notice", "20 Sep 14:11:21 UTC: # Answer"]);
+  ).toEqual(["20 Sep 14:11:20 UTC: The", " documentation PR is being checked"]);
 });
 
 test("prepends mobile timestamps without changing assistant text", () => {
@@ -5536,7 +5540,7 @@ test("prepends mobile timestamps without changing assistant text", () => {
   ]).toEqual([
     "20 Sep 14:11:19 UTC: \n\n---\n\n",
     "Answer",
-    "20 Sep 14:11:21 UTC: \n\n---\n\nAnswer",
+    "\n\n---\n\nAnswer",
     "20 Sep 14:11:22 UTC: \n\n---\n\nHistory",
     "20 Sep 14:11:23 UTC: 19 Sep 01:02:03 UTC: Agent prefix",
   ]);

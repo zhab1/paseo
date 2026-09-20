@@ -737,10 +737,7 @@ export class Session {
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
   private readonly rewindInitiators = new Map<string, object | undefined>();
-  private readonly streamingAssistantMessages = new Map<
-    string,
-    { messageId?: string; turnId?: string }
-  >();
+  private readonly streamingAssistantMessages = new Map<string, { turnId?: string }>();
 
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
@@ -1380,14 +1377,8 @@ export class Session {
       return event;
     }
     const previous = this.streamingAssistantMessages.get(agentId);
-    const startsNewMessage =
-      previous === undefined ||
-      previous.turnId !== event.turnId ||
-      (event.item.messageId !== undefined && previous.messageId !== event.item.messageId);
-    this.streamingAssistantMessages.set(agentId, {
-      ...(event.item.messageId ? { messageId: event.item.messageId } : {}),
-      ...(event.turnId ? { turnId: event.turnId } : {}),
-    });
+    const startsNewMessage = previous === undefined || previous.turnId !== event.turnId;
+    this.streamingAssistantMessages.set(agentId, event.turnId ? { turnId: event.turnId } : {});
     if (!startsNewMessage) return event;
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
