@@ -90,6 +90,11 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  projectTimelineItem(
+    provider: string,
+    item: { type: "assistant_message"; text: string; messageId?: string },
+    timestamp: string,
+  ): { type: "assistant_message"; text: string; messageId?: string };
 }
 
 function asSessionInternals(session: Session): SessionHandlerInternals {
@@ -5501,6 +5506,114 @@ test("replaces the streamed Codex message boundary with an inline mobile timesta
         : [],
     ),
   ).toEqual(["20 Sep 14:11:20 UTC: Answer"]);
+});
+
+test("removes an empty streamed Codex boundary before timestamping its message", () => {
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    clientType: "mobile",
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        listeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities(null, {});
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:19.000Z",
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: "message-a", text: "\n\n---\n\n" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:20.000Z",
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: "message-a", text: "Answer" },
+    },
+  });
+
+  expect(
+    messages.flatMap((message) =>
+      message.type === "agent_stream" &&
+      message.payload.event.type === "timeline" &&
+      message.payload.event.item.type === "assistant_message"
+        ? [message.payload.event.item.text]
+        : [],
+    ),
+  ).toEqual(["", "20 Sep 14:11:20 UTC: Answer"]);
+});
+
+test("preserves non-Codex markdown boundaries in mobile assistant messages", () => {
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    clientType: "mobile",
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        listeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities(null, {});
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:20.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: {
+        type: "assistant_message",
+        messageId: "message-a",
+        text: "\n\n---\n\nAnswer",
+      },
+    },
+  });
+
+  expect(
+    messages.flatMap((message) =>
+      message.type === "agent_stream" &&
+      message.payload.event.type === "timeline" &&
+      message.payload.event.item.type === "assistant_message"
+        ? [message.payload.event.item.text]
+        : [],
+    ),
+  ).toEqual(["20 Sep 14:11:20 UTC: \n\n---\n\nAnswer"]);
+});
+
+test("replaces persisted Codex message boundaries with inline mobile timestamps", () => {
+  const session = createSessionForTest({ clientType: "mobile" });
+
+  expect(
+    asSessionInternals(session).projectTimelineItem(
+      "codex",
+      { type: "assistant_message", messageId: "message-a", text: "\n\n---\n\nAnswer" },
+      "2026-09-20T14:11:20.000Z",
+    ),
+  ).toEqual({
+    type: "assistant_message",
+    messageId: "message-a",
+    text: "20 Sep 14:11:20 UTC: Answer",
+  });
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
