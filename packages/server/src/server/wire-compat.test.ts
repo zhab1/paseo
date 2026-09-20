@@ -333,6 +333,20 @@ describe("wire compatibility", () => {
         timestamp: "2026-09-20T14:11:29.000Z",
         item: { type: "assistant_message", text: "ne", messageId: "message-1" },
       },
+      {
+        seq: 3,
+        timestamp: "2026-09-20T14:11:30.000Z",
+        item: {
+          type: "assistant_message",
+          text: "20 Sep 14:11:30 UTC:\n\nAlready timestamped",
+          messageId: "message-2",
+        },
+      },
+      {
+        seq: 4,
+        timestamp: "2026-09-20T14:11:31.000Z",
+        item: { type: "assistant_message", text: "", messageId: "message-3" },
+      },
     ];
 
     const mobile = await emitTimelineResponse({ clientType: "mobile", rows });
@@ -348,9 +362,25 @@ describe("wire compatibility", () => {
       text: "Done",
       messageId: "message-1",
     });
+    expect(mobile.payload.entries[1]?.item).toEqual({
+      type: "assistant_message",
+      text: "20 Sep 14:11:30 UTC:\n\nAlready timestamped",
+      messageId: "message-2",
+    });
+    expect(mobile.payload.entries[2]?.item).toEqual({
+      type: "assistant_message",
+      text: "",
+      messageId: "message-3",
+    });
     expect(rows.map((row) => row.item)).toEqual([
       { type: "assistant_message", text: "Do", messageId: "message-1" },
       { type: "assistant_message", text: "ne", messageId: "message-1" },
+      {
+        type: "assistant_message",
+        text: "20 Sep 14:11:30 UTC:\n\nAlready timestamped",
+        messageId: "message-2",
+      },
+      { type: "assistant_message", text: "", messageId: "message-3" },
     ]);
   });
 
