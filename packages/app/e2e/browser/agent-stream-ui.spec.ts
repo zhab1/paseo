@@ -76,7 +76,9 @@ test.describe("Agent stream UI", () => {
       const assistantMessage = page.getByTestId("assistant-message").last();
       await expect(assistantMessage).toContainText("walking through", { timeout: 30_000 });
 
-      const activeBlock = assistantMessage.locator(":scope > *").last();
+      const activeBlock = assistantMessage
+        .locator(':scope > :not([data-testid="assistant-message-trailing-row"])')
+        .last();
       const initialText = (await activeBlock.textContent()) ?? "";
       const activeBlockHandle = await activeBlock.elementHandle();
       if (!activeBlockHandle) {
@@ -119,7 +121,10 @@ test.describe("Agent stream UI", () => {
         state.__markdownRootObserver?.disconnect();
         const messages = document.querySelectorAll('[data-testid="assistant-message"]');
         const message = messages.item(messages.length - 1);
-        const block = message?.lastElementChild;
+        const blocks = message?.querySelectorAll(
+          ':scope > :not([data-testid="assistant-message-trailing-row"])',
+        );
+        const block = blocks?.item((blocks?.length ?? 0) - 1);
         return {
           ...state.__markdownRootEvidence,
           connected: root.isConnected,
@@ -267,6 +272,12 @@ test.describe("Agent stream UI", () => {
     });
     try {
       await awaitAssistantMessage(page);
+      const assistantMessage = page.getByTestId("assistant-message").last();
+      const timestampRow = assistantMessage.getByTestId("assistant-message-trailing-row");
+      await expect(assistantMessage.getByTestId("assistant-message-timestamp")).toBeAttached();
+      await expect(timestampRow).toHaveCSS("opacity", "0");
+      await assistantMessage.hover();
+      await expect(timestampRow).toHaveCSS("opacity", "1");
       await expectInlineWorkingIndicator(page);
       await expectAgentIdle(page, 30_000);
       await scrollAgentChatToBottom(page);

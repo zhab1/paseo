@@ -2,6 +2,10 @@
 
 ## 0.9.0-beta.2 - 2026-09-18
 
+### Added
+
+- Added per-message timestamps to assistant replies, matching user-message timestamp visibility
+
 ### Fixed
 
 - Fixed every workspace showing the restart time as its last activity after relaunching ([#5040](https://github.com/getpaseo/paseo/pull/5040))

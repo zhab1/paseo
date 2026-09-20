@@ -777,6 +777,22 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
     fontStyle: "italic",
     color: theme.colors.foregroundMuted,
   },
+  trailingRow: {
+    alignSelf: "flex-end",
+    height: 24,
+    justifyContent: "center",
+    marginTop: theme.spacing[2],
+  },
+  trailingRowHidden: {
+    opacity: 0,
+  },
+  trailingRowVisible: {
+    opacity: 1,
+  },
+  timestampText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+  },
   imageFrame: {
     width: "100%",
     minHeight: 160,
@@ -1496,7 +1512,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
   occurrenceKey,
   message,
-  timestamp: _timestamp,
+  timestamp,
   workspaceRoot,
   serverId,
   client,
@@ -1504,6 +1520,15 @@ export const AssistantMessage = memo(function AssistantMessage({
   phase,
 }: AssistantMessageProps) {
   const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
+  const [isHovered, setIsHovered] = useState(false);
+  const showTrailingRow = isCompact || isNative || isHovered;
+  const formattedTimestamp = useMemo(
+    () => formatMessageTimestamp(new Date(timestamp)),
+    [timestamp],
+  );
+  const handlePointerEnter = useCallback(() => setIsHovered(true), []);
+  const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const markdownParser = useMemo(createAssistantMarkdownParser, []);
   const streamingMarkdownParser = useMemo(
     () => createAssistantMarkdownParser({ streaming: true }),
@@ -1974,6 +1999,15 @@ export const AssistantMessage = memo(function AssistantMessage({
     ],
     [spacing],
   );
+  const trailingRowStyle = useMemo(
+    () => [
+      assistantMessageStylesheet.trailingRow,
+      showTrailingRow
+        ? assistantMessageStylesheet.trailingRowVisible
+        : assistantMessageStylesheet.trailingRowHidden,
+    ],
+    [showTrailingRow],
+  );
   const revealDataSet = useMemo(
     () =>
       isRenderProfileEnabled()
@@ -1987,7 +2021,13 @@ export const AssistantMessage = memo(function AssistantMessage({
   );
 
   return (
-    <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
+    <View
+      testID="assistant-message"
+      dataSet={revealDataSet}
+      style={assistantContainerStyle}
+      onPointerEnter={handlePointerEnter}
+      onPointerLeave={handlePointerLeave}
+    >
       {keyedBlocks.map(({ key, block }, index) => (
         <AssistantMessageBlockContainer
           key={key}
@@ -2014,6 +2054,18 @@ export const AssistantMessage = memo(function AssistantMessage({
           {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
         </Text>
       ) : null}
+      <View
+        style={trailingRowStyle}
+        pointerEvents={showTrailingRow ? "auto" : "none"}
+        testID="assistant-message-trailing-row"
+      >
+        <Text
+          style={assistantMessageStylesheet.timestampText}
+          testID="assistant-message-timestamp"
+        >
+          {formattedTimestamp}
+        </Text>
+      </View>
     </View>
   );
 });
