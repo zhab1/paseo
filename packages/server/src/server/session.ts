@@ -715,7 +715,7 @@ export class Session {
   );
   private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
   private readonly clientId: string;
-  private readonly clientType: WSHelloMessage["clientType"] | null;
+  private readonly clientType: WSHelloMessage["clientType"] | undefined;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -881,7 +881,7 @@ export class Session {
     } = options;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
-    this.clientType = clientType ?? null;
+    this.clientType = clientType;
     this.authorization = new SessionAuthorization(permissions);
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
@@ -1305,38 +1305,11 @@ export class Session {
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
   ): void {
-    const timestamp = event.timestamp ?? new Date().toISOString();
-    let projectedEvent = serializedEvent;
-    if (this.clientType === "mobile") {
-      const assistantEvent = serializedEvent.type === "timeline" ? serializedEvent : null;
-      const assistantItem =
-        assistantEvent?.item.type === "assistant_message" ? assistantEvent.item : null;
-      const previous = this.streamingAssistantMessages.get(event.agentId);
-      const startsNewMessage =
-        assistantItem !== null &&
-        (previous === undefined ||
-          previous.turnId !== assistantEvent?.turnId ||
-          (previous.messageId !== undefined &&
-            assistantItem.messageId !== undefined &&
-            previous.messageId !== assistantItem.messageId));
-      if (assistantEvent !== null && assistantItem !== null) {
-        this.streamingAssistantMessages.set(event.agentId, {
-          ...(assistantItem.messageId ? { messageId: assistantItem.messageId } : {}),
-          ...(assistantEvent.turnId ? { turnId: assistantEvent.turnId } : {}),
-        });
-        if (startsNewMessage) {
-          const timestampText = formatAssistantTimestamp(timestamp);
-          if (timestampText) {
-            projectedEvent = {
-              ...assistantEvent,
-              item: { ...assistantItem, text: `${timestampText} ${assistantItem.text}` },
-            };
-          }
-        }
-      } else {
-        this.streamingAssistantMessages.delete(event.agentId);
-      }
-    }
+    const projectedEvent = this.projectLiveAssistantTimestamp(
+      event.agentId,
+      serializedEvent,
+      event.timestamp,
+    );
 
     if (projectedEvent.type === "attention_required") {
       this.emit({
@@ -1392,6 +1365,36 @@ export class Session {
       this.timelineSubscriptions.size === 0
     )
       this.emit(message);
+  }
+
+  private projectLiveAssistantTimestamp(
+    agentId: string,
+    event: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+    timestamp?: string,
+  ): typeof event {
+    if (
+      this.clientType !== "mobile" ||
+      event.type !== "timeline" ||
+      event.item.type !== "assistant_message"
+    ) {
+      this.streamingAssistantMessages.delete(agentId);
+      return event;
+    }
+    const previous = this.streamingAssistantMessages.get(agentId);
+    const startsNewMessage =
+      previous === undefined ||
+      previous.turnId !== event.turnId ||
+      (previous.messageId !== undefined &&
+        event.item.messageId !== undefined &&
+        previous.messageId !== event.item.messageId);
+    this.streamingAssistantMessages.set(agentId, {
+      ...(event.item.messageId ? { messageId: event.item.messageId } : {}),
+      ...(event.turnId ? { turnId: event.turnId } : {}),
+    });
+    if (!startsNewMessage) return event;
+    const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
+    if (!timestampText) return event;
+    return { ...event, item: { ...event.item, text: `${timestampText} ${event.item.text}` } };
   }
 
   private projectTimelineItem(
