@@ -453,7 +453,8 @@ function formatAssistantTimestamp(timestamp: string): string | null {
   const month = ASSISTANT_TIMESTAMP_MONTHS[date.getUTCMonth()];
   const hours = String(date.getUTCHours()).padStart(2, "0");
   const minutes = String(date.getUTCMinutes()).padStart(2, "0");
-  return `${day} ${month} ${hours}:${minutes} UTC`;
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+  return `${day} ${month} ${hours}:${minutes}:${seconds} UTC:`;
 }
 
 // Stub types for features under development (modules not yet available)
@@ -737,14 +738,9 @@ export class Session {
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
   private readonly rewindInitiators = new Map<string, object | undefined>();
-  private readonly pendingAssistantTimestamps = new Map<
+  private readonly streamingAssistantMessages = new Map<
     string,
-    {
-      provider: ManagedAgent["provider"];
-      timestamp: string;
-      messageId?: string;
-      turnId?: string;
-    }
+    { messageId?: string; turnId?: string }
   >();
 
   private agentManager: AgentManager;
@@ -1309,60 +1305,59 @@ export class Session {
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
   ): void {
+    const timestamp = event.timestamp ?? new Date().toISOString();
+    let projectedEvent = serializedEvent;
     if (this.clientType === "mobile") {
       const assistantEvent = serializedEvent.type === "timeline" ? serializedEvent : null;
       const assistantItem =
         assistantEvent?.item.type === "assistant_message" ? assistantEvent.item : null;
-      const pending = this.pendingAssistantTimestamps.get(event.agentId);
+      const previous = this.streamingAssistantMessages.get(event.agentId);
       const startsNewMessage =
         assistantItem !== null &&
-        pending !== undefined &&
-        (pending.turnId !== assistantEvent?.turnId ||
-          (pending.messageId !== undefined &&
+        (previous === undefined ||
+          previous.turnId !== assistantEvent?.turnId ||
+          (previous.messageId !== undefined &&
             assistantItem.messageId !== undefined &&
-            pending.messageId !== assistantItem.messageId));
-      if (assistantItem === null || startsNewMessage) {
-        this.flushAssistantTimestamp(event.agentId);
-      }
+            previous.messageId !== assistantItem.messageId));
       if (assistantEvent !== null && assistantItem !== null) {
-        this.pendingAssistantTimestamps.set(event.agentId, {
-          provider: assistantEvent.provider,
-          timestamp: event.timestamp ?? new Date().toISOString(),
+        this.streamingAssistantMessages.set(event.agentId, {
           ...(assistantItem.messageId ? { messageId: assistantItem.messageId } : {}),
           ...(assistantEvent.turnId ? { turnId: assistantEvent.turnId } : {}),
         });
+        if (startsNewMessage) {
+          const timestampText = formatAssistantTimestamp(timestamp);
+          if (timestampText) {
+            projectedEvent = {
+              ...assistantEvent,
+              item: { ...assistantItem, text: `${timestampText} ${assistantItem.text}` },
+            };
+          }
+        }
+      } else {
+        this.streamingAssistantMessages.delete(event.agentId);
       }
     }
 
-    const attention = serializedEvent.type === "attention_required";
-    if (attention) {
+    if (projectedEvent.type === "attention_required") {
       this.emit({
         type: "agent_attention_required",
         payload: {
           agentId: event.agentId,
-          reason: serializedEvent.reason,
-          timestamp: serializedEvent.timestamp,
-          shouldNotify: serializedEvent.shouldNotify,
-          ...(serializedEvent.notification ? { notification: serializedEvent.notification } : {}),
+          reason: projectedEvent.reason,
+          timestamp: projectedEvent.timestamp,
+          shouldNotify: projectedEvent.shouldNotify,
+          ...(projectedEvent.notification ? { notification: projectedEvent.notification } : {}),
         },
       });
     }
+    const attention = projectedEvent.type === "attention_required";
     const message: SessionOutboundMessage = {
       type: "agent_stream",
-      payload: this.buildAgentStreamPayload(event, serializedEvent),
+      payload: this.buildAgentStreamPayload(event, projectedEvent),
     };
-    this.deliverAgentStreamMessage(event.agentId, serializedEvent, message, attention);
-  }
-
-  private deliverAgentStreamMessage(
-    agentId: string,
-    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
-    message: SessionOutboundMessage,
-    attention = false,
-  ): void {
     for (const subscription of this.timelineSubscriptions.values()) {
       const source = subscription.owner.source;
-      if (!subscription.agentIds.has(agentId)) continue;
+      if (!subscription.agentIds.has(event.agentId)) continue;
       if (
         attention &&
         (this.delivery.isModern(source) ||
@@ -1370,8 +1365,8 @@ export class Session {
       )
         continue;
       if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
+        projectedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(projectedEvent.item, source)
       )
         continue;
       subscription.owner.emit(message);
@@ -1381,13 +1376,13 @@ export class Session {
       if (this.delivery.isModern(source) || capabilities.has(CLIENT_CAPS.selectiveAgentTimeline))
         continue;
       if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
+        projectedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(projectedEvent.item, source)
       )
         continue;
       const alreadyDelivered = [...this.timelineSubscriptions.values()].some(
         (subscription) =>
-          subscription.owner.source === source && subscription.agentIds.has(agentId),
+          subscription.owner.source === source && subscription.agentIds.has(event.agentId),
       );
       if (!alreadyDelivered) this.onMessageToSource?.(source, message);
     }
@@ -1399,31 +1394,6 @@ export class Session {
       this.emit(message);
   }
 
-  private flushAssistantTimestamp(agentId: string): void {
-    const pending = this.pendingAssistantTimestamps.get(agentId);
-    if (!pending) return;
-    this.pendingAssistantTimestamps.delete(agentId);
-    const timestampText = formatAssistantTimestamp(pending.timestamp);
-    if (!timestampText) return;
-    const serializedEvent: Extract<
-      Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
-      { type: "timeline" }
-    > = {
-      type: "timeline",
-      provider: pending.provider,
-      item: {
-        type: "assistant_message",
-        text: `\n\n_${timestampText}_`,
-        ...(pending.messageId ? { messageId: pending.messageId } : {}),
-      },
-      ...(pending.turnId ? { turnId: pending.turnId } : {}),
-    };
-    this.deliverAgentStreamMessage(agentId, serializedEvent, {
-      type: "agent_stream",
-      payload: { agentId, event: serializedEvent, timestamp: pending.timestamp },
-    });
-  }
-
   private projectTimelineItem(
     item: AgentTimelineFetchResult["rows"][number]["item"],
     timestamp: string,
@@ -1431,7 +1401,7 @@ export class Session {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${item.text}\n\n_${timestampText}_` };
+    return { ...item, text: `${timestampText} ${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -4788,7 +4758,7 @@ export class Session {
   }
 
   private deliverTimelineReplacement(agentId: string, initiatingSource?: object): void {
-    this.pendingAssistantTimestamps.delete(agentId);
+    this.streamingAssistantMessages.delete(agentId);
     const agent = this.agentManager.getAgent(agentId);
     if (!agent) return;
     const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });

@@ -5346,7 +5346,7 @@ test("unions viewed timelines across socket sources and removes detached sources
   ).toEqual(["agent-b"]);
 });
 
-test("appends one timestamp after a streamed mobile assistant message", () => {
+test("prepends one timestamp to a streamed mobile assistant message", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5398,7 +5398,7 @@ test("appends one timestamp after a streamed mobile assistant message", () => {
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["Hel", "lo", "\n\n_20 Sep 14:11 UTC_"]);
+  ).toEqual(["20 Sep 14:11:20 UTC: Hel", "lo"]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
