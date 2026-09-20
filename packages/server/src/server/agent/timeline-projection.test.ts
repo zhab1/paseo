@@ -647,7 +647,7 @@ describe("selectProjectedTimelinePage", () => {
           type: "assistant_message",
           text: "x".repeat(200),
         },
-        timestamp: new Date(1199).toISOString(),
+        timestamp: new Date(1000).toISOString(),
         seqStart: 1,
         seqEnd: 200,
         sourceSeqRanges: [{ startSeq: 1, endSeq: 200 }],
