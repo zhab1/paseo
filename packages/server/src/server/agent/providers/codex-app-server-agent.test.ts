@@ -4828,6 +4828,66 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("uses per-message rollout timestamps before a shared Codex turn timestamp", async () => {
+    const rolloutDir = await mkdtemp(path.join(tmpdir(), "paseo-codex-rollout-"));
+    const rolloutPath = path.join(rolloutDir, "rollout.jsonl");
+    writeFileSync(
+      rolloutPath,
+      [
+        {
+          timestamp: "2026-09-20T14:11:20.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "First" }],
+          },
+        },
+        {
+          timestamp: "2026-09-20T14:11:29.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Second" }],
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n"),
+    );
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async () => ({
+        thread: {
+          path: rolloutPath,
+          turns: [
+            {
+              completedAt: 1_789_927_616,
+              items: [
+                { type: "agentMessage", id: "message-first", text: "First" },
+                { type: "agentMessage", id: "message-second", text: "Second" },
+              ],
+            },
+          ],
+        },
+      })),
+    };
+
+    try {
+      await asInternals(session).loadPersistedHistory(session.client);
+      const timestamps: Array<string | undefined> = [];
+      for await (const event of session.streamHistory()) {
+        if (event.type === "timeline" && event.item.type === "assistant_message") {
+          timestamps.push(event.timestamp);
+        }
+      }
+      expect(timestamps).toEqual(["2026-09-20T14:11:20.000Z", "2026-09-20T14:11:29.000Z"]);
+    } finally {
+      rmSync(rolloutDir, { recursive: true, force: true });
+    }
+  });
+
   test("preserves Codex app-server assistant item ids in persisted history", async () => {
     const session = createSession();
     session.client = {

@@ -447,6 +447,7 @@ const ASSISTANT_TIMESTAMP_MONTHS = [
 ] as const;
 const ASSISTANT_TIMESTAMP_PREFIX =
   /^\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2}:\d{2}:\d{2} UTC:/;
+const ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN = "\n\n---\n\n";
 
 function formatAssistantTimestamp(timestamp: string): string | null {
   const date = new Date(timestamp);
@@ -1382,7 +1383,10 @@ export class Session {
       this.streamingAssistantMessages.delete(agentId);
       return event;
     }
-    if (event.item.text.trim().length === 0) return event;
+    const text = event.item.text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
+      ? event.item.text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
+      : event.item.text;
+    if (text.trim().length === 0) return event;
     const previous = this.streamingAssistantMessages.get(agentId);
     const startsNewMessage =
       previous === undefined ||
@@ -1393,10 +1397,12 @@ export class Session {
       ...(event.turnId ? { turnId: event.turnId } : {}),
     });
     if (!startsNewMessage) return event;
-    if (ASSISTANT_TIMESTAMP_PREFIX.test(event.item.text)) return event;
+    if (ASSISTANT_TIMESTAMP_PREFIX.test(text)) {
+      return text === event.item.text ? event : { ...event, item: { ...event.item, text } };
+    }
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
-    return { ...event, item: { ...event.item, text: `${timestampText} ${event.item.text}` } };
+    return { ...event, item: { ...event.item, text: `${timestampText} ${text}` } };
   }
 
   private projectTimelineItem(

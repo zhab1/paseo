@@ -44,10 +44,11 @@ import type { Logger } from "pino";
 
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { Dirent } from "node:fs";
+import { createReadStream, type Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { composeSystemPromptParts } from "../system-prompt.js";
@@ -1724,6 +1725,42 @@ function readCodexTurnHistoryTimestamp(
   return completedAt ?? startedAt;
 }
 
+async function readCodexRolloutAssistantTimestamps(
+  rolloutPath: unknown,
+): Promise<Map<string, string[]>> {
+  const timestamps = new Map<string, string[]>();
+  if (typeof rolloutPath !== "string" || path.extname(rolloutPath) !== ".jsonl") return timestamps;
+  const lines = readline.createInterface({
+    input: createReadStream(rolloutPath),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    if (!line.includes('"type":"response_item"') || !line.includes('"role":"assistant"')) {
+      continue;
+    }
+    try {
+      const record = toObjectRecord(JSON.parse(line));
+      const payload = toObjectRecord(record?.payload);
+      if (record?.type !== "response_item" || payload?.type !== "message") continue;
+      const timestamp = normalizeProviderReplayTimestamp(record.timestamp);
+      if (!timestamp || payload.role !== "assistant" || !Array.isArray(payload.content)) continue;
+      const text = payload.content
+        .flatMap((content): string[] => {
+          const entry = toObjectRecord(content);
+          const value = entry?.text ?? entry?.output_text;
+          return typeof value === "string" ? [value] : [];
+        })
+        .join("");
+      const matches = timestamps.get(text) ?? [];
+      matches.push(timestamp);
+      timestamps.set(text, matches);
+    } catch {
+      // A malformed unrelated rollout row must not prevent provider history recovery.
+    }
+  }
+  return timestamps;
+}
+
 interface CodexSubAgentActivity {
   id: string | null;
   agentThreadId: string;
@@ -2005,6 +2042,9 @@ async function loadCodexThreadHistoryTimeline(params: {
   requestThread: CodexThreadReadRequest;
 }): Promise<CodexThreadHistoryProjection> {
   const response = await requestCodexThreadHistory(params.requestThread, params.threadId);
+  const rolloutAssistantTimestamps = await readCodexRolloutAssistantTimestamps(
+    response.thread.path,
+  ).catch(() => new Map<string, string[]>());
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
   for (const turn of response.thread.turns) {
@@ -2029,8 +2069,14 @@ async function loadCodexThreadHistoryTimeline(params: {
         }
       }
       for (const timelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+        const rolloutTimestamp =
+          timelineItem.type === "assistant_message"
+            ? (rolloutAssistantTimestamps.get(timelineItem.text)?.shift() ?? null)
+            : null;
         const timestamp =
-          readCodexHistoryTimestamp(item) ?? readCodexTurnHistoryTimestamp(turn, timelineItem);
+          readCodexHistoryTimestamp(item) ??
+          rolloutTimestamp ??
+          readCodexTurnHistoryTimestamp(turn, timelineItem);
         const settledTimelineItem =
           historicalSubAgentActivity && timelineItem.type === "tool_call"
             ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
