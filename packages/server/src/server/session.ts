@@ -445,16 +445,6 @@ const ASSISTANT_TIMESTAMP_MONTHS = [
   "Nov",
   "Dec",
 ] as const;
-const ASSISTANT_TIMESTAMP_PREFIX =
-  /^\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2}:\d{2}:\d{2} UTC:/;
-const ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN = "\n\n---\n\n";
-
-function stripCodexAssistantMessageBoundary(provider: string, text: string): string {
-  return provider === "codex" && text.startsWith(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN)
-    ? text.slice(ASSISTANT_MESSAGE_BOUNDARY_MARKDOWN.length)
-    : text;
-}
-
 function formatAssistantTimestamp(timestamp: string): string | null {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return null;
@@ -747,10 +737,7 @@ export class Session {
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
   private readonly rewindInitiators = new Map<string, object | undefined>();
-  private readonly streamingAssistantMessages = new Map<
-    string,
-    { messageId?: string; turnId?: string }
-  >();
+  private readonly streamingAssistantMessages = new Map<string, { turnId?: string }>();
 
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
@@ -1389,41 +1376,26 @@ export class Session {
       this.streamingAssistantMessages.delete(agentId);
       return event;
     }
-    const text = stripCodexAssistantMessageBoundary(event.provider, event.item.text);
-    if (text.trim().length === 0) {
-      return text === event.item.text ? event : { ...event, item: { ...event.item, text } };
-    }
     const previous = this.streamingAssistantMessages.get(agentId);
-    const startsNewMessage =
-      previous === undefined ||
-      previous.turnId !== event.turnId ||
-      (event.item.messageId !== undefined && previous.messageId !== event.item.messageId);
-    this.streamingAssistantMessages.set(agentId, {
-      ...(event.item.messageId ? { messageId: event.item.messageId } : {}),
-      ...(event.turnId ? { turnId: event.turnId } : {}),
-    });
+    const startsNewMessage = previous === undefined || previous.turnId !== event.turnId;
+    this.streamingAssistantMessages.set(agentId, event.turnId ? { turnId: event.turnId } : {});
     if (!startsNewMessage) return event;
-    if (ASSISTANT_TIMESTAMP_PREFIX.test(text)) {
-      return text === event.item.text ? event : { ...event, item: { ...event.item, text } };
-    }
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
-    return { ...event, item: { ...event.item, text: `${timestampText} ${text}` } };
+    return {
+      ...event,
+      item: { ...event.item, text: `${timestampText} ${event.item.text}` },
+    };
   }
 
   private projectTimelineItem(
-    provider: ManagedAgent["provider"],
     item: AgentTimelineFetchResult["rows"][number]["item"],
     timestamp: string,
   ): AgentTimelineFetchResult["rows"][number]["item"] {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
-    const text = stripCodexAssistantMessageBoundary(provider, item.text);
-    if (text.trim().length === 0 || ASSISTANT_TIMESTAMP_PREFIX.test(text)) {
-      return text === item.text ? item : { ...item, text };
-    }
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText} ${text}` };
+    return { ...item, text: `${timestampText} ${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -4841,7 +4813,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: this.projectTimelineItem(provider, row.item, row.timestamp),
+        item: this.projectTimelineItem(row.item, row.timestamp),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7766,7 +7738,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: this.projectTimelineItem(snapshot.provider, entry.item, entry.timestamp),
+                item: this.projectTimelineItem(entry.item, entry.timestamp),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
@@ -8021,7 +7993,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: this.projectTimelineItem(descriptor.provider, row.item, row.timestamp),
+              item: this.projectTimelineItem(row.item, row.timestamp),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,
