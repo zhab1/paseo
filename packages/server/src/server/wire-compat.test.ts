@@ -354,7 +354,7 @@ describe("wire compatibility", () => {
 
     expect(mobile.payload.entries[0]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:20 UTC:\n\nDone",
+      text: "20 Sep 14:11:20 UTC: Done",
       messageId: "message-1",
     });
     expect(cli.payload.entries[0]?.item).toEqual({

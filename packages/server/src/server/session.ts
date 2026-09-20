@@ -1396,7 +1396,7 @@ export class Session {
     if (ASSISTANT_TIMESTAMP_PREFIX.test(event.item.text)) return event;
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
-    return { ...event, item: { ...event.item, text: `${timestampText}\n\n${event.item.text}` } };
+    return { ...event, item: { ...event.item, text: `${timestampText} ${event.item.text}` } };
   }
 
   private projectTimelineItem(
@@ -1407,7 +1407,7 @@ export class Session {
     if (item.text.trim().length === 0 || ASSISTANT_TIMESTAMP_PREFIX.test(item.text)) return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText}\n\n${item.text}` };
+    return { ...item, text: `${timestampText} ${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {
