@@ -1,11 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Added
-
-- Prefix assistant messages with UTC timestamps in connected Paseo apps without changing stored chat history.
-
 ## 0.9.0-beta.2 - 2026-09-18
 
 ### Fixed
