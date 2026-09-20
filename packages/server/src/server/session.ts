@@ -32,6 +32,7 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type WSHelloMessage,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -430,12 +431,39 @@ const nodeSessionFileSystem: SessionFileSystem = {
   },
 };
 
+const ASSISTANT_TIMESTAMP_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+function formatAssistantTimestamp(timestamp: string): string | null {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const day = date.getUTCDate();
+  const month = ASSISTANT_TIMESTAMP_MONTHS[date.getUTCMonth()];
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+  return `${day} ${month} ${hours}:${minutes}:${seconds} UTC:`;
+}
+
 // Stub types for features under development (modules not yet available)
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
   browserToolsBroker?: BrowserToolsBroker | null;
   clientId: string;
+  clientType?: WSHelloMessage["clientType"];
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -687,6 +715,7 @@ export class Session {
   );
   private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
   private readonly clientId: string;
+  private readonly clientType: WSHelloMessage["clientType"] | undefined;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -709,6 +738,10 @@ export class Session {
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
   private readonly rewindInitiators = new Map<string, object | undefined>();
+  private readonly streamingAssistantMessages = new Map<
+    string,
+    { messageId?: string; turnId?: string }
+  >();
 
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
@@ -791,6 +824,7 @@ export class Session {
   constructor(options: SessionOptions) {
     const {
       clientId,
+      clientType,
       permissions,
       appVersion,
       clientCapabilities,
@@ -847,6 +881,7 @@ export class Session {
     } = options;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
+    this.clientType = clientType;
     this.authorization = new SessionAuthorization(permissions);
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
@@ -1270,22 +1305,28 @@ export class Session {
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
   ): void {
-    const attention = serializedEvent.type === "attention_required";
-    if (attention) {
+    const projectedEvent = this.projectLiveAssistantTimestamp(
+      event.agentId,
+      serializedEvent,
+      event.timestamp,
+    );
+
+    if (projectedEvent.type === "attention_required") {
       this.emit({
         type: "agent_attention_required",
         payload: {
           agentId: event.agentId,
-          reason: serializedEvent.reason,
-          timestamp: serializedEvent.timestamp,
-          shouldNotify: serializedEvent.shouldNotify,
-          ...(serializedEvent.notification ? { notification: serializedEvent.notification } : {}),
+          reason: projectedEvent.reason,
+          timestamp: projectedEvent.timestamp,
+          shouldNotify: projectedEvent.shouldNotify,
+          ...(projectedEvent.notification ? { notification: projectedEvent.notification } : {}),
         },
       });
     }
+    const attention = projectedEvent.type === "attention_required";
     const message: SessionOutboundMessage = {
       type: "agent_stream",
-      payload: this.buildAgentStreamPayload(event, serializedEvent),
+      payload: this.buildAgentStreamPayload(event, projectedEvent),
     };
     for (const subscription of this.timelineSubscriptions.values()) {
       const source = subscription.owner.source;
@@ -1297,8 +1338,8 @@ export class Session {
       )
         continue;
       if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
+        projectedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(projectedEvent.item, source)
       )
         continue;
       subscription.owner.emit(message);
@@ -1308,8 +1349,8 @@ export class Session {
       if (this.delivery.isModern(source) || capabilities.has(CLIENT_CAPS.selectiveAgentTimeline))
         continue;
       if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
+        projectedEvent.type === "timeline" &&
+        !this.supportsTimelineItem(projectedEvent.item, source)
       )
         continue;
       const alreadyDelivered = [...this.timelineSubscriptions.values()].some(
@@ -1324,6 +1365,44 @@ export class Session {
       this.timelineSubscriptions.size === 0
     )
       this.emit(message);
+  }
+
+  private projectLiveAssistantTimestamp(
+    agentId: string,
+    event: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+    timestamp?: string,
+  ): typeof event {
+    if (
+      this.clientType !== "mobile" ||
+      event.type !== "timeline" ||
+      event.item.type !== "assistant_message"
+    ) {
+      this.streamingAssistantMessages.delete(agentId);
+      return event;
+    }
+    const previous = this.streamingAssistantMessages.get(agentId);
+    const startsNewMessage =
+      previous === undefined ||
+      previous.turnId !== event.turnId ||
+      (event.item.messageId !== undefined && previous.messageId !== event.item.messageId);
+    this.streamingAssistantMessages.set(agentId, {
+      ...(event.item.messageId ? { messageId: event.item.messageId } : {}),
+      ...(event.turnId ? { turnId: event.turnId } : {}),
+    });
+    if (!startsNewMessage) return event;
+    const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
+    if (!timestampText) return event;
+    return { ...event, item: { ...event.item, text: `${timestampText}\n\n${event.item.text}` } };
+  }
+
+  private projectTimelineItem(
+    item: AgentTimelineFetchResult["rows"][number]["item"],
+    timestamp: string,
+  ): AgentTimelineFetchResult["rows"][number]["item"] {
+    if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
+    const timestampText = formatAssistantTimestamp(timestamp);
+    if (!timestampText) return item;
+    return { ...item, text: `${timestampText}\n\n${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -1825,6 +1904,11 @@ export class Session {
         payload: { kind: "upsert", subagent: update.subagent },
       };
     } else if (update.type === "timeline") {
+      const projectedEvent = this.projectLiveAssistantTimestamp(
+        `provider-subagent:${update.parentAgentId}:${update.subagentId}`,
+        { type: "timeline", provider: update.provider, item: update.row.item },
+        update.row.timestamp,
+      );
       message = {
         type: "agent.provider_subagents.update",
         payload: {
@@ -1832,13 +1916,16 @@ export class Session {
           parentAgentId: update.parentAgentId,
           subagentId: update.subagentId,
           provider: update.provider,
-          item: update.row.item,
+          item: projectedEvent.type === "timeline" ? projectedEvent.item : update.row.item,
           timestamp: update.row.timestamp,
           seq: update.row.seq,
           epoch: update.epoch,
         },
       };
     } else {
+      this.streamingAssistantMessages.delete(
+        `provider-subagent:${update.parentAgentId}:${update.subagentId}`,
+      );
       message = {
         type: "agent.provider_subagents.update",
         payload: {
@@ -4680,6 +4767,7 @@ export class Session {
   }
 
   private deliverTimelineReplacement(agentId: string, initiatingSource?: object): void {
+    this.streamingAssistantMessages.delete(agentId);
     const agent = this.agentManager.getAgent(agentId);
     if (!agent) return;
     const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
@@ -4732,7 +4820,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: row.item,
+        item: this.projectTimelineItem(row.item, row.timestamp),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7657,7 +7745,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: entry.item,
+                item: this.projectTimelineItem(entry.item, entry.timestamp),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
@@ -7912,7 +8000,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: row.item,
+              item: this.projectTimelineItem(row.item, row.timestamp),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,
