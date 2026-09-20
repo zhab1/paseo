@@ -445,6 +445,8 @@ const ASSISTANT_TIMESTAMP_MONTHS = [
   "Nov",
   "Dec",
 ] as const;
+const ASSISTANT_TIMESTAMP_PREFIX =
+  /^\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{2}:\d{2}:\d{2} UTC:/;
 
 function formatAssistantTimestamp(timestamp: string): string | null {
   const date = new Date(timestamp);
@@ -1380,6 +1382,7 @@ export class Session {
       this.streamingAssistantMessages.delete(agentId);
       return event;
     }
+    if (event.item.text.trim().length === 0) return event;
     const previous = this.streamingAssistantMessages.get(agentId);
     const startsNewMessage =
       previous === undefined ||
@@ -1390,9 +1393,10 @@ export class Session {
       ...(event.turnId ? { turnId: event.turnId } : {}),
     });
     if (!startsNewMessage) return event;
+    if (ASSISTANT_TIMESTAMP_PREFIX.test(event.item.text)) return event;
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
-    return { ...event, item: { ...event.item, text: `${timestampText}\n\n${event.item.text}` } };
+    return { ...event, item: { ...event.item, text: `${timestampText} ${event.item.text}` } };
   }
 
   private projectTimelineItem(
@@ -1400,9 +1404,10 @@ export class Session {
     timestamp: string,
   ): AgentTimelineFetchResult["rows"][number]["item"] {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
+    if (item.text.trim().length === 0 || ASSISTANT_TIMESTAMP_PREFIX.test(item.text)) return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText}\n\n${item.text}` };
+    return { ...item, text: `${timestampText} ${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {

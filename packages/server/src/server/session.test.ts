@@ -5346,7 +5346,7 @@ test("unions viewed timelines across socket sources and removes detached sources
   ).toEqual(["agent-b"]);
 });
 
-test("prepends one timestamp to a streamed mobile assistant message", () => {
+test("prepends one timestamp after an empty streamed mobile assistant event", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5363,6 +5363,16 @@ test("prepends one timestamp to a streamed mobile assistant message", () => {
   const listener = listeners[0];
   if (!listener) throw new Error("Agent event listener was not installed");
 
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:19.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-a", text: "" },
+    },
+  });
   listener({
     type: "agent_stream",
     agentId: "agent-a",
@@ -5398,7 +5408,7 @@ test("prepends one timestamp to a streamed mobile assistant message", () => {
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:20 UTC:\n\nHel", "lo"]);
+  ).toEqual(["", "20 Sep 14:11:20 UTC: Hel", "lo"]);
 });
 
 test("timestamps an identified assistant message after an id-less notice", () => {
@@ -5447,7 +5457,7 @@ test("timestamps an identified assistant message after an id-less notice", () =>
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:20 UTC:\n\nNotice", "20 Sep 14:11:21 UTC:\n\n# Answer"]);
+  ).toEqual(["20 Sep 14:11:20 UTC: Notice", "20 Sep 14:11:21 UTC: # Answer"]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {

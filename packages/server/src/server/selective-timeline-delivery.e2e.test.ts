@@ -755,7 +755,7 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
   expect(childItems(capable)).toContainEqual(plugin);
   expect(childItems(legacy)).toEqual([{ type: "assistant_message", text: "Child result" }]);
   expect(childItems(mobile)).toEqual([
-    { type: "assistant_message", text: "20 Sep 14:11:29 UTC:\n\nChild result" },
+    { type: "assistant_message", text: "20 Sep 14:11:29 UTC: Child result" },
   ]);
   const oldChild = await legacy.client.fetchProviderSubagentTimeline(agent.id, "child");
   const newChild = await capable.client.fetchProviderSubagentTimeline(agent.id, "child");
@@ -765,7 +765,7 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
     { type: "assistant_message", text: "Child result" },
   ]);
   expect(mobileChild.rows.map((row) => row.item)).toEqual([
-    { type: "assistant_message", text: "20 Sep 14:11:29 UTC:\n\nChild result" },
+    { type: "assistant_message", text: "20 Sep 14:11:29 UTC: Child result" },
   ]);
   expect(oldChild.window).toEqual(newChild.window);
 
