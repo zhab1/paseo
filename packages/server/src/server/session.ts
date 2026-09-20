@@ -32,6 +32,7 @@ import {
   type ProjectPlacementPayload,
   type WorkspaceSetupSnapshot,
   type WorkspaceDescriptorPayload,
+  type WSHelloMessage,
 } from "./messages.js";
 import type {
   TerminalManager,
@@ -430,12 +431,38 @@ const nodeSessionFileSystem: SessionFileSystem = {
   },
 };
 
+const ASSISTANT_TIMESTAMP_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+function formatAssistantTimestamp(timestamp: string): string | null {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const day = date.getUTCDate();
+  const month = ASSISTANT_TIMESTAMP_MONTHS[date.getUTCMonth()];
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${day} ${month} ${hours}:${minutes} UTC`;
+}
+
 // Stub types for features under development (modules not yet available)
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
 export interface SessionOptions {
   browserToolsBroker?: BrowserToolsBroker | null;
   clientId: string;
+  clientType?: WSHelloMessage["clientType"];
   permissions: readonly DaemonPermission[];
   appVersion?: string | null;
   clientCapabilities?: Record<string, unknown> | null;
@@ -687,6 +714,7 @@ export class Session {
   );
   private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
   private readonly clientId: string;
+  private readonly clientType: WSHelloMessage["clientType"] | null;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -709,6 +737,15 @@ export class Session {
   private readonly projectIcons: ProjectIconReader;
   private readonly worktreesRoot: string | undefined;
   private readonly rewindInitiators = new Map<string, object | undefined>();
+  private readonly pendingAssistantTimestamps = new Map<
+    string,
+    {
+      provider: ManagedAgent["provider"];
+      timestamp: string;
+      messageId?: string;
+      turnId?: string;
+    }
+  >();
 
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
@@ -791,6 +828,7 @@ export class Session {
   constructor(options: SessionOptions) {
     const {
       clientId,
+      clientType,
       permissions,
       appVersion,
       clientCapabilities,
@@ -847,6 +885,7 @@ export class Session {
     } = options;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
+    this.clientType = clientType ?? null;
     this.authorization = new SessionAuthorization(permissions);
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
@@ -1270,6 +1309,31 @@ export class Session {
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
   ): void {
+    if (this.clientType === "mobile") {
+      const assistantEvent = serializedEvent.type === "timeline" ? serializedEvent : null;
+      const assistantItem =
+        assistantEvent?.item.type === "assistant_message" ? assistantEvent.item : null;
+      const pending = this.pendingAssistantTimestamps.get(event.agentId);
+      const startsNewMessage =
+        assistantItem !== null &&
+        pending !== undefined &&
+        (pending.turnId !== assistantEvent?.turnId ||
+          (pending.messageId !== undefined &&
+            assistantItem.messageId !== undefined &&
+            pending.messageId !== assistantItem.messageId));
+      if (assistantItem === null || startsNewMessage) {
+        this.flushAssistantTimestamp(event.agentId);
+      }
+      if (assistantEvent !== null && assistantItem !== null) {
+        this.pendingAssistantTimestamps.set(event.agentId, {
+          provider: assistantEvent.provider,
+          timestamp: event.timestamp ?? new Date().toISOString(),
+          ...(assistantItem.messageId ? { messageId: assistantItem.messageId } : {}),
+          ...(assistantEvent.turnId ? { turnId: assistantEvent.turnId } : {}),
+        });
+      }
+    }
+
     const attention = serializedEvent.type === "attention_required";
     if (attention) {
       this.emit({
@@ -1287,9 +1351,18 @@ export class Session {
       type: "agent_stream",
       payload: this.buildAgentStreamPayload(event, serializedEvent),
     };
+    this.deliverAgentStreamMessage(event.agentId, serializedEvent, message, attention);
+  }
+
+  private deliverAgentStreamMessage(
+    agentId: string,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+    message: SessionOutboundMessage,
+    attention = false,
+  ): void {
     for (const subscription of this.timelineSubscriptions.values()) {
       const source = subscription.owner.source;
-      if (!subscription.agentIds.has(event.agentId)) continue;
+      if (!subscription.agentIds.has(agentId)) continue;
       if (
         attention &&
         (this.delivery.isModern(source) ||
@@ -1314,7 +1387,7 @@ export class Session {
         continue;
       const alreadyDelivered = [...this.timelineSubscriptions.values()].some(
         (subscription) =>
-          subscription.owner.source === source && subscription.agentIds.has(event.agentId),
+          subscription.owner.source === source && subscription.agentIds.has(agentId),
       );
       if (!alreadyDelivered) this.onMessageToSource?.(source, message);
     }
@@ -1324,6 +1397,41 @@ export class Session {
       this.timelineSubscriptions.size === 0
     )
       this.emit(message);
+  }
+
+  private flushAssistantTimestamp(agentId: string): void {
+    const pending = this.pendingAssistantTimestamps.get(agentId);
+    if (!pending) return;
+    this.pendingAssistantTimestamps.delete(agentId);
+    const timestampText = formatAssistantTimestamp(pending.timestamp);
+    if (!timestampText) return;
+    const serializedEvent: Extract<
+      Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+      { type: "timeline" }
+    > = {
+      type: "timeline",
+      provider: pending.provider,
+      item: {
+        type: "assistant_message",
+        text: `\n\n_${timestampText}_`,
+        ...(pending.messageId ? { messageId: pending.messageId } : {}),
+      },
+      ...(pending.turnId ? { turnId: pending.turnId } : {}),
+    };
+    this.deliverAgentStreamMessage(agentId, serializedEvent, {
+      type: "agent_stream",
+      payload: { agentId, event: serializedEvent, timestamp: pending.timestamp },
+    });
+  }
+
+  private projectTimelineItem(
+    item: AgentTimelineFetchResult["rows"][number]["item"],
+    timestamp: string,
+  ): AgentTimelineFetchResult["rows"][number]["item"] {
+    if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
+    const timestampText = formatAssistantTimestamp(timestamp);
+    if (!timestampText) return item;
+    return { ...item, text: `${item.text}\n\n_${timestampText}_` };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -4680,6 +4788,7 @@ export class Session {
   }
 
   private deliverTimelineReplacement(agentId: string, initiatingSource?: object): void {
+    this.pendingAssistantTimestamps.delete(agentId);
     const agent = this.agentManager.getAgent(agentId);
     if (!agent) return;
     const timeline = this.agentManager.fetchTimeline(agentId, { limit: 0 });
@@ -4732,7 +4841,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: row.item,
+        item: this.projectTimelineItem(row.item, row.timestamp),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7657,7 +7766,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: entry.item,
+                item: this.projectTimelineItem(entry.item, entry.timestamp),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,

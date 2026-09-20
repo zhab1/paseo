@@ -455,6 +455,7 @@ type SessionConnection = ReconnectableSessionConnection | PluginSessionConnectio
 
 interface SocketSessionOptions {
   clientId: string;
+  clientType: WSHelloMessage["clientType"];
   appVersion: string | null;
   clientCapabilities: Record<string, unknown> | null;
   permissions: readonly DaemonPermission[];
@@ -1345,18 +1346,28 @@ export class VoiceAssistantWebSocketServer {
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
+    clientType: WSHelloMessage["clientType"];
     appVersion: string | null;
     clientCapabilities: Record<string, unknown> | null;
     connectionLogger: pino.Logger;
     lifecycle: { kind: "reconnectable" } | { kind: "ephemeral-plugin"; pluginId: string };
     admission: SessionAdmission;
   }): SessionConnection {
-    const { ws, clientId, appVersion, clientCapabilities, connectionLogger, lifecycle, admission } =
-      params;
+    const {
+      ws,
+      clientId,
+      clientType,
+      appVersion,
+      clientCapabilities,
+      connectionLogger,
+      lifecycle,
+      admission,
+    } = params;
     let connection: SessionConnection | null = null;
 
     const session = this.createSocketSession({
       clientId,
+      clientType,
       appVersion,
       clientCapabilities,
       permissions: admission.permissions,
@@ -1431,6 +1442,7 @@ export class VoiceAssistantWebSocketServer {
     return new Session({
       browserToolsBroker: this.browserToolsBroker,
       clientId: options.clientId,
+      clientType: options.clientType,
       appVersion: options.appVersion,
       clientCapabilities: options.clientCapabilities,
       permissions: options.permissions,
@@ -1599,6 +1611,7 @@ export class VoiceAssistantWebSocketServer {
     const connection = this.createSessionConnection({
       ws,
       clientId,
+      clientType: message.clientType,
       appVersion: message.appVersion ?? null,
       clientCapabilities: message.capabilities ?? null,
       connectionLogger,

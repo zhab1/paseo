@@ -185,6 +185,7 @@ class InMemoryWorktreeWorkflow {
 }
 
 function createSessionForWireCompatTest(options?: {
+  clientType?: SessionOptions["clientType"];
   clientCapabilities?: Record<string, unknown> | null;
   directorySync?: DirectorySyncService;
   messages?: SessionOutboundMessage[];
@@ -214,6 +215,7 @@ function createSessionForWireCompatTest(options?: {
     messageReceipts: createMessageReceiptsStub(),
     creationService: createTestCreationService(),
     clientId: "wire-compat-client",
+    clientType: options?.clientType,
     permissions: OWNER_PERMISSIONS,
     clientCapabilities: options?.clientCapabilities ?? null,
     onMessage: (message) => messages.push(message),
@@ -286,6 +288,7 @@ function createSessionForWireCompatTest(options?: {
 }
 
 async function emitTimelineResponse(options?: {
+  clientType?: SessionOptions["clientType"];
   clientCapabilities?: Record<string, unknown> | null;
   rows?: AgentTimelineRow[];
   request?: Partial<
@@ -294,6 +297,7 @@ async function emitTimelineResponse(options?: {
 }): Promise<Extract<SessionOutboundMessage, { type: "fetch_agent_timeline_response" }>> {
   const messages: SessionOutboundMessage[] = [];
   const session = createSessionForWireCompatTest({
+    clientType: options?.clientType,
     clientCapabilities: options?.clientCapabilities,
     rows: options?.rows,
     messages,
@@ -317,6 +321,29 @@ async function emitTimelineResponse(options?: {
 }
 
 describe("wire compatibility", () => {
+  test("adds assistant timestamps only to mobile timeline projections", async () => {
+    const row: AgentTimelineRow = {
+      seq: 1,
+      timestamp: "2026-09-20T14:11:29.000Z",
+      item: { type: "assistant_message", text: "Done", messageId: "message-1" },
+    };
+
+    const mobile = await emitTimelineResponse({ clientType: "mobile", rows: [row] });
+    const cli = await emitTimelineResponse({ clientType: "cli", rows: [row] });
+
+    expect(mobile.payload.entries[0]?.item).toEqual({
+      type: "assistant_message",
+      text: "Done\n\n_20 Sep 14:11 UTC_",
+      messageId: "message-1",
+    });
+    expect(cli.payload.entries[0]?.item).toEqual(row.item);
+    expect(row.item).toEqual({
+      type: "assistant_message",
+      text: "Done",
+      messageId: "message-1",
+    });
+  });
+
   test("sends project updates only to clients that declare support", async () => {
     const project = createPersistedProjectRecord({
       projectId: "project-1",

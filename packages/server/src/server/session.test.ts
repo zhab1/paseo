@@ -289,6 +289,7 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 
 interface SessionForTestOptions {
   clientId?: string;
+  clientType?: SessionOptions["clientType"];
   permissions?: readonly DaemonPermission[];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
@@ -370,6 +371,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     messageReceipts: createMessageReceiptsStub(),
     creationService: createTestCreationService(),
     clientId: options.clientId ?? "test-client",
+    clientType: options.clientType,
     onMessage: (message) => messages.push(message),
     ...(options.targetedMessages
       ? {
@@ -5342,6 +5344,61 @@ test("unions viewed timelines across socket sources and removes detached sources
       message.type === "agent_stream" ? [message.payload.agentId] : [],
     ),
   ).toEqual(["agent-b"]);
+});
+
+test("appends one timestamp after a streamed mobile assistant message", () => {
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    clientType: "mobile",
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        listeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities(null, {});
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:20.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-a", text: "Hel" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:29.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-a", text: "lo" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:30.000Z",
+    event: { type: "turn_completed", provider: "mock" },
+  });
+
+  expect(
+    messages.flatMap((message) =>
+      message.type === "agent_stream" &&
+      message.payload.event.type === "timeline" &&
+      message.payload.event.item.type === "assistant_message"
+        ? [message.payload.event.item.text]
+        : [],
+    ),
+  ).toEqual(["Hel", "lo", "\n\n_20 Sep 14:11 UTC_"]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
