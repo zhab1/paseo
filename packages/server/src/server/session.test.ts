@@ -91,7 +91,6 @@ interface SessionHandlerInternals {
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
   projectTimelineItem(
-    provider: string,
     item: { type: "assistant_message"; text: string; messageId?: string },
     timestamp: string,
   ): { type: "assistant_message"; text: string; messageId?: string };
@@ -5351,7 +5350,7 @@ test("unions viewed timelines across socket sources and removes detached sources
   ).toEqual(["agent-b"]);
 });
 
-test("prepends one timestamp after an empty streamed mobile assistant event", () => {
+test("prepends one timestamp to an unchanged streamed mobile assistant message", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5413,10 +5412,10 @@ test("prepends one timestamp after an empty streamed mobile assistant event", ()
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["", "20 Sep 14:11:20 UTC: Hel", "lo"]);
+  ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo"]);
 });
 
-test("timestamps an identified assistant message after an id-less notice", () => {
+test("does not insert a timestamp when a streamed assistant message gains its turn id", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5440,7 +5439,7 @@ test("timestamps an identified assistant message after an id-less notice", () =>
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", text: "Notice" },
+      item: { type: "assistant_message", messageId: "message-a", text: "The" },
     },
   });
   listener({
@@ -5450,22 +5449,32 @@ test("timestamps an identified assistant message after an id-less notice", () =>
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", messageId: "message-a", text: "# Answer" },
+      turnId: "turn-a",
+      item: {
+        type: "assistant_message",
+        messageId: "message-a",
+        text: " documentation PR is being checked",
+      },
     },
   });
 
-  expect(
-    messages.flatMap((message) =>
-      message.type === "agent_stream" &&
-      message.payload.event.type === "timeline" &&
-      message.payload.event.item.type === "assistant_message"
-        ? [message.payload.event.item.text]
-        : [],
-    ),
-  ).toEqual(["20 Sep 14:11:20 UTC: Notice", "20 Sep 14:11:21 UTC: # Answer"]);
+  const assistantTexts = messages.flatMap((message) =>
+    message.type === "agent_stream" &&
+    message.payload.event.type === "timeline" &&
+    message.payload.event.item.type === "assistant_message"
+      ? [message.payload.event.item.text]
+      : [],
+  );
+  expect(assistantTexts).toEqual([
+    "20 Sep 14:11:20 UTC: The",
+    " documentation PR is being checked",
+  ]);
+  expect(assistantTexts.join("")).toBe(
+    "20 Sep 14:11:20 UTC: The documentation PR is being checked",
+  );
 });
 
-test("replaces the streamed Codex message boundary with an inline mobile timestamp", () => {
+test("prepends mobile timestamps without changing assistant text", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5523,15 +5532,23 @@ test("replaces the streamed Codex message boundary with an inline mobile timesta
   expect([
     ...assistantTexts,
     asSessionInternals(session).projectTimelineItem(
-      "codex",
       { type: "assistant_message", messageId: "persisted", text: "\n\n---\n\nHistory" },
       "2026-09-20T14:11:22.000Z",
     ).text,
+    asSessionInternals(session).projectTimelineItem(
+      {
+        type: "assistant_message",
+        messageId: "prefixed",
+        text: "19 Sep 01:02:03 UTC: Agent prefix",
+      },
+      "2026-09-20T14:11:23.000Z",
+    ).text,
   ]).toEqual([
-    "",
-    "20 Sep 14:11:20 UTC: Answer",
+    "20 Sep 14:11:19 UTC: \n\n---\n\n",
+    "Answer",
     "20 Sep 14:11:21 UTC: \n\n---\n\nAnswer",
-    "20 Sep 14:11:22 UTC: History",
+    "20 Sep 14:11:22 UTC: \n\n---\n\nHistory",
+    "20 Sep 14:11:23 UTC: 19 Sep 01:02:03 UTC: Agent prefix",
   ]);
 });
 
