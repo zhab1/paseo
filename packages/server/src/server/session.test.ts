@@ -5457,15 +5457,20 @@ test("does not insert a timestamp when the message id changes within one assista
     },
   });
 
-  expect(
-    messages.flatMap((message) =>
-      message.type === "agent_stream" &&
-      message.payload.event.type === "timeline" &&
-      message.payload.event.item.type === "assistant_message"
-        ? [message.payload.event.item.text]
-        : [],
-    ),
-  ).toEqual(["20 Sep 14:11:20 UTC: The", " documentation PR is being checked"]);
+  const assistantTexts = messages.flatMap((message) =>
+    message.type === "agent_stream" &&
+    message.payload.event.type === "timeline" &&
+    message.payload.event.item.type === "assistant_message"
+      ? [message.payload.event.item.text]
+      : [],
+  );
+  expect(assistantTexts).toEqual([
+    "20 Sep 14:11:20 UTC: The",
+    " documentation PR is being checked",
+  ]);
+  expect(assistantTexts.join("")).toBe(
+    "20 Sep 14:11:20 UTC: The documentation PR is being checked",
+  );
 });
 
 test("prepends mobile timestamps without changing assistant text", () => {
