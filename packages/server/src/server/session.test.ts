@@ -90,6 +90,11 @@ interface SessionHandlerInternals {
   handleStashPopRequest(params: unknown): Promise<unknown>;
   createPaseoWorktree(params: unknown): Promise<unknown>;
   handleStartWorkspaceScriptRequest(params: unknown): Promise<unknown>;
+  projectTimelineItem(
+    provider: string,
+    item: { type: "assistant_message"; text: string; messageId?: string },
+    timestamp: string,
+  ): { type: "assistant_message"; text: string; messageId?: string };
 }
 
 function asSessionInternals(session: Session): SessionHandlerInternals {
@@ -5458,6 +5463,76 @@ test("timestamps an identified assistant message after an id-less notice", () =>
         : [],
     ),
   ).toEqual(["20 Sep 14:11:20 UTC: Notice", "20 Sep 14:11:21 UTC: # Answer"]);
+});
+
+test("replaces the streamed Codex message boundary with an inline mobile timestamp", () => {
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    clientType: "mobile",
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        listeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities(null, {});
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:19.000Z",
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: "message-a", text: "\n\n---\n\n" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:20.000Z",
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: "message-a", text: "Answer" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:21.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-b", text: "\n\n---\n\nAnswer" },
+    },
+  });
+
+  const assistantTexts = messages.flatMap((message) =>
+    message.type === "agent_stream" &&
+    message.payload.event.type === "timeline" &&
+    message.payload.event.item.type === "assistant_message"
+      ? [message.payload.event.item.text]
+      : [],
+  );
+  expect([
+    ...assistantTexts,
+    asSessionInternals(session).projectTimelineItem(
+      "codex",
+      { type: "assistant_message", messageId: "persisted", text: "\n\n---\n\nHistory" },
+      "2026-09-20T14:11:22.000Z",
+    ).text,
+  ]).toEqual([
+    "",
+    "20 Sep 14:11:20 UTC: Answer",
+    "20 Sep 14:11:21 UTC: \n\n---\n\nAnswer",
+    "20 Sep 14:11:22 UTC: History",
+  ]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
