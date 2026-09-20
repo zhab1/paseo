@@ -322,26 +322,36 @@ async function emitTimelineResponse(options?: {
 
 describe("wire compatibility", () => {
   test("adds assistant timestamps only to mobile timeline projections", async () => {
-    const row: AgentTimelineRow = {
-      seq: 1,
-      timestamp: "2026-09-20T14:11:29.000Z",
-      item: { type: "assistant_message", text: "Done", messageId: "message-1" },
-    };
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-09-20T14:11:20.000Z",
+        item: { type: "assistant_message", text: "Do", messageId: "message-1" },
+      },
+      {
+        seq: 2,
+        timestamp: "2026-09-20T14:11:29.000Z",
+        item: { type: "assistant_message", text: "ne", messageId: "message-1" },
+      },
+    ];
 
-    const mobile = await emitTimelineResponse({ clientType: "mobile", rows: [row] });
-    const cli = await emitTimelineResponse({ clientType: "cli", rows: [row] });
+    const mobile = await emitTimelineResponse({ clientType: "mobile", rows });
+    const cli = await emitTimelineResponse({ clientType: "cli", rows });
 
     expect(mobile.payload.entries[0]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:29 UTC: Done",
+      text: "20 Sep 14:11:20 UTC:\n\nDone",
       messageId: "message-1",
     });
-    expect(cli.payload.entries[0]?.item).toEqual(row.item);
-    expect(row.item).toEqual({
+    expect(cli.payload.entries[0]?.item).toEqual({
       type: "assistant_message",
       text: "Done",
       messageId: "message-1",
     });
+    expect(rows.map((row) => row.item)).toEqual([
+      { type: "assistant_message", text: "Do", messageId: "message-1" },
+      { type: "assistant_message", text: "ne", messageId: "message-1" },
+    ]);
   });
 
   test("sends project updates only to clients that declare support", async () => {

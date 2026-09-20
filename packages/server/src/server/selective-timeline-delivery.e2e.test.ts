@@ -179,6 +179,7 @@ afterEach(async () => {
 
 async function connect(input: {
   clientId: string;
+  clientType?: "mobile" | "cli";
   selective: boolean;
   timelineReplacementInvalidation?: boolean;
   timelineNotifications?: boolean;
@@ -189,6 +190,7 @@ async function connect(input: {
   const client = new DaemonClient({
     url: `ws://127.0.0.1:${daemon.port}/ws`,
     clientId: input.clientId,
+    clientType: input.clientType,
     webSocketFactory: (url) => {
       socket = new WebSocket(url);
       return socket as unknown as WebSocketLike;
@@ -692,6 +694,11 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
     selective: false,
     pluginTimelineItems: true,
   });
+  const mobile = await connect({
+    clientId: "provider-mobile",
+    clientType: "mobile",
+    selective: false,
+  });
   const agent = await capable.client.createAgent({
     provider: "mock",
     cwd: "/tmp",
@@ -723,6 +730,7 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
       type: "timeline",
       id: "child",
       item: { type: "assistant_message", text: "Child result" },
+      timestamp: "2026-09-20T14:11:29.000Z",
     },
   });
   function childResult(message: SessionOutboundMessage): boolean {
@@ -735,6 +743,7 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
   await Promise.all([
     capable.next(childResult, "capable child result"),
     legacy.next(childResult, "legacy child result"),
+    mobile.next(childResult, "mobile child result"),
   ]);
   function childItems(client: ConnectedClient) {
     return client.messages.flatMap((message) =>
@@ -745,11 +754,18 @@ test("plugin items are gated in provider child streams, child fetches, and rewin
   }
   expect(childItems(capable)).toContainEqual(plugin);
   expect(childItems(legacy)).toEqual([{ type: "assistant_message", text: "Child result" }]);
+  expect(childItems(mobile)).toEqual([
+    { type: "assistant_message", text: "20 Sep 14:11:29 UTC:\n\nChild result" },
+  ]);
   const oldChild = await legacy.client.fetchProviderSubagentTimeline(agent.id, "child");
   const newChild = await capable.client.fetchProviderSubagentTimeline(agent.id, "child");
+  const mobileChild = await mobile.client.fetchProviderSubagentTimeline(agent.id, "child");
   expect(newChild.rows.map((row) => row.item)).toContainEqual(plugin);
   expect(oldChild.rows.map((row) => row.item)).toEqual([
     { type: "assistant_message", text: "Child result" },
+  ]);
+  expect(mobileChild.rows.map((row) => row.item)).toEqual([
+    { type: "assistant_message", text: "20 Sep 14:11:29 UTC:\n\nChild result" },
   ]);
   expect(oldChild.window).toEqual(newChild.window);
 

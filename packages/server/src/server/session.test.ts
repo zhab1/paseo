@@ -5398,7 +5398,56 @@ test("prepends one timestamp to a streamed mobile assistant message", () => {
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:20 UTC: Hel", "lo"]);
+  ).toEqual(["20 Sep 14:11:20 UTC:\n\nHel", "lo"]);
+});
+
+test("timestamps an identified assistant message after an id-less notice", () => {
+  const messages: SessionOutboundMessage[] = [];
+  const listeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    clientType: "mobile",
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        listeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities(null, {});
+  const listener = listeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:20.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", text: "Notice" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:21.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", messageId: "message-a", text: "# Answer" },
+    },
+  });
+
+  expect(
+    messages.flatMap((message) =>
+      message.type === "agent_stream" &&
+      message.payload.event.type === "timeline" &&
+      message.payload.event.item.type === "assistant_message"
+        ? [message.payload.event.item.text]
+        : [],
+    ),
+  ).toEqual(["20 Sep 14:11:20 UTC:\n\nNotice", "20 Sep 14:11:21 UTC:\n\n# Answer"]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {

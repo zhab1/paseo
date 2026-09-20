@@ -36,6 +36,7 @@ describe("projectTimelineRows", () => {
     });
     expect(projected[0]?.seqStart).toBe(1);
     expect(projected[0]?.seqEnd).toBe(2);
+    expect(projected[0]?.timestamp).toBe("2026-02-13T00:00:00.000Z");
     expect(projected[0]?.sourceSeqRanges).toEqual([{ startSeq: 1, endSeq: 2 }]);
     expect(projected[0]?.collapsed).toContain("assistant_merge");
   });

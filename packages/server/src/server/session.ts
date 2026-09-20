@@ -1384,9 +1384,7 @@ export class Session {
     const startsNewMessage =
       previous === undefined ||
       previous.turnId !== event.turnId ||
-      (previous.messageId !== undefined &&
-        event.item.messageId !== undefined &&
-        previous.messageId !== event.item.messageId);
+      (event.item.messageId !== undefined && previous.messageId !== event.item.messageId);
     this.streamingAssistantMessages.set(agentId, {
       ...(event.item.messageId ? { messageId: event.item.messageId } : {}),
       ...(event.turnId ? { turnId: event.turnId } : {}),
@@ -1394,7 +1392,7 @@ export class Session {
     if (!startsNewMessage) return event;
     const timestampText = formatAssistantTimestamp(timestamp ?? new Date().toISOString());
     if (!timestampText) return event;
-    return { ...event, item: { ...event.item, text: `${timestampText} ${event.item.text}` } };
+    return { ...event, item: { ...event.item, text: `${timestampText}\n\n${event.item.text}` } };
   }
 
   private projectTimelineItem(
@@ -1404,7 +1402,7 @@ export class Session {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText} ${item.text}` };
+    return { ...item, text: `${timestampText}\n\n${item.text}` };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -1906,6 +1904,11 @@ export class Session {
         payload: { kind: "upsert", subagent: update.subagent },
       };
     } else if (update.type === "timeline") {
+      const projectedEvent = this.projectLiveAssistantTimestamp(
+        `provider-subagent:${update.parentAgentId}:${update.subagentId}`,
+        { type: "timeline", provider: update.provider, item: update.row.item },
+        update.row.timestamp,
+      );
       message = {
         type: "agent.provider_subagents.update",
         payload: {
@@ -1913,13 +1916,16 @@ export class Session {
           parentAgentId: update.parentAgentId,
           subagentId: update.subagentId,
           provider: update.provider,
-          item: update.row.item,
+          item: projectedEvent.type === "timeline" ? projectedEvent.item : update.row.item,
           timestamp: update.row.timestamp,
           seq: update.row.seq,
           epoch: update.epoch,
         },
       };
     } else {
+      this.streamingAssistantMessages.delete(
+        `provider-subagent:${update.parentAgentId}:${update.subagentId}`,
+      );
       message = {
         type: "agent.provider_subagents.update",
         payload: {
@@ -7994,7 +8000,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: row.item,
+              item: this.projectTimelineItem(row.item, row.timestamp),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,

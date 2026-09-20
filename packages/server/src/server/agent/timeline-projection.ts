@@ -281,7 +281,7 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
         text: `${previousAssistant.text}${entryAssistant.text}`,
         ...(previousAssistant.messageId ? { messageId: previousAssistant.messageId } : {}),
       },
-      timestamp: entry.timestamp,
+      timestamp: previous.timestamp,
       seqEnd: entry.seqEnd,
       sourceSeqRanges: mergeSeqRanges(previous.sourceSeqRanges, entry.sourceSeqRanges),
       collapsed: Array.from(collapsedKinds),
