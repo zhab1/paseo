@@ -1385,9 +1385,7 @@ export class Session {
       (event.turnId !== undefined &&
         previous.turnId !== undefined &&
         previous.turnId !== event.turnId) ||
-      (event.item.messageId !== undefined &&
-        previous.messageId !== undefined &&
-        previous.messageId !== event.item.messageId);
+      (event.item.messageId !== undefined && previous.messageId !== event.item.messageId);
     const messageId = event.item.messageId ?? previous?.messageId;
     const turnId = event.turnId ?? previous?.turnId;
     this.streamingAssistantMessages.set(agentId, {

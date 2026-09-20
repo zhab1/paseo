@@ -5415,7 +5415,7 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo"]);
 });
 
-test("does not insert a timestamp when a streamed assistant message gains its id", () => {
+test("does not insert a timestamp when a streamed assistant message gains its turn id", () => {
   const messages: SessionOutboundMessage[] = [];
   const listeners: Array<(event: AgentManagerEvent) => void> = [];
   const session = createSessionForTest({
@@ -5439,7 +5439,7 @@ test("does not insert a timestamp when a streamed assistant message gains its id
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", text: "The" },
+      item: { type: "assistant_message", messageId: "message-a", text: "The" },
     },
   });
   listener({
@@ -5449,9 +5449,10 @@ test("does not insert a timestamp when a streamed assistant message gains its id
     event: {
       type: "timeline",
       provider: "mock",
+      turnId: "turn-a",
       item: {
         type: "assistant_message",
-        messageId: "message-b",
+        messageId: "message-a",
         text: " documentation PR is being checked",
       },
     },
