@@ -456,6 +456,11 @@ function formatAssistantTimestamp(timestamp: string): string | null {
   return `${day} ${month} ${hours}:${minutes}:${seconds} UTC:`;
 }
 
+function prependAssistantTimestamp(text: string, timestamp: string, provider: string): string {
+  const boundary = provider === "codex" && text.startsWith("\n\n---\n\n") ? "\n\n---\n\n" : "";
+  return `${boundary}${timestamp} ${text.slice(boundary.length)}`;
+}
+
 // Stub types for features under development (modules not yet available)
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
@@ -1379,6 +1384,7 @@ export class Session {
       this.streamingAssistantMessages.delete(agentId);
       return event;
     }
+    if (!event.item.text) return event;
     const previous = this.streamingAssistantMessages.get(agentId);
     const startsNewMessage =
       previous === undefined ||
@@ -1397,18 +1403,23 @@ export class Session {
     if (!timestampText) return event;
     return {
       ...event,
-      item: { ...event.item, text: `${timestampText} ${event.item.text}` },
+      item: {
+        ...event.item,
+        text: prependAssistantTimestamp(event.item.text, timestampText, event.provider),
+      },
     };
   }
 
   private projectTimelineItem(
+    provider: string,
     item: AgentTimelineFetchResult["rows"][number]["item"],
     timestamp: string,
   ): AgentTimelineFetchResult["rows"][number]["item"] {
-    if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
+    if (this.clientType !== "mobile" || item.type !== "assistant_message" || !item.text)
+      return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText} ${item.text}` };
+    return { ...item, text: prependAssistantTimestamp(item.text, timestampText, provider) };
   }
 
   supports(capability: ClientCapability): boolean {
@@ -4826,7 +4837,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: this.projectTimelineItem(row.item, row.timestamp),
+        item: this.projectTimelineItem(provider, row.item, row.timestamp),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7751,7 +7762,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: this.projectTimelineItem(entry.item, entry.timestamp),
+                item: this.projectTimelineItem(snapshot.provider, entry.item, entry.timestamp),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
@@ -8006,7 +8017,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: this.projectTimelineItem(row.item, row.timestamp),
+              item: this.projectTimelineItem(descriptor.provider, row.item, row.timestamp),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,

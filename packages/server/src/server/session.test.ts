@@ -5412,7 +5412,7 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo"]);
+  ).toEqual(["", "20 Sep 14:11:20 UTC: Hel", "lo"]);
 });
 
 test("does not insert a timestamp when a streamed assistant message gains its turn id", () => {
@@ -5529,13 +5529,16 @@ test("prepends mobile timestamps without changing assistant text", () => {
       ? [message.payload.event.item.text]
       : [],
   );
+  expect(assistantTexts.slice(0, 2).join("")).toBe("\n\n---\n\n20 Sep 14:11:19 UTC: Answer");
   expect([
     ...assistantTexts,
     asSessionInternals(session).projectTimelineItem(
+      "codex",
       { type: "assistant_message", messageId: "persisted", text: "\n\n---\n\nHistory" },
       "2026-09-20T14:11:22.000Z",
     ).text,
     asSessionInternals(session).projectTimelineItem(
+      "codex",
       {
         type: "assistant_message",
         messageId: "prefixed",
@@ -5544,10 +5547,10 @@ test("prepends mobile timestamps without changing assistant text", () => {
       "2026-09-20T14:11:23.000Z",
     ).text,
   ]).toEqual([
-    "20 Sep 14:11:19 UTC: \n\n---\n\n",
+    "\n\n---\n\n20 Sep 14:11:19 UTC: ",
     "Answer",
     "20 Sep 14:11:21 UTC: \n\n---\n\nAnswer",
-    "20 Sep 14:11:22 UTC: \n\n---\n\nHistory",
+    "\n\n---\n\n20 Sep 14:11:22 UTC: History",
     "20 Sep 14:11:23 UTC: 19 Sep 01:02:03 UTC: Agent prefix",
   ]);
 });
