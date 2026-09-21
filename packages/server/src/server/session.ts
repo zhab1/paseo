@@ -456,6 +456,11 @@ function formatAssistantTimestamp(timestamp: string): string | null {
   return `${day} ${month} ${hours}:${minutes}:${seconds} UTC:`;
 }
 
+function prependAssistantTimestamp(text: string, timestamp: string): string {
+  const boundary = text.startsWith("\n\n---\n\n") ? "\n\n---\n\n" : "";
+  return `${boundary}${timestamp} ${text.slice(boundary.length)}`;
+}
+
 // Stub types for features under development (modules not yet available)
 type AgentMcpTransportFactory = () => Promise<unknown>;
 
@@ -1397,7 +1402,10 @@ export class Session {
     if (!timestampText) return event;
     return {
       ...event,
-      item: { ...event.item, text: `${timestampText} ${event.item.text}` },
+      item: {
+        ...event.item,
+        text: prependAssistantTimestamp(event.item.text, timestampText),
+      },
     };
   }
 
@@ -1408,7 +1416,7 @@ export class Session {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
-    return { ...item, text: `${timestampText} ${item.text}` };
+    return { ...item, text: prependAssistantTimestamp(item.text, timestampText) };
   }
 
   supports(capability: ClientCapability): boolean {

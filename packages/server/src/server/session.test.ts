@@ -5529,6 +5529,7 @@ test("prepends mobile timestamps without changing assistant text", () => {
       ? [message.payload.event.item.text]
       : [],
   );
+  expect(assistantTexts.slice(0, 2).join("")).toBe("\n\n---\n\n20 Sep 14:11:19 UTC: Answer");
   expect([
     ...assistantTexts,
     asSessionInternals(session).projectTimelineItem(
@@ -5544,10 +5545,10 @@ test("prepends mobile timestamps without changing assistant text", () => {
       "2026-09-20T14:11:23.000Z",
     ).text,
   ]).toEqual([
-    "20 Sep 14:11:19 UTC: \n\n---\n\n",
+    "\n\n---\n\n20 Sep 14:11:19 UTC: ",
     "Answer",
-    "20 Sep 14:11:21 UTC: \n\n---\n\nAnswer",
-    "20 Sep 14:11:22 UTC: \n\n---\n\nHistory",
+    "\n\n---\n\n20 Sep 14:11:21 UTC: Answer",
+    "\n\n---\n\n20 Sep 14:11:22 UTC: History",
     "20 Sep 14:11:23 UTC: 19 Sep 01:02:03 UTC: Agent prefix",
   ]);
 });
