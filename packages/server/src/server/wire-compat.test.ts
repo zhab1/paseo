@@ -369,7 +369,7 @@ describe("wire compatibility", () => {
     });
     expect(mobile.payload.entries[2]?.item).toEqual({
       type: "assistant_message",
-      text: "",
+      text: "20 Sep 14:11:31 UTC: ",
       messageId: "message-3",
     });
     expect(rows.map((row) => row.item)).toEqual([
