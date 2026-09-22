@@ -1378,8 +1378,7 @@ export class Session {
   ): typeof event {
     if (this.clientType !== "mobile") return event;
     if (event.type !== "timeline" || event.item.type !== "assistant_message") {
-      if (!this.streamingAssistantMessages.get(agentId)?.messageId)
-        this.streamingAssistantMessages.delete(agentId);
+      this.clearAssistantTimestampBoundary(agentId, event);
       return event;
     }
     const previous = this.streamingAssistantMessages.get(agentId);
@@ -1407,13 +1406,29 @@ export class Session {
     };
   }
 
+  private clearAssistantTimestampBoundary(
+    agentId: string,
+    event: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): void {
+    if (
+      event.type === "turn_completed" ||
+      (event.type === "timeline" && event.item.type === "user_message") ||
+      !this.streamingAssistantMessages.get(agentId)?.messageId
+    ) {
+      this.streamingAssistantMessages.delete(agentId);
+    }
+  }
+
   private projectTimelineItem(
     item: AgentTimelineFetchResult["rows"][number]["item"],
     timestamp: string,
+    seenMessageIds?: Set<string>,
   ): AgentTimelineFetchResult["rows"][number]["item"] {
     if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
+    if (item.messageId && seenMessageIds?.has(item.messageId)) return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
+    if (item.messageId) seenMessageIds?.add(item.messageId);
     return { ...item, text: prependAssistantTimestamp(item.text, timestampText) };
   }
 
@@ -4825,6 +4840,7 @@ export class Session {
     epoch: string,
     source?: object,
   ): void {
+    const seenMessageIds = new Set<string>();
     for (const row of rows) {
       if (!this.supportsTimelineItem(row.item, source)) {
         continue;
@@ -4832,7 +4848,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: this.projectTimelineItem(row.item, row.timestamp),
+        item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7734,6 +7750,7 @@ export class Session {
       const entries = selectedTimeline.entries.filter((entry) =>
         this.supportsTimelineItem(entry.item, source),
       );
+      const seenMessageIds = new Set<string>();
 
       this.emitForSource(
         {
@@ -7757,7 +7774,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: this.projectTimelineItem(entry.item, entry.timestamp),
+                item: this.projectTimelineItem(entry.item, entry.timestamp, seenMessageIds),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
@@ -7990,6 +8007,7 @@ export class Session {
         },
       );
       const rows = timeline.rows.filter((row) => this.supportsTimelineItem(row.item, source));
+      const seenMessageIds = new Set<string>();
       this.emitForSource(
         {
           type: "agent.provider_subagents.timeline.get.response",
@@ -8012,7 +8030,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: this.projectTimelineItem(row.item, row.timestamp),
+              item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,
