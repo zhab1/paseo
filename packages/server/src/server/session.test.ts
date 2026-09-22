@@ -5390,6 +5390,16 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   listener({
     type: "agent_stream",
     agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:21.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "reasoning", text: "interleaved event" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
     timestamp: "2026-09-20T14:11:29.000Z",
     event: {
       type: "timeline",

@@ -1376,12 +1376,14 @@ export class Session {
     event: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
     timestamp?: string,
   ): typeof event {
-    if (
-      this.clientType !== "mobile" ||
-      event.type !== "timeline" ||
-      event.item.type !== "assistant_message"
-    ) {
-      this.streamingAssistantMessages.delete(agentId);
+    if (this.clientType !== "mobile") return event;
+    if (event.type !== "timeline" || event.item.type !== "assistant_message") {
+      if (
+        event.type === "turn_completed" ||
+        !this.streamingAssistantMessages.get(agentId)?.messageId
+      ) {
+        this.streamingAssistantMessages.delete(agentId);
+      }
       return event;
     }
     const previous = this.streamingAssistantMessages.get(agentId);
