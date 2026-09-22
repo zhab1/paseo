@@ -1378,12 +1378,8 @@ export class Session {
   ): typeof event {
     if (this.clientType !== "mobile") return event;
     if (event.type !== "timeline" || event.item.type !== "assistant_message") {
-      if (
-        event.type === "turn_completed" ||
-        !this.streamingAssistantMessages.get(agentId)?.messageId
-      ) {
+      if (!this.streamingAssistantMessages.get(agentId)?.messageId)
         this.streamingAssistantMessages.delete(agentId);
-      }
       return event;
     }
     const previous = this.streamingAssistantMessages.get(agentId);
