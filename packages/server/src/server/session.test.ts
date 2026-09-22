@@ -93,6 +93,7 @@ interface SessionHandlerInternals {
   projectTimelineItem(
     item: { type: "assistant_message"; text: string; messageId?: string },
     timestamp: string,
+    seenMessageIds?: Set<string>,
   ): { type: "assistant_message"; text: string; messageId?: string };
 }
 
@@ -5390,6 +5391,16 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   listener({
     type: "agent_stream",
     agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:21.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "reasoning", text: "interleaved event" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
     timestamp: "2026-09-20T14:11:29.000Z",
     event: {
       type: "timeline",
@@ -5400,8 +5411,28 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   listener({
     type: "agent_stream",
     agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:29.500Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", text: "Failure" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
     timestamp: "2026-09-20T14:11:30.000Z",
     event: { type: "turn_completed", provider: "mock" },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:31.000Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", text: "Standalone reply" },
+    },
   });
 
   expect(
@@ -5412,7 +5443,13 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo"]);
+  ).toEqual([
+    "20 Sep 14:11:19 UTC: ",
+    "Hel",
+    "lo",
+    "20 Sep 14:11:29 UTC: Failure",
+    "20 Sep 14:11:31 UTC: Standalone reply",
+  ]);
 });
 
 test("does not insert a timestamp when a streamed assistant message gains its turn id", () => {
@@ -5551,6 +5588,19 @@ test("prepends mobile timestamps without changing assistant text", () => {
     "\n\n---\n\n20 Sep 14:11:22 UTC: History",
     "20 Sep 14:11:23 UTC: 19 Sep 01:02:03 UTC: Agent prefix",
   ]);
+
+  const seenMessageIds = new Set<string>();
+  const first = asSessionInternals(session).projectTimelineItem(
+    { type: "assistant_message", messageId: "one-message", text: "The ROADMAP" },
+    "2026-09-20T14:11:24.000Z",
+    seenMessageIds,
+  );
+  const resumed = asSessionInternals(session).projectTimelineItem(
+    { type: "assistant_message", messageId: "one-message", text: " brief locally" },
+    "2026-09-20T14:11:25.000Z",
+    seenMessageIds,
+  );
+  expect(first.text + resumed.text).toBe("20 Sep 14:11:24 UTC: The ROADMAP brief locally");
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
