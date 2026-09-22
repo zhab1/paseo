@@ -45,6 +45,7 @@ export interface AgentTimelineFetchResult {
   startSeq: number | null;
   endSeq: number | null;
   rows: ProjectedTimelineRow[];
+  priorAssistantMessageIds?: string[];
 }
 
 export interface AgentTimelineStore {

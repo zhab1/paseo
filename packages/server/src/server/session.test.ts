@@ -5411,6 +5411,16 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
   listener({
     type: "agent_stream",
     agentId: "agent-a",
+    timestamp: "2026-09-20T14:11:29.500Z",
+    event: {
+      type: "timeline",
+      provider: "mock",
+      item: { type: "assistant_message", text: "Failure" },
+    },
+  });
+  listener({
+    type: "agent_stream",
+    agentId: "agent-a",
     timestamp: "2026-09-20T14:11:30.000Z",
     event: { type: "turn_completed", provider: "mock" },
   });
@@ -5433,7 +5443,13 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
         ? [message.payload.event.item.text]
         : [],
     ),
-  ).toEqual(["20 Sep 14:11:19 UTC: ", "Hel", "lo", "20 Sep 14:11:31 UTC: Standalone reply"]);
+  ).toEqual([
+    "20 Sep 14:11:19 UTC: ",
+    "Hel",
+    "lo",
+    "20 Sep 14:11:29 UTC: Failure",
+    "20 Sep 14:11:31 UTC: Standalone reply",
+  ]);
 });
 
 test("does not insert a timestamp when a streamed assistant message gains its turn id", () => {

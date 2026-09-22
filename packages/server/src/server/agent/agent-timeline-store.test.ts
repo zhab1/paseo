@@ -2,6 +2,30 @@ import { describe, expect, it } from "vitest";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 
 describe("InMemoryAgentTimelineStore", () => {
+  it("identifies assistant messages continued from an older page", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent-1", { epoch: "epoch-1" });
+    store.append("agent-1", { type: "assistant_message", messageId: "message-a", text: "The" });
+    store.append("agent-1", { type: "reasoning", text: "interleaved" });
+    store.append("agent-1", { type: "assistant_message", messageId: "message-a", text: " brief" });
+    store.append("agent-1", { type: "assistant_message", messageId: "message-b", text: "Done" });
+
+    const tail = store.fetch("agent-1", { limit: 2 });
+    expect(tail.priorAssistantMessageIds).toEqual(["message-a"]);
+    expect(tail.rows.map((row) => row.item)).toEqual([
+      { type: "assistant_message", messageId: "message-a", text: " brief" },
+      { type: "assistant_message", messageId: "message-b", text: "Done" },
+    ]);
+
+    expect(
+      store.fetch("agent-1", {
+        direction: "before",
+        cursor: { epoch: "epoch-1", seq: tail.startSeq ?? 0 },
+        limit: 2,
+      }).priorAssistantMessageIds,
+    ).toEqual([]);
+  });
+
   it("clamps an overshooting before cursor into the bounded tail window", () => {
     const store = new InMemoryAgentTimelineStore();
     store.initialize("agent-1", {

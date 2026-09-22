@@ -114,6 +114,21 @@ export class InMemoryAgentTimelineStore {
       cursorSeq: cursor?.seq,
       limit: options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT,
     });
+    const pageMessageIds = new Set(
+      page.entries.flatMap(({ item }) =>
+        item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
+      ),
+    );
+    const priorAssistantMessageIds = new Set<string>();
+    for (const row of rows) {
+      if (page.startSeq === null || row.seqStart >= page.startSeq) break;
+      if (
+        row.item.type === "assistant_message" &&
+        row.item.messageId &&
+        pageMessageIds.has(row.item.messageId)
+      )
+        priorAssistantMessageIds.add(row.item.messageId);
+    }
     return {
       epoch: state.epoch,
       direction,
@@ -125,6 +140,7 @@ export class InMemoryAgentTimelineStore {
       hasNewer: page.hasNewer,
       startSeq: page.startSeq,
       endSeq: page.endSeq,
+      priorAssistantMessageIds: [...priorAssistantMessageIds],
       rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
     };
   }
