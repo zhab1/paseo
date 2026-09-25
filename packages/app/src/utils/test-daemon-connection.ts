@@ -13,6 +13,7 @@ import {
   createDesktopDaemonTransportFactory,
 } from "@/desktop/daemon/desktop-daemon-transport";
 import type { DesktopDaemonTransportTarget } from "@/desktop/daemon/desktop-daemon";
+import { isWeb } from "@/constants/platform";
 
 export interface DaemonProbeClient {
   readonly lastError: string | null;
@@ -132,7 +133,7 @@ export async function buildClientConfig(
   const desktopTransportFactory = deps.createDesktopTransportFactory();
   const base = {
     clientId,
-    clientType: "mobile" as const,
+    clientType: isWeb ? ("browser" as const) : ("mobile" as const),
     appVersion: deps.resolveAppVersion() ?? undefined,
     suppressSendErrors: true,
     reconnect: { enabled: false },
