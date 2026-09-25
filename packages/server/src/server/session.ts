@@ -458,7 +458,8 @@ function formatAssistantTimestamp(timestamp: string): string | null {
 
 function prependAssistantTimestamp(text: string, timestamp: string): string {
   const boundary = text.startsWith("\n\n---\n\n") ? "\n\n---\n\n" : "";
-  return `${boundary}${timestamp} ${text.slice(boundary.length)}`;
+  // Keep the timestamp separate so leading Markdown syntax, including code fences, still parses.
+  return `${boundary}${timestamp}\n\n${text.slice(boundary.length)}`;
 }
 
 // Stub types for features under development (modules not yet available)

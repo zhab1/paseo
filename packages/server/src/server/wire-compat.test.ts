@@ -2,6 +2,7 @@ import {
   createMessageReceiptsStub,
   createTestCreationService,
 } from "./test-utils/session-stubs.js";
+import MarkdownIt from "markdown-it";
 import pino from "pino";
 import { z } from "zod";
 import { describe, expect, test } from "vitest";
@@ -321,6 +322,37 @@ async function emitTimelineResponse(options?: {
 }
 
 describe("wire compatibility", () => {
+  test("mobile timestamps preserve a copyable fenced assistant reply", async () => {
+    const source = "```text\nfirst line\n\nsecond line\n```";
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-09-25T10:50:46.000Z",
+        item: { type: "assistant_message", text: source, messageId: "message-1" },
+      },
+    ];
+
+    const mobile = await emitTimelineResponse({ clientType: "mobile", rows });
+    const cli = await emitTimelineResponse({ clientType: "cli", rows });
+    const mobileItem = mobile.payload.entries[0]?.item;
+    const cliItem = cli.payload.entries[0]?.item;
+    if (mobileItem?.type !== "assistant_message" || cliItem?.type !== "assistant_message") {
+      throw new Error("Expected assistant messages");
+    }
+
+    const fences = new MarkdownIt()
+      .parse(mobileItem.text, {})
+      .filter((token) => token.type === "fence");
+    expect(fences).toHaveLength(1);
+    expect(fences[0]?.content).toBe("first line\n\nsecond line\n");
+    expect(cliItem.text).toBe(source);
+    expect(rows[0]?.item).toEqual({
+      type: "assistant_message",
+      text: source,
+      messageId: "message-1",
+    });
+  });
+
   test("adds assistant timestamps only to mobile timeline projections", async () => {
     const rows: AgentTimelineRow[] = [
       {
@@ -354,7 +386,7 @@ describe("wire compatibility", () => {
 
     expect(mobile.payload.entries[0]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:20 UTC: Done",
+      text: "20 Sep 14:11:20 UTC:\n\nDone",
       messageId: "message-1",
     });
     expect(cli.payload.entries[0]?.item).toEqual({
@@ -364,12 +396,12 @@ describe("wire compatibility", () => {
     });
     expect(mobile.payload.entries[1]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:30 UTC: 20 Sep 14:11:30 UTC:\n\nAlready timestamped",
+      text: "20 Sep 14:11:30 UTC:\n\n20 Sep 14:11:30 UTC:\n\nAlready timestamped",
       messageId: "message-2",
     });
     expect(mobile.payload.entries[2]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:31 UTC: ",
+      text: "20 Sep 14:11:31 UTC:\n\n",
       messageId: "message-3",
     });
     expect(rows.map((row) => row.item)).toEqual([
