@@ -128,6 +128,7 @@ export function createStreamPresentation() {
         id,
         blockGroupId: item.id,
         blockIndex: index,
+        showTimestamp: index === (item.text.startsWith("\n\n---\n\n") ? 1 : 0),
         text: blockText,
       });
     }

@@ -1,4 +1,5 @@
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { formatAssistantTimestamp } from "@getpaseo/protocol/assistant-timestamp";
 import { TaskListRow } from "@/components/task-list-row";
 import {
   View,
@@ -752,6 +753,7 @@ interface AssistantMessageProps {
   occurrenceKey: string;
   message: string;
   timestamp: number;
+  showTimestamp?: boolean;
   workspaceRoot?: string;
   serverId?: string;
   client?: DaemonClient | null;
@@ -760,6 +762,12 @@ interface AssistantMessageProps {
 }
 
 export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
+  timestamp: {
+    paddingTop: theme.spacing[3],
+    fontFamily: theme.fontFamily.ui,
+    fontSize: theme.fontSize.base,
+    color: theme.colors.foregroundMuted,
+  },
   container: {
     paddingVertical: theme.spacing[3],
     ...(isWeb ? { userSelect: "text" as const } : {}),
@@ -1496,7 +1504,8 @@ export const AssistantMessage = memo(function AssistantMessage({
   renderFullContent = false,
   occurrenceKey,
   message,
-  timestamp: _timestamp,
+  timestamp,
+  showTimestamp = false,
   workspaceRoot,
   serverId,
   client,
@@ -1987,33 +1996,40 @@ export const AssistantMessage = memo(function AssistantMessage({
   );
 
   return (
-    <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
-      {keyedBlocks.map(({ key, block }, index) => (
-        <AssistantMessageBlockContainer
-          key={key}
-          block={block}
-          marginBottom={index < keyedBlocks.length - 1 ? 12 : 0}
-        >
-          <MemoizedMarkdownBlock
-            text={block}
-            rules={markdownRules}
-            parser={
-              phase === "streaming" && index === keyedBlocks.length - 1
-                ? streamingMarkdownParser
-                : markdownParser
-            }
-            onLinkPress={handleMarkdownLinkPress}
-          />
-        </AssistantMessageBlockContainer>
-      ))}
-      {fullMessageByteLength !== null ? (
-        <Text
-          testID="assistant-message-capped-notice"
-          style={assistantMessageStylesheet.cappedNotice}
-        >
-          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
+    <View>
+      {showTimestamp ? (
+        <Text testID="assistant-timestamp" style={assistantMessageStylesheet.timestamp}>
+          {formatAssistantTimestamp(timestamp)}
         </Text>
       ) : null}
+      <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
+        {keyedBlocks.map(({ key, block }, index) => (
+          <AssistantMessageBlockContainer
+            key={key}
+            block={block}
+            marginBottom={index < keyedBlocks.length - 1 ? 12 : 0}
+          >
+            <MemoizedMarkdownBlock
+              text={block}
+              rules={markdownRules}
+              parser={
+                phase === "streaming" && index === keyedBlocks.length - 1
+                  ? streamingMarkdownParser
+                  : markdownParser
+              }
+              onLinkPress={handleMarkdownLinkPress}
+            />
+          </AssistantMessageBlockContainer>
+        ))}
+        {fullMessageByteLength !== null ? (
+          <Text
+            testID="assistant-message-capped-notice"
+            style={assistantMessageStylesheet.cappedNotice}
+          >
+            {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
+          </Text>
+        ) : null}
+      </View>
     </View>
   );
 });

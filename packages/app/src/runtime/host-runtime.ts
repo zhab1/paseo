@@ -531,6 +531,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
     : undefined;
   const appCapabilities = {
     ...browserAutomationCapabilities,
+    [CLIENT_CAPS.assistantTimestampRendering]: true,
   };
 
   return {
