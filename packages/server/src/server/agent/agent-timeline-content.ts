@@ -4,6 +4,12 @@ import type { JsonValue } from "@getpaseo/protocol/agent-types";
 const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
 export const PLUGIN_TIMELINE_DATA_MAX_BYTES = 64 * 1024;
 
+function copyContentPrefix(content: string): string {
+  // V8 slices can retain the entire oversized source. Copy the UTF-16 code units,
+  // including a surrogate split at the existing character limit, into bounded storage.
+  return Buffer.from(content.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH), "utf16le").toString("utf16le");
+}
+
 export function assertPluginTimelineDataSize(data: JsonValue): void {
   const serializedBytes = Buffer.byteLength(JSON.stringify(data), "utf8");
   if (serializedBytes > PLUGIN_TIMELINE_DATA_MAX_BYTES) {
@@ -28,7 +34,7 @@ function limitFailedShellError(item: AgentTimelineItem): AgentTimelineItem {
     ...item,
     error: {
       ...item.error,
-      content: item.error.content.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      content: copyContentPrefix(item.error.content),
     },
   };
 }
@@ -46,7 +52,7 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
     ...item,
     detail: {
       ...item.detail,
-      text: item.detail.text.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      text: copyContentPrefix(item.detail.text),
     },
   };
 }
@@ -68,7 +74,7 @@ export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTim
     ...item,
     detail: {
       ...item.detail,
-      output: item.detail.output.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH),
+      output: copyContentPrefix(item.detail.output),
     },
   };
 }
