@@ -123,62 +123,6 @@ function rows(result: { tail: StreamItem[]; head: StreamItem[] }): StreamItem[] 
   return [...result.tail, ...result.head];
 }
 
-it.each(["", "\n\n---\n\n"])(
-  "keeps one timestamp beside message content across streaming and history with prefix %j",
-  (prefix) => {
-    const harness = streamHarness();
-    harness.send(assistant(prefix + "```ts\nconst x = 1;\n```"));
-    const streamed = rows(harness.send(assistant("\n\nSecond paragraph.")));
-    const text = prefix + "```ts\nconst x = 1;\n```\n\nSecond paragraph.";
-    const fetched = rows(
-      createStreamPresentation()({
-        ...presentationOptions,
-        head: [],
-        transform: undefined,
-        tail: hydrateStreamState([{ event: assistant(text), timestamp: new Date(1000) }]),
-      }),
-    );
-    for (const result of [streamed, fetched]) {
-      const labelled = result.filter(
-        (item) => item.kind === "assistant_message" && item.showTimestamp,
-      );
-      expect(labelled).toHaveLength(1);
-      expect(labelled[0]).toMatchObject({
-        text: expect.stringContaining("```ts"),
-        timestamp: new Date(1000),
-      });
-      expect(result).toHaveLength(prefix ? 3 : 2);
-    }
-  },
-);
-
-it("labels a logical assistant message once across interleaved segments", () => {
-  const events: AgentStreamEventPayload[] = [
-    assistant("First segment.", "message-a"),
-    { type: "timeline", provider: "claude", item: { type: "reasoning", text: "Thinking" } },
-    assistant("Second segment.", "message-a"),
-    assistant("Another message.", "message-b"),
-  ];
-  const harness = streamHarness();
-  for (const event of events) harness.send(event);
-  const history = hydrateStreamState(events.map((event) => ({ event, timestamp: new Date(1000) })));
-  const fetched = createStreamPresentation()({
-    ...presentationOptions,
-    tail: history,
-    head: [],
-    transform: undefined,
-  });
-  for (const result of [harness.render(), fetched]) {
-    const labelled = rows(result).filter(
-      (item) => item.kind === "assistant_message" && item.showTimestamp,
-    );
-    expect(labelled.map((item) => item.kind === "assistant_message" && item.messageId)).toEqual([
-      "message-a",
-      "message-b",
-    ]);
-  }
-});
-
 describe("stream presentation through installed plugins", () => {
   it("offers every source tool call to an installed transformer in Overview mode", () => {
     const calls = [toolCall("call-1", "bash"), toolCall("call-2", "read")];
@@ -605,13 +549,7 @@ describe("timeline presentation", () => {
     expect(projectTimelineItems(items)).toEqual(
       items.map((item) =>
         item.kind === "assistant_message"
-          ? {
-              ...item,
-              id: `${item.id}:block:0`,
-              blockGroupId: item.id,
-              blockIndex: 0,
-              showTimestamp: true,
-            }
+          ? { ...item, id: `${item.id}:block:0`, blockGroupId: item.id, blockIndex: 0 }
           : item,
       ),
     );

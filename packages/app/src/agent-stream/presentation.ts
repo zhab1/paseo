@@ -48,13 +48,6 @@ function isReusableBlock(block: AssistantMessageItem, source: AssistantMessageIt
   );
 }
 
-function assistantTimestampBlock(item: AssistantMessageItem): number {
-  // The reducer keeps the provider ID on the first segment and gives later
-  // interleaved segments distinct IDs while preserving their messageId.
-  if (item.messageId && item.id !== item.messageId) return -1;
-  return item.text.startsWith("\n\n---\n\n") ? 1 : 0;
-}
-
 /** Source messages reach plugins before any Markdown splitting or Overview grouping. */
 export function createStreamPresentation() {
   const userMessageCache = new WeakMap<UserMessageItem, UserMessageItem>();
@@ -135,7 +128,6 @@ export function createStreamPresentation() {
         id,
         blockGroupId: item.id,
         blockIndex: index,
-        showTimestamp: index === assistantTimestampBlock(item),
         text: blockText,
       });
     }

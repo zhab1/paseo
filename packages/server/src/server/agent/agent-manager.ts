@@ -3702,11 +3702,7 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return { timestamp: now.toISOString() };
     }
-    const rows = await this.durableTimelineStore.getCommittedRows(agentId);
     return {
-      rows: rows.map((row) =>
-        Object.assign({}, row, { item: limitAgentTimelineItemContent(row.item) }),
-      ),
       nextSeq: (await this.durableTimelineStore.getLatestCommittedSeq(agentId)) + 1,
       timestamp: now.toISOString(),
     };

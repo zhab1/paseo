@@ -1,5 +1,4 @@
 import { searchTimeline } from "./agent/chat-search/index.js";
-import { formatAssistantTimestamp } from "@getpaseo/protocol/assistant-timestamp";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
 import type {
@@ -435,6 +434,31 @@ const nodeSessionFileSystem: SessionFileSystem = {
     return stats?.isDirectory() ?? false;
   },
 };
+
+const ASSISTANT_TIMESTAMP_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+function formatAssistantTimestamp(timestamp: string): string | null {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const day = date.getUTCDate();
+  const month = ASSISTANT_TIMESTAMP_MONTHS[date.getUTCMonth()];
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(date.getUTCSeconds()).padStart(2, "0");
+  return `${day} ${month} ${hours}:${minutes}:${seconds} UTC:`;
+}
 
 function prependAssistantTimestamp(text: string, timestamp: string): string {
   const boundary = text.startsWith("\n\n---\n\n") ? "\n\n---\n\n" : "";
@@ -1322,12 +1346,6 @@ export class Session {
       type: "agent_stream",
       payload: this.buildAgentStreamPayload(event, projectedEvent),
     };
-    const rawMessage: SessionOutboundMessage = {
-      ...message,
-      payload: { ...message.payload, event: serializedEvent },
-    };
-    const messageForSource = (source?: object) =>
-      this.rendersAssistantTimestamps(source) ? rawMessage : message;
     for (const subscription of this.timelineSubscriptions.values()) {
       const source = subscription.owner.source;
       if (!subscription.agentIds.has(event.agentId)) continue;
@@ -1342,7 +1360,7 @@ export class Session {
         !this.supportsTimelineItem(projectedEvent.item, source)
       )
         continue;
-      subscription.owner.emit(messageForSource(source));
+      subscription.owner.emit(message);
     }
     // COMPAT(ownedSubscriptions): added in v0.8.0, remove implicit timeline delivery after 2027-03-09.
     for (const [source, { capabilities }] of this.clientSources) {
@@ -1357,22 +1375,14 @@ export class Session {
         (subscription) =>
           subscription.owner.source === source && subscription.agentIds.has(event.agentId),
       );
-      if (!alreadyDelivered) this.onMessageToSource?.(source, messageForSource(source));
+      if (!alreadyDelivered) this.onMessageToSource?.(source, message);
     }
     if (
       this.clientSources.size === 0 &&
       !this.supports(CLIENT_CAPS.selectiveAgentTimeline) &&
       this.timelineSubscriptions.size === 0
     )
-      this.emit(messageForSource());
-  }
-
-  private rendersAssistantTimestamps(source?: object): boolean {
-    // COMPAT(assistantTimestampRendering): fork v0.11.0; retire legacy text projection after
-    // 2027-04-02 once the supported official client floor renders timestamps itself.
-    return source
-      ? this.supportsForSource(CLIENT_CAPS.assistantTimestampRendering, source)
-      : this.supports(CLIENT_CAPS.assistantTimestampRendering);
+      this.emit(message);
   }
 
   private projectLiveAssistantTimestamp(
@@ -1415,14 +1425,8 @@ export class Session {
     item: AgentTimelineFetchResult["rows"][number]["item"],
     timestamp: string,
     seenMessageIds?: Set<string>,
-    source?: object,
   ): AgentTimelineFetchResult["rows"][number]["item"] {
-    if (
-      this.clientType !== "mobile" ||
-      item.type !== "assistant_message" ||
-      this.rendersAssistantTimestamps(source)
-    )
-      return item;
+    if (this.clientType !== "mobile" || item.type !== "assistant_message") return item;
     if (item.messageId && seenMessageIds?.has(item.messageId)) return item;
     const timestampText = formatAssistantTimestamp(timestamp);
     if (!timestampText) return item;
@@ -1961,16 +1965,6 @@ export class Session {
       };
     }
 
-    const messageForSource = (source?: object): SessionOutboundMessage => {
-      if (
-        update.type !== "timeline" ||
-        message.type !== "agent.provider_subagents.update" ||
-        message.payload.kind !== "timeline" ||
-        !this.rendersAssistantTimestamps(source)
-      )
-        return message;
-      return { ...message, payload: { ...message.payload, item: update.row.item } };
-    };
     const delivered = new Set<object>();
     for (const subscription of this.eventSubscriptions.values()) {
       if (!subscription.events.has("agent.provider_subagents.update")) continue;
@@ -1979,7 +1973,7 @@ export class Session {
         !this.supportsSubagentTimelineItem(update.row.item, subscription.owner.source)
       )
         continue;
-      subscription.owner.emit(messageForSource(subscription.owner.source));
+      subscription.owner.emit(message);
       delivered.add(subscription.owner.source);
     }
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
@@ -1987,7 +1981,7 @@ export class Session {
         this.supports(CLIENT_CAPS.providerSubagents) &&
         (update.type !== "timeline" || this.supportsSubagentTimelineItem(update.row.item))
       ) {
-        this.emit(messageForSource());
+        this.emit(message);
       }
       return;
     }
@@ -2000,7 +1994,7 @@ export class Session {
         continue;
       if (update.type === "timeline" && !this.supportsSubagentTimelineItem(update.row.item, source))
         continue;
-      this.onMessageToSource(source, messageForSource(source));
+      this.onMessageToSource(source, message);
     }
   }
 
@@ -4866,7 +4860,7 @@ export class Session {
       const event = serializeAgentStreamEvent({
         type: "timeline",
         provider,
-        item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds, source),
+        item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds),
         ...(row.turnId ? { turnId: row.turnId } : {}),
         timestamp: row.timestamp,
       });
@@ -7792,7 +7786,7 @@ export class Session {
             entries: entries.map((entry) => {
               const payloadEntry = {
                 provider: snapshot.provider,
-                item: this.projectTimelineItem(entry.item, entry.timestamp, seenMessageIds, source),
+                item: this.projectTimelineItem(entry.item, entry.timestamp, seenMessageIds),
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
@@ -8048,7 +8042,7 @@ export class Session {
             hasOlder: supportsProjection && timeline.hasOlder,
             hasNewer: supportsProjection && timeline.hasNewer,
             rows: rows.map((row) => ({
-              item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds, source),
+              item: this.projectTimelineItem(row.item, row.timestamp, seenMessageIds),
               timestamp: row.timestamp,
               seq: row.seqEnd,
               seqStart: row.seqStart,

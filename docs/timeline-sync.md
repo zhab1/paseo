@@ -21,17 +21,6 @@ to 64 KiB, and the same bounded item is used for runtime timeline rows and live 
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 
-## Assistant timestamps
-
-The fork app advertises `assistant_timestamp_rendering` and enables timestamp labels only when
-`server_info.features.assistantTimestampRendering` confirms the daemon honors it. These labels sit
-outside assistant Markdown, so message splitting, streaming reveal, copying and plugin transforms
-receive original text. Only the first content block gets a label, after a synthetic Codex divider.
-Older official mobile clients keep the server's inline timestamp projection. Select the projection
-per physical client source, including fetched history and provider child timelines; a retained
-session can contain clients with different capabilities. Stored timelines and provider context
-remain unchanged. An updated app connected to an older daemon leaves its inline labels alone.
-
 ## Presence is not delivery
 
 Client heartbeat reports presence:

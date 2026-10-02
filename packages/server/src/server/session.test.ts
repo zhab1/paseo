@@ -94,7 +94,6 @@ interface SessionHandlerInternals {
     item: { type: "assistant_message"; text: string; messageId?: string },
     timestamp: string,
     seenMessageIds?: Set<string>,
-    source?: object,
   ): { type: "assistant_message"; text: string; messageId?: string };
 }
 
@@ -5352,88 +5351,6 @@ test("unions viewed timelines across socket sources and removes detached sources
       message.type === "agent_stream" ? [message.payload.agentId] : [],
     ),
   ).toEqual(["agent-b"]);
-});
-
-test("keeps original assistant content for rendering clients sharing a session with legacy mobile", () => {
-  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
-  const listeners: Array<(event: AgentManagerEvent) => void> = [];
-  const session = createSessionForTest({
-    clientType: "mobile",
-    messages: [],
-    targetedMessages,
-    agentManager: {
-      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
-        listeners.push(listener);
-        return () => {};
-      }),
-    },
-  });
-  const legacy = {};
-  const renderer = {};
-  const capabilities = {
-    [CLIENT_CAPS.providerSubagents]: true,
-    [CLIENT_CAPS.projectedSubagentTimeline]: true,
-  };
-  session.updateClientCapabilities(capabilities, legacy);
-  session.updateClientCapabilities(
-    { ...capabilities, [CLIENT_CAPS.assistantTimestampRendering]: true },
-    renderer,
-  );
-  const timestamp = "2026-09-20T14:11:19.000Z";
-  const item = {
-    type: "assistant_message" as const,
-    messageId: "message-a",
-    text: "```ts\nconst x = 1;\n```",
-  };
-  for (const text of [item.text, "\n\nNext paragraph"]) {
-    listeners[0]!({
-      type: "agent_stream",
-      agentId: "agent-a",
-      timestamp,
-      event: { type: "timeline", provider: "mock", item: { ...item, text } },
-    });
-  }
-  const texts = (source: object) =>
-    targetedMessages.flatMap(({ source: target, message }) =>
-      target === source &&
-      message.type === "agent_stream" &&
-      message.payload.event.type === "timeline" &&
-      message.payload.event.item.type === "assistant_message"
-        ? [message.payload.event.item.text]
-        : [],
-    );
-  expect(texts(renderer)).toEqual([item.text, "\n\nNext paragraph"]);
-  expect(texts(legacy)).toEqual([`20 Sep 14:11:19 UTC:\n\n${item.text}`, "\n\nNext paragraph"]);
-  expect(
-    asSessionInternals(session).projectTimelineItem(item, timestamp, new Set(), renderer),
-  ).toBe(item);
-  expect(
-    asSessionInternals(session).projectTimelineItem(item, timestamp, new Set(), legacy).text,
-  ).toBe(`20 Sep 14:11:19 UTC:\n\n${item.text}`);
-  listeners[0]!({
-    type: "provider_subagent",
-    event: {
-      type: "timeline",
-      parentAgentId: "agent-a",
-      subagentId: "child",
-      provider: "mock",
-      epoch: "epoch",
-      row: { seq: 1, timestamp, item },
-    },
-  });
-  for (const source of [legacy, renderer]) {
-    const childTexts = targetedMessages.flatMap(({ source: target, message }) =>
-      target === source &&
-      message.type === "agent.provider_subagents.update" &&
-      message.payload.kind === "timeline" &&
-      message.payload.item.type === "assistant_message"
-        ? [message.payload.item.text]
-        : [],
-    );
-    expect(childTexts).toEqual([
-      source === renderer ? item.text : `20 Sep 14:11:19 UTC:\n\n${item.text}`,
-    ]);
-  }
 });
 
 test("prepends one timestamp to an unchanged streamed mobile assistant message", () => {

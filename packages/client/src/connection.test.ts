@@ -135,17 +135,13 @@ function connection(
   };
 }
 
-test("a plain client advertises protocol capabilities without app-owned rendering or hosting", async () => {
+test("a plain client advertises every protocol capability and no browser host", async () => {
   const h = connection();
   try {
     const ready = h.client.connect();
     h.open();
     await ready;
-    const {
-      browserHost: _browser,
-      assistantTimestampRendering: _timestamps,
-      ...protocolCapabilities
-    } = CLIENT_CAPS;
+    const { browserHost: _browser, ...protocolCapabilities } = CLIENT_CAPS;
     // Every new capability needs a deliberate default or a host-owned exception.
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].capabilities).toEqual(

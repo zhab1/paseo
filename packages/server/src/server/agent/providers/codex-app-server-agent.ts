@@ -4763,6 +4763,10 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async setMode(modeId: string): Promise<void | AgentProviderNotice> {
     validateCodexMode(modeId);
+    this.currentMode = modeId;
+    this.hasWorkflowModeOverride = true;
+    this.config.modeId = modeId;
+    this.cachedRuntimeInfo = null;
     const client = this.client;
     const threadId = this.currentThreadId;
     if (client && threadId) {
@@ -4778,40 +4782,32 @@ export class CodexAppServerAgentSession implements AgentSession {
         });
       }
       params.approvalsReviewer = preset.approvalsReviewer;
-      let nativeSettingsUpdated = false;
       try {
         await client.request("thread/settings/update", params);
-        nativeSettingsUpdated = true;
       } catch (error) {
         if (!isUnsupportedCodexThreadSettingsUpdate(error)) throw error;
         // COMPAT(codexThreadSettingsUpdate): added in v0.7.0, remove after 2027-03-02
         // once Codex 0.105 falls below the supported floor.
-        // Keep the local next-turn fallback, without sending unsupported child updates.
+        return this.activeForegroundTurnId ? MODE_APPLIES_NEXT_TURN_NOTICE : undefined;
       }
 
-      if (nativeSettingsUpdated) {
-        const activeChildThreadIds = Array.from(this.subAgentCallsByCallId.values()).flatMap(
-          (state) => (state.toolCall.status === "running" ? Array.from(state.childThreadIds) : []),
-        );
-        const updates = await Promise.allSettled(
-          activeChildThreadIds.map((childThreadId) =>
-            client.request("thread/settings/update", { ...params, threadId: childThreadId }),
-          ),
-        );
-        updates.forEach((result, index) => {
-          if (result.status === "rejected") {
-            this.logger.warn(
-              { err: result.reason, threadId: activeChildThreadIds[index] },
-              "Failed to update a running Codex subagent permission mode",
-            );
-          }
-        });
-      }
+      const activeChildThreadIds = Array.from(this.subAgentCallsByCallId.values()).flatMap(
+        (state) => (state.toolCall.status === "running" ? Array.from(state.childThreadIds) : []),
+      );
+      const updates = await Promise.allSettled(
+        activeChildThreadIds.map((childThreadId) =>
+          client.request("thread/settings/update", { ...params, threadId: childThreadId }),
+        ),
+      );
+      updates.forEach((result, index) => {
+        if (result.status === "rejected") {
+          this.logger.warn(
+            { err: result.reason, threadId: activeChildThreadIds[index] },
+            "Failed to update a running Codex subagent permission mode",
+          );
+        }
+      });
     }
-    this.currentMode = modeId;
-    this.hasWorkflowModeOverride = true;
-    this.config.modeId = modeId;
-    this.cachedRuntimeInfo = null;
     if (this.activeForegroundTurnId) {
       return MODE_APPLIES_NEXT_TURN_NOTICE;
     }

@@ -729,12 +729,6 @@ test("skips provider history when a resumed agent already has durable timeline r
         item: { type: "assistant_message", text: "durable history" },
       }),
     );
-    const page = manager.fetchTimeline(agentId, { direction: "tail", limit: 20 });
-    expect(page.rows.map((row) => row.item)).toEqual([
-      { type: "assistant_message", text: "durable history" },
-    ]);
-    expect(page.startSeq).toBe(1);
-    expect(page.endSeq).toBe(1);
     expect(manager.getAgent(agentId)?.historyPrimed).toBe(true);
   } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
