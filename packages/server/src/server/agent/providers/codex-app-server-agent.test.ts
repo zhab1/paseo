@@ -1036,6 +1036,22 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("setMode preserves the previous mode when native settings reject the update", async () => {
+    const session = createSession({ modeId: "auto" });
+    const previousRuntime = await session.getRuntimeInfo();
+    const failure = new Error("native settings unavailable");
+    session.client = {
+      request: vi.fn(async () => {
+        throw failure;
+      }),
+    };
+
+    await expect(session.setMode("full-access")).rejects.toBe(failure);
+    await expect(session.getCurrentMode()).resolves.toBe("auto");
+    expect(asInternals(session).config.modeId).toBe("auto");
+    await expect(session.getRuntimeInfo()).resolves.toEqual(previousRuntime);
+  });
+
   test("setMode falls back to next-turn policy when thread settings are unsupported", async () => {
     const session = createSession({ modeId: "auto" });
     session.activeForegroundTurnId = null;

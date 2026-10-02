@@ -152,6 +152,33 @@ it.each(["", "\n\n---\n\n"])(
   },
 );
 
+it("labels a logical assistant message once across interleaved segments", () => {
+  const events: AgentStreamEventPayload[] = [
+    assistant("First segment.", "message-a"),
+    { type: "timeline", provider: "claude", item: { type: "reasoning", text: "Thinking" } },
+    assistant("Second segment.", "message-a"),
+    assistant("Another message.", "message-b"),
+  ];
+  const harness = streamHarness();
+  for (const event of events) harness.send(event);
+  const history = hydrateStreamState(events.map((event) => ({ event, timestamp: new Date(1000) })));
+  const fetched = createStreamPresentation()({
+    ...presentationOptions,
+    tail: history,
+    head: [],
+    transform: undefined,
+  });
+  for (const result of [harness.render(), fetched]) {
+    const labelled = rows(result).filter(
+      (item) => item.kind === "assistant_message" && item.showTimestamp,
+    );
+    expect(labelled.map((item) => item.kind === "assistant_message" && item.messageId)).toEqual([
+      "message-a",
+      "message-b",
+    ]);
+  }
+});
+
 describe("stream presentation through installed plugins", () => {
   it("offers every source tool call to an installed transformer in Overview mode", () => {
     const calls = [toolCall("call-1", "bash"), toolCall("call-2", "read")];
