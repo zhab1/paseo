@@ -168,6 +168,19 @@ export function pinRow(scope: Locator, source: string, window: string): Locator 
   return scope.getByRole("checkbox", { name: new RegExp(`^Pin ${source} ${window}, `) });
 }
 
+/**
+ * A report card whose window rows do not pin: no pin toggle, no pin glyph, and nothing focusable
+ * but buttons, so no row presses or highlights on hover.
+ */
+export async function expectUnpinnableRows(card: Locator): Promise<void> {
+  await expect(card.getByRole("checkbox")).toHaveCount(0);
+  await expect(card.locator('[data-testid^="usage-pin-"]')).toHaveCount(0);
+  const focusable = await card
+    .locator("[tabindex]")
+    .evaluateAll((nodes) => nodes.filter((node) => node.getAttribute("role") !== "button").length);
+  expect(focusable).toBe(0);
+}
+
 export async function togglePin(scope: Locator, source: string, window: string) {
   const row = pinRow(scope, source, window);
   const pinned = await row.isChecked();
@@ -175,21 +188,46 @@ export async function togglePin(scope: Locator, source: string, window: string) 
   await expect(row).toBeChecked({ checked: !pinned });
 }
 
-/** The usage title row's options menu: Refresh and Used/Remaining. */
+/** The footer's Usage icon, which is there whether or not the Usage item is on. */
+export async function openUsageScreenFromIcon(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Usage", exact: true }).click({ timeout: 30_000 });
+  await expectOnUsageScreen(page);
+}
+
+function summaryInSidebarSwitch(page: Page): Locator {
+  return page.getByRole("switch", { name: "Summary in sidebar", exact: true });
+}
+
+/** Turns the sidebar Usage summary on or off from the Usage screen's Settings. */
+export async function setSummaryInSidebar(page: Page, on: boolean): Promise<void> {
+  await openUsageOptions(page);
+  await summaryInSidebarSwitch(page).click();
+  await expectSummaryInSidebar(page, on);
+}
+
+export async function expectSummaryInSidebar(page: Page, on: boolean): Promise<void> {
+  await openUsageOptions(page);
+  await expect(summaryInSidebarSwitch(page)).toBeChecked({ checked: on });
+}
+
+/** Expand the inline Settings row when its controls are folded. */
 export async function openUsageOptions(page: Page): Promise<void> {
-  await page.locator('[data-testid="usage-options-menu"]:visible').first().click();
-  await expect(page.getByTestId("usage-display-used")).toBeVisible();
+  const toggle = visible(page, "usage-options-toggle");
+  if ((await toggle.getAttribute("aria-expanded")) === "false") await toggle.click();
+  await expect(visible(page, "usage-display-used")).toBeVisible();
 }
 
 export async function showUsageAs(page: Page, displayAs: "used" | "remaining") {
   await openUsageOptions(page);
-  await page.getByTestId(`usage-display-${displayAs}`).click();
-  await expect(page.getByTestId("usage-display-used")).toHaveCount(0);
+  await visible(page, `usage-display-${displayAs}`).click();
+  await expect(visible(page, `usage-display-${displayAs}`)).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
 }
 
 export async function refreshAllUsage(page: Page): Promise<void> {
-  await openUsageOptions(page);
-  await page.getByRole("menuitem", { name: "Refresh", exact: true }).click();
+  await visible(page, "usage-refresh-all").click();
 }
 
 /** Opens the compact sidebar drawer. */
