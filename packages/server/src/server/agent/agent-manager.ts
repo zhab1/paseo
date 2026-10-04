@@ -1225,6 +1225,14 @@ export class AgentManager {
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
+  async hydrateProviderSubagentTimeline(parentAgentId: string, subagentId: string): Promise<void> {
+    const agent = this.requirePublicAgent(parentAgentId);
+    const session = agent.session;
+    const load = session?.getProviderSubagentHistory?.bind(session);
+    if (!load) return;
+    await this.providerSubagents.hydrateTimeline(parentAgentId, subagentId, () => load(subagentId));
+  }
+
   createAgent(
     config: AgentSessionConfig,
     agentId: string | undefined,

@@ -1,7 +1,85 @@
 import { describe, expect, test } from "vitest";
 import { ProviderSubagentStore } from "./store.js";
+import type { ImportedTimelineEntry } from "../agent-sdk-types.js";
 
 describe("ProviderSubagentStore", () => {
+  test("prepends deferred history once while preserving concurrent live output and paging", async () => {
+    const store = new ProviderSubagentStore();
+    store.apply("parent", "codex", { type: "upsert", id: "child" });
+    const before = store.fetchTimeline("parent", "child");
+    let finish!: (history: ImportedTimelineEntry[]) => void;
+    let calls = 0;
+    const history = new Promise<ImportedTimelineEntry[]>((resolve) => {
+      finish = resolve;
+    });
+    const load = () => {
+      calls++;
+      return history;
+    };
+    const first = store.hydrateTimeline("parent", "child", load);
+    const second = store.hydrateTimeline("parent", "child", load);
+    store.apply("parent", "codex", {
+      type: "timeline",
+      id: "child",
+      item: { type: "assistant_message", messageId: "live", text: "New reply" },
+    });
+    finish([
+      {
+        item: { type: "assistant_message", messageId: "old", text: "Saved reply" },
+        timestamp: "2026-09-27T00:00:00Z",
+      },
+    ]);
+    await Promise.all([first, second]);
+    await store.hydrateTimeline("parent", "child", load);
+    expect(calls).toBe(1);
+    expect(store.fetchTimeline("parent", "child").rows.map((row) => row.item)).toEqual([
+      { type: "assistant_message", messageId: "old", text: "Saved reply" },
+      { type: "assistant_message", messageId: "live", text: "New reply" },
+    ]);
+    expect(
+      store.fetchTimeline("parent", "child", {
+        cursor: { epoch: before.epoch, seq: 0 },
+        direction: "after",
+      }).staleCursor,
+    ).toBe(true);
+    expect(store.fetchTimeline("parent", "child", { limit: 1 }).hasOlder).toBe(true);
+  });
+
+  test("failed deferred reads retry without losing live output", async () => {
+    const store = new ProviderSubagentStore();
+    store.apply("parent", "codex", { type: "upsert", id: "child" });
+    store.apply("parent", "codex", {
+      type: "timeline",
+      id: "child",
+      item: { type: "assistant_message", messageId: "live", text: "Live" },
+    });
+    await expect(
+      store.hydrateTimeline("parent", "child", async () => {
+        throw new Error("read failed");
+      }),
+    ).rejects.toThrow("read failed");
+    expect(store.fetchTimeline("parent", "child").rows).toHaveLength(1);
+    await store.hydrateTimeline("parent", "child", async () => [
+      { item: { type: "assistant_message", messageId: "old", text: "Saved" } },
+    ]);
+    expect(store.fetchTimeline("parent", "child").rows).toHaveLength(2);
+  });
+
+  test("discarding a parent invalidates an outstanding history read", async () => {
+    const store = new ProviderSubagentStore();
+    store.apply("parent", "codex", { type: "upsert", id: "child" });
+    let finish!: (history: ImportedTimelineEntry[]) => void;
+    const history = new Promise<ImportedTimelineEntry[]>((resolve) => {
+      finish = resolve;
+    });
+    const pending = store.hydrateTimeline("parent", "child", () => history);
+    store.deleteParent("parent");
+    store.apply("parent", "codex", { type: "upsert", id: "child" });
+    finish([{ item: { type: "assistant_message", text: "Stale" } }]);
+    await expect(pending).rejects.toThrow("reloaded");
+    expect(store.fetchTimeline("parent", "child").rows).toEqual([]);
+  });
+
   test("keeps provider children and their timelines scoped to the parent agent", () => {
     const subagents = new ProviderSubagentStore();
 

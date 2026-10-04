@@ -197,6 +197,8 @@ export function createFakeCodexAppServer(
       };
     },
     "thread/read": () => ({ thread: { turns: [] } }),
+    "thread/list": () => ({ data: [], nextCursor: null }),
+    "thread/turns/list": () => ({ data: [] }),
     ...handlers,
   };
   const messages: JsonObject[] = [];

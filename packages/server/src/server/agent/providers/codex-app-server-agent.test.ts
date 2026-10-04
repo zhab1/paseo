@@ -4970,6 +4970,150 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test.each([
+    ["completed", "completed"],
+    ["failed", "failed"],
+    ["interrupted", "canceled"],
+  ])("defers %s child transcripts until requested", async (nativeStatus, status) => {
+    const reads: string[] = [];
+    const appServer = createFakeCodexAppServer({
+      "thread/list": () => ({ data: [], nextCursor: null }),
+      "thread/turns/list": () => ({
+        data: [{ id: "saved-turn", status: nativeStatus, items: [] }],
+      }),
+      "thread/read": (params) => {
+        const id = (params as { threadId: string }).threadId;
+        reads.push(id);
+        return {
+          thread: {
+            turns: [
+              {
+                id: "saved-turn",
+                status: "completed",
+                items:
+                  id === "test-thread"
+                    ? [
+                        {
+                          type: "subAgentActivity",
+                          id: "spawn",
+                          kind: "started",
+                          agentThreadId: "child",
+                          agentPath: "/root/child",
+                        },
+                      ]
+                    : [{ type: "agentMessage", id: "saved-message", text: "Saved child reply" }],
+              },
+              // This turn began after reconnect and is delivered by the live event stream.
+              {
+                id: "new-turn",
+                status: "inProgress",
+                items: [{ type: "agentMessage", id: "new-message", text: "New reply" }],
+              },
+            ],
+          },
+        };
+      },
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      { sessionId: "test-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    try {
+      await session.connect();
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(reads).toEqual(["test-thread"]);
+      expect(history.filter((event) => event.type === "provider_subagent")).toEqual([
+        expect.objectContaining({
+          event: expect.objectContaining({ type: "upsert", id: "child", status }),
+        }),
+      ]);
+      expect(await session.getProviderSubagentHistory("child")).toEqual([
+        expect.objectContaining({
+          item: {
+            type: "assistant_message",
+            messageId: "saved-message",
+            text: "Saved child reply",
+          },
+        }),
+      ]);
+      expect(reads).toEqual(["test-thread", "child"]);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("restores running child history and continues its live stream", async () => {
+    const appServer = createFakeCodexAppServer({
+      "thread/turns/list": () => ({
+        data: [{ id: "active-turn", status: "inProgress", items: [] }],
+      }),
+      "thread/read": (params) => ({
+        thread: {
+          turns: [
+            {
+              id: "active-turn",
+              status: "inProgress",
+              items:
+                (params as { threadId: string }).threadId === "test-thread"
+                  ? [
+                      {
+                        type: "subAgentActivity",
+                        id: "spawn",
+                        kind: "started",
+                        agentThreadId: "child",
+                        agentPath: "/root/child",
+                      },
+                    ]
+                  : [{ type: "agentMessage", id: "saved-message", text: "Earlier reply" }],
+            },
+          ],
+        },
+      }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      { sessionId: "test-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    try {
+      await session.connect();
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history).toContainEqual(
+        expect.objectContaining({
+          event: expect.objectContaining({
+            type: "timeline",
+            id: "child",
+            item: { type: "assistant_message", messageId: "saved-message", text: "Earlier reply" },
+          }),
+        }),
+      );
+      expect(await session.getProviderSubagentHistory("child")).toBeNull();
+      const next = new Promise<AgentStreamEvent>((resolve) =>
+        session.subscribe((event) => {
+          if (
+            event.type === "provider_subagent" &&
+            event.event.type === "timeline" &&
+            event.event.item.type === "assistant_message"
+          )
+            resolve(event);
+        }),
+      );
+      appServer.says({ threadId: "child", itemId: "live-message", text: "Continued reply" });
+      expect(await next).toMatchObject({
+        event: { id: "child", item: { type: "assistant_message", text: "Continued reply" } },
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("loads mixed legacy and MultiAgentV2 sub-agent history", async () => {
     const session = createSession();
     session.client = {
@@ -5054,26 +5198,7 @@ describe("Codex app-server provider", () => {
       history.flatMap((event) =>
         event.type === "provider_subagent" && event.event.type === "timeline" ? [event.event] : [],
       ),
-    ).toEqual([
-      {
-        type: "timeline",
-        id: "legacy-child-thread",
-        item: {
-          type: "assistant_message",
-          messageId: "message-legacy-child-thread",
-          text: "History from legacy-child-thread",
-        },
-      },
-      {
-        type: "timeline",
-        id: "v2-child-thread",
-        item: {
-          type: "assistant_message",
-          messageId: "message-v2-child-thread",
-          text: "History from v2-child-thread",
-        },
-      },
-    ]);
+    ).toEqual([]);
     expect(
       history
         .filter((event) => event.type === "timeline" && event.item.type === "tool_call")
@@ -5152,6 +5277,23 @@ describe("Codex app-server provider", () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        if (method === "thread/list")
+          return {
+            data: (params as { archived: boolean }).archived
+              ? [
+                  {
+                    id: "persisted-grandchild",
+                    parentThreadId: "persisted-child",
+                    source: {
+                      subAgent: {
+                        thread_spawn: { agent_path: "/root/persisted-child/grandchild" },
+                      },
+                    },
+                  },
+                ]
+              : [],
+            nextCursor: null,
+          };
         if (method !== "thread/read") {
           return {};
         }
