@@ -5040,6 +5040,42 @@ describe("Codex app-server provider", () => {
         }),
       ]);
       expect(reads).toEqual(["test-thread", "child"]);
+      const handle = session.describePersistence();
+      const reloadedServer = createFakeCodexAppServer({
+        "thread/read": () => ({
+          thread: {
+            turns: [
+              {
+                id: "saved-turn",
+                status: nativeStatus,
+                items: [{ type: "agentMessage", id: "saved-message", text: "Saved child reply" }],
+              },
+            ],
+          },
+        }),
+      });
+      const reloaded = new CodexAppServerAgentSession(
+        createConfig(),
+        handle,
+        createTestLogger(),
+        async () => reloadedServer.child,
+        {},
+        false,
+        false,
+        false,
+        undefined,
+        "interactive",
+        false,
+      );
+      try {
+        await reloaded.connect();
+        expect(await reloaded.getProviderSubagentHistory("child")).toEqual(
+          await session.getProviderSubagentHistory("child"),
+        );
+        reloadedServer.assertNoErrors();
+      } finally {
+        await reloaded.close();
+      }
       appServer.assertNoErrors();
     } finally {
       await session.close();

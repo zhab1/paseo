@@ -3662,7 +3662,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private persistedHistory: PersistedTimelineEntry[] = [];
   private loadingPersistedHistory = false;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
-  private readonly deferredSubagentTurns = new Map<string, string>();
+  private readonly deferredSubagentTurns: Map<string, string>;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
   private mcpElicitationPermissionIds = new Map<number, string>();
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
@@ -3747,6 +3747,14 @@ export class CodexAppServerAgentSession implements AgentSession {
       validateProviderOptions("codex", CodexProviderOptionsSchema, config.providerOptions) ?? {};
     this.config = config;
     this.asyncQuestions = new CodexAsyncQuestions(resumeHandle?.metadata?.asyncQuestions);
+    this.deferredSubagentTurns = new Map(
+      Object.entries(
+        z
+          .record(z.string(), z.string())
+          .default({})
+          .parse(resumeHandle?.metadata?.deferredSubagentTurns),
+      ),
+    );
     this.codexHome = deps.codexHome ?? resolveCodexHomeDir(process.env);
     this.config.thinkingOptionId = normalizeCodexThinkingOptionId(this.config.thinkingOptionId);
     this.serviceTier = readCodexServiceTier(this.config.featureValues);
@@ -5290,6 +5298,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         systemPrompt: this.config.systemPrompt,
         mcpServers: this.config.mcpServers,
         asyncQuestions: this.asyncQuestions.serialize(),
+        deferredSubagentTurns: Object.fromEntries(this.deferredSubagentTurns),
       },
     };
   }
