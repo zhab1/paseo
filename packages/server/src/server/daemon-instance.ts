@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -227,6 +228,7 @@ export async function startDaemonInstance(input: {
     onReady = () => {},
   } = input;
   const child = spawn(input.command, input.args, {
+    cwd: homedir(),
     env: daemonLaunchEnvironment(input),
     detached: !foreground,
     stdio: foreground ? "inherit" : "ignore",

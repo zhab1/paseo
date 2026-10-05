@@ -270,7 +270,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
 
   async function emitStoredRecord(record: StoredAgentRecord): Promise<AgentSnapshotPayload> {
     const payload = deps.buildStoredAgentPayload(record);
-    await publishPayload(payload);
+    await enqueueAgentUpdate(payload.id, () => publishPayload(payload));
     return payload;
   }
 
@@ -290,11 +290,12 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     const previous = liveAgentUpdateTails.get(agentId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(emitUpdate);
     liveAgentUpdateTails.set(agentId, next);
-    void next.finally(() => {
+    const clearTail = () => {
       if (liveAgentUpdateTails.get(agentId) === next) {
         liveAgentUpdateTails.delete(agentId);
       }
-    });
+    };
+    void next.then(clearTail, clearTail);
     return next;
   }
 
