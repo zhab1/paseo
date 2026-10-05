@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, rm, writeFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -31,9 +31,9 @@ async function fixture() {
   };
   const homes = [path.join(root, "a"), path.join(root, "b")];
   const owned = new Map<string, { pid: number; startedAt: string }>();
-  async function run(args: string[], overrides: NodeJS.ProcessEnv = {}) {
+  async function run(args: string[], overrides: NodeJS.ProcessEnv = {}, cwd = root) {
     const child = spawn(process.execPath, [cli, ...args], {
-      cwd: root,
+      cwd,
       env: { ...env, ...overrides },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -111,6 +111,37 @@ async function fixture() {
   }
   return { root, homes, env, run, ok, liveStatus, configure, close };
 }
+
+test.runIf(process.platform === "linux")(
+  "a daemon launched from a removed workspace keeps a usable working directory after restart",
+  async () => {
+    const f = await fixture();
+    const home = f.homes[0]!;
+    const workspace = path.join(f.root, "disposable-workspace");
+    try {
+      await mkdir(workspace);
+      await f.configure(home, `127.0.0.1:${await port()}`);
+      const started = await f.run(
+        ["--json", "daemon", "start", "--home", home, "--timeout", "30"],
+        {},
+        workspace,
+      );
+      expect(started.code, started.stderr).toBe(0);
+      await rm(workspace, { recursive: true });
+      const before = await f.liveStatus(home);
+      expect(await readlink(`/proc/${before.pid}/cwd`)).toBe(f.root);
+      expect(await readlink(`/proc/${before.workerPid}/cwd`)).toBe(f.root);
+      await f.ok(["daemon", "restart", "--home", home, "--timeout", "30"]);
+      const after = await f.liveStatus(home);
+      expect(after.pid).toBe(before.pid);
+      expect(after.workerPid).not.toBe(before.workerPid);
+      expect(await readlink(`/proc/${after.workerPid}/cwd`)).toBe(f.root);
+    } finally {
+      await f.close();
+    }
+  },
+  90_000,
+);
 
 test("managed two-home restart retains its supervisor and never routes ordinary commands or stop to the other home", async () => {
   const f = await fixture();

@@ -100,6 +100,7 @@ function buildHarness() {
   const projectByWorkspaceId = new Map<string, ProjectPlacementPayload | null>();
   let providerVisible: (provider: string) => boolean = () => true;
   let buildAgentPayloadError: Error | null = null;
+  let projectPlacementError: Error | null = null;
   let enrichProjectedPayload = false;
   const directorySync = new DirectorySyncService("test-generation");
 
@@ -130,8 +131,10 @@ function buildHarness() {
       return payload;
     },
     isProviderVisibleToClient: (provider) => providerVisible(provider),
-    buildProjectPlacementForWorkspaceId: async (workspaceId) =>
-      projectByWorkspaceId.get(workspaceId) ?? null,
+    buildProjectPlacementForWorkspaceId: async (workspaceId) => {
+      if (projectPlacementError) throw projectPlacementError;
+      return projectByWorkspaceId.get(workspaceId) ?? null;
+    },
     emitWorkspaceUpdateForWorkspaceId: async (workspaceId) => {
       workspaceUpdates.push(workspaceId);
     },
@@ -170,6 +173,9 @@ function buildHarness() {
     },
     failBuildAgentPayload(error: Error) {
       buildAgentPayloadError = error;
+    },
+    failProjectPlacement(error: Error | null) {
+      projectPlacementError = error;
     },
     queuePayloadBuilds(...payloads: Promise<AgentSnapshotPayload>[]) {
       queuedPayloadBuilds.push(...payloads);
@@ -454,6 +460,56 @@ describe("forwardLiveAgent", () => {
 });
 
 describe("emitStoredRecord", () => {
+  test("reports a publication failure and permits the next update", async () => {
+    const h = buildHarness();
+    h.service.beginSubscription({ subscriptionId: "sub" });
+    h.service.flushBootstrapped("sub");
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    h.failProjectPlacement(new Error("placement unavailable"));
+    await expect(h.service.emitStoredRecord(h.stored("a"))).rejects.toThrow(
+      "placement unavailable",
+    );
+    h.failProjectPlacement(null);
+    await h.service.emitStoredRecord(h.stored("a"));
+    expect(h.agentUpdates()).toEqual([
+      { kind: "upsert", agent: expect.objectContaining({ id: "a" }), project: makeProject() },
+    ]);
+  });
+
+  test.each([false, true])(
+    "keeps an archive after an earlier live update (includeArchived=%s)",
+    async (includeArchived) => {
+      const h = buildHarness();
+      h.service.beginSubscription({ subscriptionId: "sub", filter: { includeArchived } });
+      h.service.flushBootstrapped("sub");
+      const active = h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+      const delayedBuild = deferred<AgentSnapshotPayload>();
+      h.queuePayloadBuilds(delayedBuild.promise);
+      const liveUpdate = h.service.forwardLiveAgent(h.managed("a"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const archived = h.register(
+        makeAgentPayload({
+          id: "a",
+          workspaceId: "ws-1",
+          archivedAt: "2026-03-02T00:00:00.000Z",
+          updatedAt: "2026-03-02T00:00:00.000Z",
+        }),
+      );
+      const archiveUpdate = h.service.emitStoredRecord(h.stored("a"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      delayedBuild.resolve(active);
+      await Promise.all([liveUpdate, archiveUpdate]);
+
+      expect(h.agentUpdates()).toEqual([
+        { kind: "upsert", agent: active, project: makeProject() },
+        includeArchived
+          ? { kind: "upsert", agent: archived, project: makeProject() }
+          : { kind: "remove", agentId: "a" },
+      ]);
+    },
+  );
+
   test("returns the built payload and emits an upsert when matching", async () => {
     const h = buildHarness();
     h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
