@@ -1,4 +1,8 @@
-import type { AgentProvider, AgentTimelineItem } from "../agent-sdk-types.js";
+import type {
+  AgentProvider,
+  AgentTimelineItem,
+  ImportedTimelineEntry,
+} from "../agent-sdk-types.js";
 import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
 import { InMemoryAgentTimelineStore } from "../agent-timeline-store.js";
 import type {
@@ -78,6 +82,7 @@ function stickyField<T>(next: T | undefined, previous: T | null | undefined): T 
 export class ProviderSubagentStore {
   private readonly descriptors = new Map<string, ProviderSubagentDescriptor>();
   private readonly timelines = new InMemoryAgentTimelineStore();
+  private readonly historyLoads = new Map<string, Promise<void>>();
 
   apply(
     parentAgentId: string,
@@ -88,6 +93,7 @@ export class ProviderSubagentStore {
     if (event.type === "remove") {
       this.descriptors.delete(key);
       this.timelines.delete(key);
+      this.historyLoads.delete(key);
       return { type: "remove", parentAgentId, subagentId: event.id };
     }
 
@@ -153,12 +159,45 @@ export class ProviderSubagentStore {
     return this.timelines.fetch(storeKey(parentAgentId, subagentId), options);
   }
 
+  async hydrateTimeline(
+    parentAgentId: string,
+    subagentId: string,
+    load: () => Promise<ImportedTimelineEntry[] | null>,
+  ): Promise<void> {
+    const key = storeKey(parentAgentId, subagentId);
+    const existing = this.historyLoads.get(key);
+    if (existing) return existing;
+    const pending = Promise.resolve().then(async () => {
+      const history = await load();
+      if (this.historyLoads.get(key) !== pending) throw new Error("Provider subagent was reloaded");
+      if (!history?.length) return undefined;
+      const live = this.timelines.getRows(key);
+      const timestamp = new Date().toISOString();
+      this.timelines.initialize(key, {
+        rows: [...history, ...live].map((entry, index) => ({
+          seq: index + 1,
+          timestamp: entry.timestamp ?? timestamp,
+          item: limitAgentTimelineItemContent(entry.item),
+        })),
+      });
+      return undefined;
+    });
+    this.historyLoads.set(key, pending);
+    try {
+      await pending;
+    } catch (error) {
+      if (this.historyLoads.get(key) === pending) this.historyLoads.delete(key);
+      throw error;
+    }
+  }
+
   deleteParent(parentAgentId: string): ProviderSubagentStoreEvent[] {
     const events: ProviderSubagentStoreEvent[] = [];
     for (const subagent of this.list(parentAgentId)) {
       const key = storeKey(parentAgentId, subagent.id);
       this.descriptors.delete(key);
       this.timelines.delete(key);
+      this.historyLoads.delete(key);
       events.push({ type: "remove", parentAgentId, subagentId: subagent.id });
     }
     return events;

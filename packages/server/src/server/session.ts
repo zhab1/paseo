@@ -8012,6 +8012,7 @@ export class Session {
       if (!descriptor) {
         throw new Error("Provider subagent not found");
       }
+      await this.agentManager.hydrateProviderSubagentTimeline(msg.parentAgentId, msg.subagentId);
       // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove after 2027-03-14.
       const supportsProjection = source
         ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)

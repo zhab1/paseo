@@ -122,6 +122,7 @@ test.each([
   "resuming Codex derives child status from its latest %s turn",
   async (turnStatus, status) => {
     const app = createFakeCodexAppServer({
+      "thread/turns/list": () => ({ data: [{ id: "turn", status: turnStatus, items: [] }] }),
       "thread/read": (params) => {
         const { threadId } = params as { threadId: string };
         return {
@@ -170,14 +171,14 @@ test.each([
         id: "child",
         status,
       });
-      expect(childEvents).toContainEqual(
+      const childItems = [
+        ...childEvents.flatMap((event) => (event.type === "timeline" ? [event.item] : [])),
+        ...((await session.getProviderSubagentHistory("child")) ?? []).map((entry) => entry.item),
+      ];
+      expect(childItems).toContainEqual(
         expect.objectContaining({
-          type: "timeline",
-          id: "child",
-          item: expect.objectContaining({
-            type: "assistant_message",
-            text: "Complete child answer",
-          }),
+          type: "assistant_message",
+          text: "Complete child answer",
         }),
       );
       expect(
@@ -194,6 +195,79 @@ test.each([
     }
   },
 );
+
+test("opening a saved child through the daemon loads its history once", async () => {
+  let childReads = 0;
+  const app = createFakeCodexAppServer({
+    "thread/turns/list": () => ({ data: [{ id: "saved", status: "completed", items: [] }] }),
+    "thread/read": (params) => {
+      const root = (params as { threadId: string }).threadId === "root";
+      if (!root) childReads++;
+      return {
+        thread: {
+          turns: [
+            {
+              id: "saved",
+              status: "completed",
+              items: root
+                ? [
+                    {
+                      type: "subAgentActivity",
+                      id: "spawn",
+                      kind: "started",
+                      agentThreadId: "child",
+                      agentPath: "/root/child",
+                    },
+                  ]
+                : [{ type: "agentMessage", id: "old", text: "Saved answer" }],
+            },
+          ],
+        },
+      };
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd() },
+    { sessionId: "root" },
+    pino({ level: "silent" }),
+    async () => app.child,
+  );
+  await session.connect();
+  const provider: AgentClient = {
+    provider: "codex",
+    capabilities: session.capabilities,
+    isAvailable: async () => true,
+    createSession: async () => session,
+    resumeSession: async () => session,
+    fetchCatalog: async () => ({ models: [], modes: [] }),
+  };
+  const ctx = await createDaemonTestContext({
+    pluginsEnabled: false,
+    relayEnabled: false,
+    agentClients: { codex: provider },
+  });
+  try {
+    const manager = ctx.daemon.daemon.agentManager;
+    const agent = await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "root" },
+      { cwd: process.cwd() },
+    );
+    await manager.hydrateTimelineFromProvider(agent.id);
+    expect((await ctx.client.listProviderSubagents(agent.id)).subagents).toHaveLength(1);
+    expect(childReads).toBe(0);
+    const [first, second] = await Promise.all([
+      ctx.client.fetchProviderSubagentTimeline(agent.id, "child"),
+      ctx.client.fetchProviderSubagentTimeline(agent.id, "child"),
+    ]);
+    expect(first.error).toBeNull();
+    expect(first.rows).toMatchObject([{ item: { text: "Saved answer" } }]);
+    expect(second.rows).toEqual(first.rows);
+    expect(childReads).toBe(1);
+    app.assertNoErrors();
+  } finally {
+    await ctx.cleanup();
+  }
+}, 30_000);
 
 test("retains only the latest cumulative Pi tool progress payload", async () => {
   const { parseToolArgs, parseToolResult, mapToolDetail } =

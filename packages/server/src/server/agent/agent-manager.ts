@@ -1233,6 +1233,14 @@ export class AgentManager {
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
+  async hydrateProviderSubagentTimeline(parentAgentId: string, subagentId: string): Promise<void> {
+    const agent = this.requirePublicAgent(parentAgentId);
+    const session = agent.session;
+    const load = session?.getProviderSubagentHistory?.bind(session);
+    if (!load) return;
+    await this.providerSubagents.hydrateTimeline(parentAgentId, subagentId, () => load(subagentId));
+  }
+
   createAgent(
     config: AgentSessionConfig,
     agentId: string | undefined,
@@ -3664,6 +3672,13 @@ export class AgentManager {
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const discoveredPersistence = session.describePersistence();
+    const persistence = options?.persistence
+      ? {
+          ...options.persistence,
+          metadata: { ...options.persistence.metadata, ...discoveredPersistence?.metadata },
+        }
+      : discoveredPersistence;
     return {
       id: resolvedAgentId,
       provider: config.provider,
@@ -3689,10 +3704,7 @@ export class AgentManager {
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
       unsubscribeSession: null,
-      persistence: attachPersistenceCwd(
-        options?.persistence ?? session.describePersistence(),
-        config.cwd,
-      ),
+      persistence: attachPersistenceCwd(persistence, config.cwd),
       historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
