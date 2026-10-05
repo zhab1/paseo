@@ -42,6 +42,7 @@ export interface ProjectedTimelinePageSelection {
   endSeq: number | null;
   hasOlder: boolean;
   hasNewer: boolean;
+  reset?: boolean;
 }
 
 function appendSeqToRanges(ranges: TimelineSeqRange[], seq: number): TimelineSeqRange[] {
@@ -540,19 +541,19 @@ function selectProjectedEntriesTail(
   limit: number,
   bounds: { minSeq: number; maxSeq: number },
 ): ProjectedTimelinePageSelection {
-  let start = limit === 0 ? 0 : Math.max(0, projectedAll.length - limit);
-  // Include earlier display anchors with updates in the selected source window,
-  // so a tail certifies contiguous coverage even with interleaved tool updates.
-  for (let i = start - 1; i >= 0; i--) {
-    if (projectedAll[i].seqEnd >= projectedAll[start].seqStart) start = i;
-  }
+  const start = limit === 0 ? 0 : Math.max(0, projectedAll.length - limit);
   const selected = projectedAll.slice(start);
+  // An older tool may finish inside this source window. Replace the client's
+  // cached range so it cannot retain that tool's stale state, rather than
+  // expanding a bounded tail to include all history back to the tool's anchor.
+  const reset = projectedAll.slice(0, start).some((entry) => entry.seqEnd >= selected[0].seqStart);
   return {
     entries: selected,
     startSeq: selected[0]?.seqStart ?? null,
     endSeq: bounds.maxSeq,
     hasOlder: start > 0,
     hasNewer: false,
+    reset,
   };
 }
 

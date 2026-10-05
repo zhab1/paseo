@@ -214,7 +214,7 @@ describe("projected sequence ownership", () => {
   });
 });
 
-it("includes transitive tool updates in a contiguous projected tail", () => {
+it("keeps a tail bounded when older tools complete across the selected window", () => {
   const store = new InMemoryAgentTimelineStore();
   store.initialize("a");
   const tool = (callId: string, status: "running" | "completed") => ({
@@ -232,6 +232,50 @@ it("includes transitive tool updates in a contiguous projected tail", () => {
   store.append("a", { type: "assistant_message", text: "Answer" });
   store.append("a", tool("second", "completed"));
   const tail = store.fetch("a", { limit: 1 });
-  expect(tail.rows.map((row) => row.seqStart)).toEqual([1, 2, 3, 5]);
-  expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
+  expect(tail.rows.map((row) => row.seqStart)).toEqual([5]);
+  expect(tail).toMatchObject({ startSeq: 5, endSeq: 6, hasOlder: true, reset: true });
+  const older = store.fetch("a", {
+    direction: "before",
+    cursor: { epoch: tail.epoch, seq: 5 },
+    limit: 3,
+  });
+  expect(older.rows.map((row) => row.seqStart)).toEqual([1, 2, 3]);
+  expect(older.rows.slice(0, 2).map((row) => row.item)).toEqual([
+    tool("first", "completed"),
+    tool("second", "completed"),
+  ]);
+  expect(older).toMatchObject({ hasOlder: false, reset: false });
+});
+
+it("does not download intervening history for one old tool update", () => {
+  const store = new InMemoryAgentTimelineStore();
+  store.initialize("a");
+  const tool = {
+    type: "tool_call" as const,
+    callId: "old-child",
+    name: "task",
+    error: null,
+    detail: { type: "plain_text" as const, label: "Child" },
+  };
+  store.append("a", { ...tool, status: "running" });
+  for (let i = 0; i < 1000; i++) {
+    store.append("a", { type: "assistant_message", messageId: String(i), text: String(i) });
+  }
+  store.append("a", { ...tool, status: "completed" });
+  const tail = store.fetch("a", { limit: 40 });
+  expect(tail.rows).toHaveLength(40);
+  expect(tail.rows[0].item).toEqual({
+    type: "assistant_message",
+    messageId: "960",
+    text: "960",
+  });
+  expect(tail).toMatchObject({ startSeq: 962, endSeq: 1002, hasOlder: true, reset: true });
+  const catchUp = store.fetch("a", {
+    direction: "after",
+    cursor: { epoch: tail.epoch, seq: 1001 },
+    limit: 40,
+  });
+  expect(catchUp.rows).toHaveLength(1);
+  expect(catchUp.rows[0].item).toEqual({ ...tool, status: "completed" });
+  expect(catchUp).toMatchObject({ reset: false, hasNewer: false, endSeq: 1002 });
 });
