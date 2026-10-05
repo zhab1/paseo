@@ -2,7 +2,7 @@ import pino from "pino";
 import { asInternals } from "../../../../test-utils/class-mocks.js";
 
 const moduleUrl =
-  process.argv[2] ?? new URL("../../codex-app-server-agent.js", import.meta.url).href;
+  process.argv[2] || new URL("../../codex-app-server-agent.js", import.meta.url).href;
 const { CodexAppServerAgentSession } = await import(moduleUrl);
 const session = new CodexAppServerAgentSession(
   { provider: "codex", cwd: process.cwd() },
@@ -14,15 +14,29 @@ const session = new CodexAppServerAgentSession(
 );
 const count = 400;
 const size = 512 * 1024;
-const item = (index: number) => ({
-  type: "commandExecution",
-  id: `command-${index}`,
-  command: "example",
-  cwd: process.cwd(),
-  status: "completed",
-  exitCode: 0,
-  aggregatedOutput: Buffer.alloc(size, 65 + (index % 26)).toString("utf8"),
-});
+const item = (index: number) =>
+  process.argv[3] === "mcp"
+    ? {
+        type: "mcpToolCall",
+        id: `mcp-${index}`,
+        server: "custom",
+        tool: "fetch",
+        status: "completed",
+        arguments: {},
+        result: {
+          content: [{ type: "text", text: Buffer.alloc(size, 65 + (index % 26)).toString("utf8") }],
+          structuredContent: { value: Buffer.alloc(size, 65 + (index % 26)).toString("utf8") },
+        },
+      }
+    : {
+        type: "commandExecution",
+        id: `command-${index}`,
+        command: "example",
+        cwd: process.cwd(),
+        status: "completed",
+        exitCode: 0,
+        aggregatedOutput: Buffer.alloc(size, 65 + (index % 26)).toString("utf8"),
+      };
 const client = {
   async request(method: string, params: Record<string, unknown>) {
     if (method === "thread/read")

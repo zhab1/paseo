@@ -25,6 +25,43 @@ function contentItems(text: string): AgentTimelineItem[] {
 }
 
 describe("agent timeline content", () => {
+  test.each(["text", "structured"])(
+    "bounds unknown %s results without retaining the native payload",
+    (kind) => {
+      const text = "界".repeat(100_000);
+      const output =
+        kind === "text" ? text : { content: [{ type: "text", text }], structuredContent: { text } };
+      const item: AgentTimelineItem = {
+        type: "tool_call",
+        callId: "mcp",
+        name: "mcp__custom__fetch",
+        status: "completed",
+        error: null,
+        detail: { type: "unknown", input: { query: "keep" }, output },
+      };
+      const limited = limitAgentTimelineItemContent(item);
+      const visible = typeof output === "string" ? output : JSON.stringify(output, null, 2);
+      expect(limited).toEqual({
+        ...item,
+        detail: { ...item.detail, output: visible.slice(0, 64 * 1024) },
+      });
+    },
+  );
+  test("preserves a small structured result and its identity", () => {
+    const item: AgentTimelineItem = {
+      type: "tool_call",
+      callId: "mcp",
+      name: "mcp__custom__fetch",
+      status: "completed",
+      error: null,
+      detail: {
+        type: "unknown",
+        input: {},
+        output: { content: [{ type: "text", text: "small" }] },
+      },
+    };
+    expect(limitAgentTimelineItemContent(item)).toBe(item);
+  });
   test("preserves UTF-16 content when the limit splits a surrogate pair", () => {
     const prefix = "界".repeat(64 * 1024 - 1) + "\ud83d";
     expect(contentItems(prefix + "\ude00tail").map(limitAgentTimelineItemContent)).toEqual(

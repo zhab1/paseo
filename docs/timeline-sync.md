@@ -295,3 +295,8 @@ canonical assistant prefix, it stays in the head lane. No row may be returned in
 - App viewed-agent synchronization: `packages/app/src/timeline/viewed-timeline-sync.ts`
 - App stream/timeline reducer: `packages/app/src/timeline/session-stream-reducers.ts`
 - Session wiring: `packages/app/src/contexts/session-context.tsx`
+
+Oversized unknown tool results (including MCP structured results) use the same 64 KiB
+text/JSON preview limit as shell output; small structured results retain their shape.
+Native history retains the complete result. Item lifecycle timestamps are not required
+by the page reader; the established rollout/turn timestamp projection remains authoritative.

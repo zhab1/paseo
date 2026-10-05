@@ -14,8 +14,6 @@ const ItemsPageSchema = z.object({
     z.object({
       turnId: z.string(),
       item: z.unknown(),
-      startedAtMs: z.number().nullable(),
-      completedAtMs: z.number().nullable(),
     }),
   ),
   nextCursor: z.string().nullable(),

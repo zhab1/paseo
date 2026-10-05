@@ -4,19 +4,25 @@ import { fileURLToPath } from "node:url";
 import { openCodexHistory } from "./history-reader.js";
 
 describe("native paged history", () => {
-  test("releases oversized raw outputs before retaining the restored timeline", () => {
-    const fixture = fileURLToPath(new URL("./test-utils/history-memory-repro.ts", import.meta.url));
-    const result = JSON.parse(
-      execFileSync(process.execPath, ["--expose-gc", "--import", "tsx", fixture], {
-        encoding: "utf8",
-      }),
-    );
-    expect(result.rows).toBe(400);
-    expect(result.maxOutput).toBe(64 * 1024);
-    // 200 MiB of native outputs must not remain behind a 25 MiB UI projection.
-    expect(result.retained).toBeLessThan(64 * 1024 * 1024);
-  }, 30_000);
-  test("reads bounded item pages, retaining turn identity and timestamps", async () => {
+  test.each(["shell", "mcp"])(
+    "releases oversized %s outputs before retaining the restored timeline",
+    (kind) => {
+      const fixture = fileURLToPath(
+        new URL("./test-utils/history-memory-repro.ts", import.meta.url),
+      );
+      const result = JSON.parse(
+        execFileSync(process.execPath, ["--expose-gc", "--import", "tsx", fixture, "", kind], {
+          encoding: "utf8",
+        }),
+      );
+      expect(result.rows).toBe(400);
+      expect(result.maxOutput).toBe(64 * 1024);
+      // 200 MiB of native outputs must not remain behind a 25 MiB UI projection.
+      expect(result.retained).toBeLessThan(64 * 1024 * 1024);
+    },
+    30_000,
+  );
+  test("reads bounded item pages, retaining turn identity without requiring lifecycle timestamps", async () => {
     let itemRequests = 0;
     const client = {
       async request(method: string, params: Record<string, unknown>) {
@@ -37,8 +43,6 @@ describe("native paged history", () => {
             {
               turnId: "turn",
               item: { id: `item-${page}` },
-              startedAtMs: 1000 + page,
-              completedAtMs: null,
             },
           ],
           nextCursor: page ? null : "next",
@@ -49,9 +53,9 @@ describe("native paged history", () => {
     expect(itemRequests).toBe(0);
     const items = [];
     for await (const item of history.items) items.push(item);
-    expect(items.map((entry) => [entry.item, entry.turn.id, entry.startedAtMs])).toEqual([
-      [{ id: "item-0" }, "turn", 1000],
-      [{ id: "item-1" }, "turn", 1001],
+    expect(items.map((entry) => [entry.item, entry.turn.id])).toEqual([
+      [{ id: "item-0" }, "turn"],
+      [{ id: "item-1" }, "turn"],
     ]);
     expect(itemRequests).toBe(2);
   });
