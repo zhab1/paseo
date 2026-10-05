@@ -16,14 +16,18 @@ The invariants are:
 > agent establishes the daemon's current tail in one bounded request, with older history reachable
 > through backward pagination.
 
-Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
+Tool output is bounded before it enters either delivery path. Shell output and oversized unknown
+results (including MCP JSON) use 64 KiB previews; small structured results retain their shape.
+The same bounded item is used for runtime timeline rows and live stream events; native history
+retains the complete result.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 
+Codex CLI 0.153.4+ is required for native history paging; older builds must be upgraded.
 Codex hydration reads thread metadata and turn summaries without bodies, then consumes native
 `thread/items/list` pages of 40 items. Each mapped tool output is bounded before it enters the
-pending replay, so raw outputs from earlier pages can be released. Deferred child reads stop at
+pending replay, so raw outputs from earlier pages can be released. Turns created during the scan
+remain part of restored history without relying on live notifications. Deferred child reads stop at
 their saved completed-turn boundary. Assistant timestamps still come from the canonical rollout
 reader, since native item-page timestamps can differ. This bounds the raw replay working set by a
 page; the completed projection still grows with retained conversation history.
@@ -295,8 +299,3 @@ canonical assistant prefix, it stays in the head lane. No row may be returned in
 - App viewed-agent synchronization: `packages/app/src/timeline/viewed-timeline-sync.ts`
 - App stream/timeline reducer: `packages/app/src/timeline/session-stream-reducers.ts`
 - Session wiring: `packages/app/src/contexts/session-context.tsx`
-
-Oversized unknown tool results (including MCP structured results) use the same 64 KiB
-text/JSON preview limit as shell output; small structured results retain their shape.
-Native history retains the complete result. Item lifecycle timestamps are not required
-by the page reader; the established rollout/turn timestamp projection remains authoritative.

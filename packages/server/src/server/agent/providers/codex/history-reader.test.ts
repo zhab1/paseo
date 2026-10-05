@@ -1,9 +1,65 @@
 import { describe, expect, test } from "vitest";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { CodexAppServerRpcError } from "./app-server-transport.js";
 import { openCodexHistory } from "./history-reader.js";
 
 describe("native paged history", () => {
+  test("keeps turns created after the initial metadata page instead of dropping their history", async () => {
+    let turnReads = 0;
+    const client = {
+      async request(method: string, params: Record<string, unknown>) {
+        if (method === "thread/read") return { thread: {} };
+        if (method === "thread/turns/list")
+          return {
+            data: (++turnReads === 1 ? ["old"] : ["old", "new"]).map((id) => ({
+              id,
+              status: "completed",
+            })),
+            nextCursor: null,
+          };
+        return {
+          data: [
+            {
+              turnId: params.cursor ? "new" : "old",
+              item: { id: params.cursor ? "new-message" : "old-message" },
+            },
+          ],
+          nextCursor: params.cursor ? null : "next",
+        };
+      },
+    };
+    const history = await openCodexHistory(client, "root");
+    const items = [];
+    for await (const entry of history.items) items.push([entry.item, entry.turn.id]);
+    expect(items).toEqual([
+      [{ id: "old-message" }, "old"],
+      [{ id: "new-message" }, "new"],
+    ]);
+    expect(history.turns.at(-1)?.id).toBe("new");
+  });
+  test.each(["thread/turns/list", "thread/items/list"])(
+    "reports the required Codex upgrade when %s is unavailable",
+    async (missingMethod) => {
+      const client = {
+        async request(method: string) {
+          if (method === missingMethod)
+            throw new CodexAppServerRpcError("Method not found", -32601, null);
+          if (method === "thread/read") return { thread: {} };
+          return { data: [{ id: "old" }], nextCursor: null };
+        },
+      };
+      await expect(
+        (async () => {
+          const history = await openCodexHistory(client, "root");
+          for await (const _ of history.items) {
+            /* consume */
+          }
+        })(),
+      ).rejects.toThrow("Codex CLI 0.153.4 or newer");
+    },
+  );
+
   test.each(["shell", "mcp"])(
     "releases oversized %s outputs before retaining the restored timeline",
     (kind) => {
