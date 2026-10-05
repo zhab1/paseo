@@ -3672,6 +3672,13 @@ export class AgentManager {
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const discoveredPersistence = session.describePersistence();
+    const persistence = options?.persistence
+      ? {
+          ...options.persistence,
+          metadata: { ...options.persistence.metadata, ...discoveredPersistence?.metadata },
+        }
+      : discoveredPersistence;
     return {
       id: resolvedAgentId,
       provider: config.provider,
@@ -3697,10 +3704,7 @@ export class AgentManager {
       foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
       finalizedForegroundTurnIds: new Set<string>(),
       unsubscribeSession: null,
-      persistence: attachPersistenceCwd(
-        options?.persistence ?? session.describePersistence(),
-        config.cwd,
-      ),
+      persistence: attachPersistenceCwd(persistence, config.cwd),
       historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,

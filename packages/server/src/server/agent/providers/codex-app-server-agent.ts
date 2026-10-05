@@ -2253,8 +2253,10 @@ async function listCodexDescendantRoutes(
   const descendants = new Map<string, Record<string, unknown>>();
   // Archived children remain part of the saved conversation tree.
   for (const archived of [false, true]) {
+    if (descendants.size >= 100) break;
     let cursor: string | undefined;
     do {
+      const previousSize = descendants.size;
       const response = toObjectRecord(
         await client.request("thread/list", {
           ancestorThreadId,
@@ -2271,6 +2273,7 @@ async function listCodexDescendantRoutes(
         if (typeof thread?.id === "string") descendants.set(thread.id, thread);
       }
       cursor = nonEmptyString(response?.nextCursor) ?? undefined;
+      if (descendants.size === previousSize) break;
     } while (cursor && descendants.size < 100);
   }
   return codexDescendantRoutes(descendants);
@@ -4240,7 +4243,12 @@ export class CodexAppServerAgentSession implements AgentSession {
     }));
     // Thread summaries include ownership even for grandchildren and archived children.
     // Discover them without reading their tool output or assistant messages.
-    const descendants = await listCodexDescendantRoutes(client, this.currentThreadId);
+    const descendants = await listCodexDescendantRoutes(client, this.currentThreadId).catch(
+      (error) => {
+        this.logger.trace({ err: error }, "Failed to list persisted Codex descendants");
+        return new Map<string, PersistedSubAgentRoute[]>();
+      },
+    );
     const visitedThreadIds = new Set(this.currentThreadId ? [this.currentThreadId] : []);
     while (queue.length > 0 && visitedThreadIds.size < 100) {
       const next = queue.shift();
@@ -4249,7 +4257,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       visitedThreadIds.add(next.route.childThreadId);
       const childThreadId = next.route.childThreadId;
-      const { lastTurnId, latestStatus } = await readCodexChildTurn(client, childThreadId);
+      const { lastTurnId, latestStatus } = await readCodexChildTurn(client, childThreadId).catch(
+        (error) => {
+          this.logger.trace(
+            { err: error, childThreadId },
+            "Failed to read persisted Codex child status",
+          );
+          return { lastTurnId: null, latestStatus: null };
+        },
+      );
       if (latestStatus) {
         next.route.toolCall.status = latestStatus;
         next.route.toolCall.error =
@@ -4343,6 +4359,17 @@ export class CodexAppServerAgentSession implements AgentSession {
       state.callId = route.toolCall.callId;
       state.toolCall = route.toolCall;
       this.subAgentCallsByCallId.set(state.callId, state);
+      const parent = state.parentCallId
+        ? this.subAgentCallsByCallId.get(state.parentCallId)
+        : undefined;
+      const previousItem = callId ? parent?.childItems.get(callId) : undefined;
+      if (parent && callId && previousItem?.type === "tool_call") {
+        parent.childItems.delete(callId);
+        parent.childItems.set(state.callId, { ...previousItem, callId: state.callId });
+        parent.childItemOrder = parent.childItemOrder.map((id) =>
+          id === callId ? state.callId : id,
+        );
+      }
       for (const id of state.childThreadIds) {
         this.subAgentCallIdByChildThreadId.set(id, state.callId);
         this.emitProviderSubagentUpsert(id, state, state.toolCall.status);

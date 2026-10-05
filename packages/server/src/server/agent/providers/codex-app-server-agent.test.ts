@@ -5337,10 +5337,100 @@ describe("Codex app-server provider", () => {
     });
   });
 
-  test("restores nested MultiAgentV2 ownership from persisted child threads", async () => {
+  test.each(["thread/list", "thread/turns/list"])(
+    "preserves parent history when %s fails for saved children",
+    async (failingMethod) => {
+      const session = createSession();
+      session.client = {
+        request: vi.fn(async (method: string) => {
+          if (method === failingMethod) throw new Error("child unavailable");
+          if (method !== "thread/read") return {};
+          return {
+            thread: {
+              turns: [
+                {
+                  items: [
+                    { type: "agentMessage", id: "parent-reply", text: "Parent history" },
+                    {
+                      type: "subAgentActivity",
+                      id: "spawn",
+                      kind: "started",
+                      agentThreadId: "missing-child",
+                      agentPath: "/root/child",
+                    },
+                  ],
+                },
+              ],
+            },
+          };
+        }),
+      };
+      await asInternals(session).loadPersistedHistory(session.client);
+      const events: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) events.push(event);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({ text: "Parent history" }),
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "provider_subagent",
+          event: expect.objectContaining({ id: "missing-child" }),
+        }),
+      );
+    },
+  );
+
+  test("stops descendant discovery when pagination repeats threads", async () => {
+    const session = createSession();
+    let listCalls = 0;
+    session.client = {
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/list") {
+          listCalls++;
+          if (listCalls > 4) throw new Error("pagination made no progress");
+          return { data: [{ id: "child", parentThreadId: "test-thread" }], nextCursor: "repeat" };
+        }
+        if (method !== "thread/read") return {};
+        return {
+          thread: {
+            turns: [
+              {
+                items: [
+                  {
+                    type: "subAgentActivity",
+                    id: "spawn",
+                    kind: "started",
+                    agentThreadId: "child",
+                    agentPath: "/root/child",
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }),
+    };
+    await asInternals(session).loadPersistedHistory(session.client);
+    expect(listCalls).toBeLessThanOrEqual(4);
+    const events: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) events.push(event);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "provider_subagent",
+        event: expect.objectContaining({ id: "child" }),
+      }),
+    );
+  });
+
+  test("restores nested MultiAgentV2 ownership and preserves one live card after opening history", async () => {
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        if (method === "thread/turns/list")
+          return { data: [{ id: "saved-turn", status: "completed" }] };
         if (method === "thread/list")
           return {
             data: (params as { archived: boolean }).archived
@@ -5393,7 +5483,7 @@ describe("Codex app-server provider", () => {
         const items = threadId ? itemsByThreadId[threadId as keyof typeof itemsByThreadId] : [];
         return {
           thread: {
-            turns: items ? [{ items }] : [],
+            turns: items ? [{ id: "saved-turn", status: "completed", items }] : [],
           },
         };
       }),
@@ -5415,6 +5505,27 @@ describe("Codex app-server provider", () => {
         parentSubagentId: "persisted-child",
       }),
     ]);
+    const live: AgentStreamEvent[] = [];
+    session.subscribe((event) => live.push(event));
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "persisted-grandchild",
+      itemId: "live-message",
+      delta: "Grandchild output",
+    });
+    await session.getProviderSubagentHistory("persisted-child");
+    asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "persisted-grandchild",
+      itemId: "live-message",
+      delta: " finished",
+    });
+    const rootCards = live.flatMap((event) =>
+      event.type === "timeline" && event.item.type === "tool_call" ? [event.item] : [],
+    );
+    const detail = rootCards.at(-1)?.detail;
+    expect(detail?.type).toBe("sub_agent");
+    if (detail?.type !== "sub_agent") throw new Error("missing root child card");
+    expect(detail.log?.match(/Grandchild output/g)).toHaveLength(1);
+    expect(detail.log).toContain("Grandchild output finished");
   });
 
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {

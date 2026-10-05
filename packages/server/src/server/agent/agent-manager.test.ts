@@ -4537,6 +4537,49 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
   });
 });
 
+test("resume persists newly discovered provider metadata and passes it to reload", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-metadata-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const boundaries = { child: "saved-turn" };
+  const receivedHandles: AgentPersistenceHandle[] = [];
+  class MetadataClient extends TestAgentClient {
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      receivedHandles.push(handle);
+      return new (class extends TestAgentSession {
+        override describePersistence() {
+          return {
+            provider: this.provider,
+            sessionId: handle.sessionId,
+            metadata: { deferredSubagentTurns: boundaries },
+          };
+        }
+      })({ provider: "codex", cwd: overrides?.cwd ?? workdir });
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new MetadataClient() },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "parent-thread" },
+      { cwd: workdir },
+    );
+    expect((await storage.get(agent.id))?.persistence?.metadata).toMatchObject({
+      deferredSubagentTurns: boundaries,
+    });
+    await manager.reloadAgentSession(agent.id);
+    expect(receivedHandles[1]?.metadata).toMatchObject({ deferredSubagentTurns: boundaries });
+    await manager.closeAgent(agent.id);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("reloadAgentSession preserves timeline and does not force history replay", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-"));
   const storagePath = join(workdir, "agents");
