@@ -21,6 +21,13 @@ to 64 KiB, and the same bounded item is used for runtime timeline rows and live 
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 
+Codex hydration reads thread metadata and turn summaries without bodies, then consumes native
+`thread/items/list` pages of 40 items. Each mapped tool output is bounded before it enters the
+pending replay, so raw outputs from earlier pages can be released. Deferred child reads stop at
+their saved completed-turn boundary. Assistant timestamps still come from the canonical rollout
+reader, since native item-page timestamps can differ. This bounds the raw replay working set by a
+page; the completed projection still grows with retained conversation history.
+
 ## Presence is not delivery
 
 Client heartbeat reports presence:

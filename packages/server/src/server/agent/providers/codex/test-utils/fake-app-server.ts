@@ -1,3 +1,4 @@
+import { pagedHistoryRequest } from "./paged-history.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -201,6 +202,15 @@ export function createFakeCodexAppServer(
     "thread/turns/list": () => ({ data: [] }),
     ...handlers,
   };
+  const historyRequest = pagedHistoryRequest(async (method, params) => {
+    const handler = handlers[method];
+    if (handler) return handler(params);
+    if (method === "thread/read") return { thread: { turns: [] } };
+    return { data: [], nextCursor: null };
+  });
+  for (const method of ["thread/read", "thread/turns/list", "thread/items/list"]) {
+    responseHandlers[method] = (params) => historyRequest(method, params);
+  }
   const messages: JsonObject[] = [];
   const errors: Error[] = [];
   const approvalRequestIds = new Map<string, number>();
