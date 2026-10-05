@@ -34,7 +34,7 @@ const NetworkPolicySchema = z
   })
   .strict();
 
-// Codex config reference, maintained against Codex CLI 0.143+.
+// Codex CLI 0.153.4+ is required: history restoration uses its native paging APIs.
 export const CodexProviderOptionsSchema = z
   .object({
     approval_policy: ApprovalPolicySchema.optional(),

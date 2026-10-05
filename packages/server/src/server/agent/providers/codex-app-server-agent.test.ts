@@ -1,3 +1,4 @@
+import { pagedHistoryRequest } from "./codex/test-utils/paged-history.js";
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -4936,6 +4937,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -4944,7 +4946,7 @@ describe("Codex app-server provider", () => {
     }
 
     expect(requests.map((request) => [request.method, request.params])).toEqual([
-      ["thread/read", { threadId: "test-thread", includeTurns: true }],
+      ["thread/read", { threadId: "test-thread", includeTurns: false }],
     ]);
     expect(history).toEqual([
       {
@@ -4990,6 +4992,7 @@ describe("Codex app-server provider", () => {
       })),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     expect(asInternals(session).codexUserMessageTurns().resolve("message-history")).toEqual({
@@ -5239,6 +5242,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -5365,6 +5369,7 @@ describe("Codex app-server provider", () => {
           };
         }),
       };
+      session.client!.request = pagedHistoryRequest(session.client!.request);
       await asInternals(session).loadPersistedHistory(session.client);
       const events: AgentStreamEvent[] = [];
       for await (const event of session.streamHistory()) events.push(event);
@@ -5413,6 +5418,7 @@ describe("Codex app-server provider", () => {
         };
       }),
     };
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
     const events: AgentStreamEvent[] = [];
     for await (const event of session.streamHistory()) events.push(event);
@@ -5462,6 +5468,7 @@ describe("Codex app-server provider", () => {
         };
       }),
     };
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
@@ -5556,6 +5563,7 @@ describe("Codex app-server provider", () => {
         };
       }),
     };
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
     expect(listCalls).toBeLessThanOrEqual(4);
     const events: AgentStreamEvent[] = [];
@@ -5632,6 +5640,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -5718,6 +5727,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -5892,6 +5902,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -5970,6 +5981,7 @@ describe("Codex app-server provider", () => {
     };
 
     try {
+      session.client!.request = pagedHistoryRequest(session.client!.request);
       await asInternals(session).loadPersistedHistory(session.client);
       const timestamps: Array<string | undefined> = [];
       for await (const event of session.streamHistory()) {
@@ -6013,6 +6025,7 @@ describe("Codex app-server provider", () => {
       }),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];
@@ -7150,6 +7163,7 @@ describe("Codex app-server provider", () => {
       })),
     };
 
+    session.client!.request = pagedHistoryRequest(session.client!.request);
     await asInternals(session).loadPersistedHistory(session.client);
 
     const history: AgentStreamEvent[] = [];

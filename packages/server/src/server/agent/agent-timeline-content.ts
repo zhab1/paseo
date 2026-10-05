@@ -57,9 +57,20 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
   };
 }
 
+function limitUnknownOutput(item: AgentTimelineItem): AgentTimelineItem {
+  if (item.type !== "tool_call" || item.detail.type !== "unknown") return item;
+  // Unknown results render as text/JSON. Preserve small structured values, but do
+  // not retain oversized native result objects behind a bounded history page.
+  const output = item.detail.output;
+  const text = typeof output === "string" ? output : JSON.stringify(output, null, 2);
+  if (text === undefined || text.length <= TOOL_CALL_CONTENT_MAX_LENGTH) return item;
+  return { ...item, detail: { ...item.detail, output: copyContentPrefix(text) } };
+}
+
 export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTimelineItem {
   item = limitFailedShellError(item);
   item = limitPlainText(item);
+  item = limitUnknownOutput(item);
   if (
     item.type !== "tool_call" ||
     item.detail.type !== "shell" ||

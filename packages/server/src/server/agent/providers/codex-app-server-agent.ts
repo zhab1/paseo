@@ -1,3 +1,5 @@
+import { openCodexHistory } from "./codex/history-reader.js";
+import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
 import { validateProviderOptions } from "../provider-options.js";
 import {
   getAgentStreamEventTurnId,
@@ -2113,30 +2115,8 @@ function threadItemToTimelineEntries(
   return [timelineItem, ...mcpToolResultImagesToTimeline(item)];
 }
 
-const CodexThreadReadResponseSchema = z
-  .object({
-    thread: z
-      .object({
-        turns: z
-          .array(
-            z
-              .object({
-                items: z.array(z.unknown()).default([]),
-              })
-              .passthrough(),
-          )
-          .default([]),
-      })
-      .passthrough()
-      .default({ turns: [] }),
-  })
-  .passthrough();
-
-type CodexThreadReadResponse = z.infer<typeof CodexThreadReadResponseSchema>;
-type CodexThreadReadRequest = (threadId: string) => Promise<unknown>;
-
 function readCodexHistoricalTurnStatus(
-  turns: CodexThreadReadResponse["thread"]["turns"],
+  turns: readonly unknown[],
 ): ToolCallTimelineItem["status"] | null {
   const latestTurn = toObjectRecord(turns.at(-1));
   switch (latestTurn?.status) {
@@ -2153,81 +2133,60 @@ function readCodexHistoricalTurnStatus(
   }
 }
 
-async function requestCodexThreadHistory(
-  requestThread: CodexThreadReadRequest,
-  threadId: string,
-  throughTurnId?: string,
-): Promise<CodexThreadReadResponse> {
-  const response = await requestThread(threadId);
-  const parsed = CodexThreadReadResponseSchema.parse(response);
-  if (throughTurnId) {
-    const end = parsed.thread.turns.findIndex((turn) => turn.id === throughTurnId);
-    if (end < 0) throw new Error("Saved Codex child turn is no longer available");
-    parsed.thread.turns = parsed.thread.turns.slice(0, end + 1);
-  }
-  return parsed;
-}
-
 async function loadCodexThreadHistoryTimeline(params: {
   threadId: string;
   cwd: string | null;
-  requestThread: CodexThreadReadRequest;
+  client: CodexAppServerClientLike;
   throughTurnId?: string;
 }): Promise<CodexThreadHistoryProjection> {
-  const response = await requestCodexThreadHistory(
-    params.requestThread,
-    params.threadId,
-    params.throughTurnId,
+  const history = await openCodexHistory(params.client, params.threadId, params.throughTurnId);
+  const rolloutAssistantTimestamps = await readCodexRolloutAssistantTimestamps(history.path).catch(
+    () => new Map<string, string[]>(),
   );
-  const rolloutAssistantTimestamps = await readCodexRolloutAssistantTimestamps(
-    response.thread.path,
-  ).catch(() => new Map<string, string[]>());
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
-  for (const turn of response.thread.turns) {
-    for (const item of turn.items) {
-      const historicalSubAgentActivity = readCodexSubAgentActivity(item);
-      if (historicalSubAgentActivity) {
-        const existingIndex = subAgentTimelineIndexByThreadId.get(
-          historicalSubAgentActivity.agentThreadId,
+  for await (const { item, turn } of history.items) {
+    const historicalSubAgentActivity = readCodexSubAgentActivity(item);
+    if (historicalSubAgentActivity) {
+      const existingIndex = subAgentTimelineIndexByThreadId.get(
+        historicalSubAgentActivity.agentThreadId,
+      );
+      if (existingIndex !== undefined) {
+        const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
+        updateHistoricalSubAgentActivity(
+          timeline,
+          existingIndex,
+          historicalSubAgentActivity.kind,
+          activityTimelineItem?.type === "tool_call" &&
+            activityTimelineItem.detail.type === "sub_agent"
+            ? activityTimelineItem.detail.subAgentType
+            : undefined,
         );
-        if (existingIndex !== undefined) {
-          const activityTimelineItem = threadItemToTimeline(item, { cwd: params.cwd });
-          updateHistoricalSubAgentActivity(
-            timeline,
-            existingIndex,
-            historicalSubAgentActivity.kind,
-            activityTimelineItem?.type === "tool_call" &&
-              activityTimelineItem.detail.type === "sub_agent"
-              ? activityTimelineItem.detail.subAgentType
-              : undefined,
-          );
-          continue;
-        }
+        continue;
       }
-      for (const timelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
-        const rolloutTimestamp =
-          timelineItem.type === "assistant_message"
-            ? (rolloutAssistantTimestamps.get(timelineItem.text)?.shift() ?? null)
-            : null;
-        const timestamp =
-          readCodexHistoryTimestamp(item) ??
-          rolloutTimestamp ??
-          readCodexTurnHistoryTimestamp(turn, timelineItem);
-        const settledTimelineItem =
-          historicalSubAgentActivity && timelineItem.type === "tool_call"
-            ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
-            : timelineItem;
-        timeline.push({
-          item: settledTimelineItem,
-          timestamp: timestamp ?? undefined,
-          ...(timelineItem.type === "user_message" && typeof turn.id === "string"
-            ? { providerTurnId: turn.id }
-            : {}),
-        });
-        for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
-          subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
-        }
+    }
+    for (const timelineItem of threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+      const rolloutTimestamp =
+        timelineItem.type === "assistant_message"
+          ? (rolloutAssistantTimestamps.get(timelineItem.text)?.shift() ?? null)
+          : null;
+      const timestamp =
+        readCodexHistoryTimestamp(item) ??
+        rolloutTimestamp ??
+        readCodexTurnHistoryTimestamp(turn, timelineItem);
+      const settledTimelineItem =
+        historicalSubAgentActivity && timelineItem.type === "tool_call"
+          ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
+          : timelineItem;
+      timeline.push({
+        item: limitAgentTimelineItemContent(settledTimelineItem),
+        timestamp: timestamp ?? undefined,
+        ...(timelineItem.type === "user_message" && typeof turn.id === "string"
+          ? { providerTurnId: turn.id }
+          : {}),
+      });
+      for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
+        subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
       }
     }
   }
@@ -2242,7 +2201,7 @@ async function loadCodexThreadHistoryTimeline(params: {
   return {
     timeline,
     subAgentRoutes,
-    latestTurnStatus: readCodexHistoricalTurnStatus(response.thread.turns),
+    latestTurnStatus: readCodexHistoricalTurnStatus(history.turns),
   };
 }
 
@@ -4202,9 +4161,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const history = await loadCodexThreadHistoryTimeline({
       threadId,
       cwd: this.config.cwd ?? null,
-      requestThread: (threadIdToRead) => {
-        return readCodexThread(client, threadIdToRead);
-      },
+      client,
     });
     const { timeline, subAgentRoutes } = history;
     this.subAgentCallsByCallId.clear();
@@ -4315,7 +4272,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const history = await loadCodexThreadHistoryTimeline({
         threadId: route.childThreadId,
         cwd: this.config.cwd ?? null,
-        requestThread: (id) => readCodexThread(client, id),
+        client,
       });
       for (const entry of history.timeline) {
         this.emitProviderSubagentTimeline(route.childThreadId, entry.item, entry.timestamp);
@@ -4346,7 +4303,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         threadId: subagentId,
         cwd: this.config.cwd ?? null,
         throughTurnId,
-        requestThread: (id) => readCodexThread(client, id),
+        client,
       });
       const missingRoutes = savedHistory.subAgentRoutes.filter(
         (route) => !this.subAgentCallIdByChildThreadId.has(route.childThreadId),

@@ -16,10 +16,32 @@ The invariants are:
 > agent establishes the daemon's current tail in one bounded request, with older history reachable
 > through backward pagination.
 
-Tool output is bounded before it enters either delivery path. Canonical shell tool output is sliced
-to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
+Tool output is bounded before it enters either delivery path. Shell output and oversized unknown
+results (including MCP JSON) use 64 KiB previews; small structured results retain their shape.
+The same bounded item is used for runtime timeline rows and live stream events; native history
+retains the complete result.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
+
+Codex CLI 0.153.4+ is required for native history paging; older builds must be upgraded.
+Threads still marked `legacy` use native turn pages with one full turn per request because Codex's
+item API requires migrated storage. A large legacy turn can still allocate a large response;
+native migration is required for the 40-item working-set bound. Saved history stays unchanged.
+Codex hydration reads thread metadata and turn summaries without bodies, then consumes native
+`thread/items/list` pages of 40 items. Each mapped tool output is bounded before it enters the
+pending replay, so raw outputs from earlier pages can be released. Turns created during the scan
+remain part of restored history without relying on live notifications. Deferred child reads stop at
+their saved completed-turn boundary. Assistant timestamps still come from the canonical rollout
+reader, since native item-page timestamps can differ. This bounds the raw replay working set by a
+page; the completed projection still grows with retained conversation history.
+
+The existing Codex connection-to-subscription handoff remains a separate delivery gap:
+`establishConnection()` finishes hydration before `AgentManager.registerSession()` subscribes.
+A notification arriving after the last history response but before that subscription can be lost,
+including a turn's final items. This predates native paging and is not fixed by refreshing turn
+metadata during the scan. A follow-up must preserve and reconcile notifications across that
+handoff, with a regression that injects a final item and completion after history EOF and verifies
+exactly-once delivery after registration. See [the tracked finding](https://github.com/zhab1/paseo/pull/38#discussion_r4187947146).
 
 ## Presence is not delivery
 
