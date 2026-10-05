@@ -4183,7 +4183,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     read: (client: CodexAppServerClientLike) => Promise<T>,
   ): Promise<T> {
     if (this.closed) throw this.createClosedError();
-    if (this.client) return read(this.client);
+    if (this.client && this.connectionState === "connected") return read(this.client);
     const child = await this.spawnAppServer();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
     try {
@@ -4214,7 +4214,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.deferredSubagentTurns.clear();
     this.loadingPersistedHistory = true;
     try {
-      await this.loadPersistedSubAgentHistories(client, subAgentRoutes);
+      await this.loadPersistedSubAgentHistories(client, subAgentRoutes, null, null);
     } finally {
       this.loadingPersistedHistory = false;
     }
@@ -4234,12 +4234,14 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async loadPersistedSubAgentHistories(
     client: CodexAppServerClientLike,
     rootRoutes: readonly PersistedSubAgentRoute[],
+    parentCallId: string | null,
+    parentSubagentId: string | null,
   ): Promise<void> {
     if (rootRoutes.length === 0) return;
     const queue = rootRoutes.map((route) => ({
       route,
-      parentCallId: null as string | null,
-      parentSubagentId: null as string | null,
+      parentCallId,
+      parentSubagentId,
     }));
     // Thread summaries include ownership even for grandchildren and archived children.
     // Discover them without reading their tool output or assistant messages.
@@ -4257,15 +4259,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       visitedThreadIds.add(next.route.childThreadId);
       const childThreadId = next.route.childThreadId;
-      const { lastTurnId, latestStatus } = await readCodexChildTurn(client, childThreadId).catch(
-        (error) => {
-          this.logger.trace(
-            { err: error, childThreadId },
-            "Failed to read persisted Codex child status",
-          );
-          return { lastTurnId: null, latestStatus: null };
-        },
-      );
+      const childTurn = await readCodexChildTurn(client, childThreadId).catch((error) => {
+        this.logger.trace(
+          { err: error, childThreadId },
+          "Failed to read persisted Codex child status",
+        );
+        return null;
+      });
+      const lastTurnId = childTurn?.lastTurnId;
+      const latestStatus = childTurn?.latestStatus;
       if (latestStatus) {
         next.route.toolCall.status = latestStatus;
         next.route.toolCall.error =
@@ -4289,8 +4291,8 @@ export class CodexAppServerAgentSession implements AgentSession {
           parentSubagentId: childThreadId,
         });
       }
-      if (latestStatus !== "running") continue;
-      for (const route of await this.restoreRunningSubagent(client, next.route)) {
+      if (childTurn && latestStatus !== "running") continue;
+      for (const route of await this.restoreSubagentHistory(client, next.route)) {
         const queued = queue.find((entry) => entry.route.childThreadId === route.childThreadId);
         if (queued) {
           queued.route = route;
@@ -4305,7 +4307,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private async restoreRunningSubagent(
+  private async restoreSubagentHistory(
     client: CodexAppServerClientLike,
     route: PersistedSubAgentRoute,
   ): Promise<PersistedSubAgentRoute[]> {
@@ -4339,14 +4341,24 @@ export class CodexAppServerAgentSession implements AgentSession {
   async getProviderSubagentHistory(subagentId: string): Promise<PersistedTimelineEntry[] | null> {
     const throughTurnId = this.deferredSubagentTurns.get(subagentId);
     if (!throughTurnId) return null;
-    const history = await this.withHistoryClient((client) =>
-      loadCodexThreadHistoryTimeline({
+    const history = await this.withHistoryClient(async (client) => {
+      const savedHistory = await loadCodexThreadHistoryTimeline({
         threadId: subagentId,
         cwd: this.config.cwd ?? null,
         throughTurnId,
         requestThread: (id) => readCodexThread(client, id),
-      }),
-    );
+      });
+      const missingRoutes = savedHistory.subAgentRoutes.filter(
+        (route) => !this.subAgentCallIdByChildThreadId.has(route.childThreadId),
+      );
+      await this.loadPersistedSubAgentHistories(
+        client,
+        missingRoutes,
+        this.subAgentCallIdByChildThreadId.get(subagentId) ?? null,
+        subagentId,
+      );
+      return savedHistory;
+    });
     // Preserve the real spawn item identities once the direct parent's history is opened.
     for (const route of history.subAgentRoutes) {
       const callId = this.subAgentCallIdByChildThreadId.get(route.childThreadId);

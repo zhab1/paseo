@@ -5383,6 +5383,149 @@ describe("Codex app-server provider", () => {
     },
   );
 
+  test("restores readable child history when its status lookup fails", async () => {
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        if (method === "thread/turns/list") throw new Error("status unavailable");
+        if (method !== "thread/read") return {};
+        const root = (params as { threadId: string }).threadId === "test-thread";
+        return {
+          thread: {
+            turns: [
+              {
+                id: "saved-turn",
+                status: "completed",
+                items: root
+                  ? [
+                      {
+                        type: "subAgentActivity",
+                        id: "spawn",
+                        kind: "started",
+                        agentThreadId: "child",
+                        agentPath: "/root/child",
+                      },
+                    ]
+                  : [{ type: "agentMessage", id: "saved", text: "Readable child history" }],
+              },
+            ],
+          },
+        };
+      }),
+    };
+    await asInternals(session).loadPersistedHistory(session.client);
+    const events: AgentStreamEvent[] = [];
+    for await (const event of session.streamHistory()) events.push(event);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "provider_subagent",
+        event: expect.objectContaining({
+          type: "timeline",
+          id: "child",
+          item: expect.objectContaining({ text: "Readable child history" }),
+        }),
+      }),
+    );
+  });
+
+  test("discovers omitted grandchildren when opening their parent's saved history", async () => {
+    const session = createSession();
+    session.client = {
+      request: vi.fn(async (method: string, params: unknown) => {
+        if (method === "thread/list") throw new Error("listing unavailable");
+        if (method === "thread/turns/list")
+          return { data: [{ id: "saved-turn", status: "completed" }] };
+        if (method !== "thread/read") return {};
+        const id = (params as { threadId: string }).threadId;
+        const child = id === "test-thread" ? "child" : "grandchild";
+        return {
+          thread: {
+            turns: [
+              {
+                id: "saved-turn",
+                status: "completed",
+                items:
+                  id === "grandchild"
+                    ? [{ type: "agentMessage", id: "saved", text: "Grandchild history" }]
+                    : [
+                        {
+                          type: "subAgentActivity",
+                          id: `spawn-${child}`,
+                          kind: "started",
+                          agentThreadId: child,
+                          agentPath: `/root/${child}`,
+                        },
+                      ],
+              },
+            ],
+          },
+        };
+      }),
+    };
+    await asInternals(session).loadPersistedHistory(session.client);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await session.getProviderSubagentHistory?.("child");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "provider_subagent",
+        event: expect.objectContaining({
+          type: "upsert",
+          id: "grandchild",
+          parentSubagentId: "child",
+        }),
+      }),
+    );
+    expect(await session.getProviderSubagentHistory?.("grandchild")).toEqual([
+      expect.objectContaining({ item: expect.objectContaining({ text: "Grandchild history" }) }),
+    ]);
+  });
+
+  test("reads deferred history after the idle app-server disconnects", async () => {
+    const live = createFakeCodexAppServer();
+    const history = createFakeCodexAppServer({
+      "thread/read": () => ({
+        thread: {
+          turns: [
+            {
+              id: "saved-turn",
+              status: "completed",
+              items: [{ type: "agentMessage", id: "saved", text: "History after disconnect" }],
+            },
+          ],
+        },
+      }),
+    });
+    const spawn = vi.fn().mockResolvedValueOnce(live.child).mockResolvedValueOnce(history.child);
+    const session = new CodexAppServerAgentSession(
+      createConfig(),
+      { sessionId: "test-thread", metadata: { deferredSubagentTurns: { child: "saved-turn" } } },
+      createTestLogger(),
+      spawn,
+      {},
+      false,
+      false,
+      false,
+      undefined,
+      "interactive",
+      false,
+    );
+    try {
+      await session.connect();
+      live.disconnect();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(await session.getProviderSubagentHistory("child")).toEqual([
+        expect.objectContaining({
+          item: expect.objectContaining({ text: "History after disconnect" }),
+        }),
+      ]);
+      expect(spawn).toHaveBeenCalledTimes(2);
+      history.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("stops descendant discovery when pagination repeats threads", async () => {
     const session = createSession();
     let listCalls = 0;
