@@ -97,7 +97,7 @@ Foregrounding probes a nominally connected session immediately. A healthy respon
 socket; a failed three-second probe starts reconnecting without waiting for the background heartbeat
 or retry backoff. This cannot keep a mobile socket alive after the operating system suspends it.
 
-- The same epoch and `window.maxSeq` is an exact display no-op. The app advances synchronization
+- Without a server reset, the same epoch and `window.maxSeq` is an exact display no-op. The app advances synchronization
   bookkeeping without replacing timeline arrays, preserving an upward-scrolled viewport.
 - When the page overlaps or is adjacent to the local end cursor, only projected items newer than
   that cursor are applied. Already-covered rows are not replayed.
@@ -108,6 +108,12 @@ or retry backoff. This cannot keep a mobile socket alive after the operating sys
 The installed tail carries `hasOlder`, so history skipped by a replacement remains reachable through
 ordinary backward pagination. A backward page is accepted only when it is adjacent to the current
 history start; a response requested from a pre-replacement range is stale and is discarded.
+
+A tail's item limit also applies when an older tool finishes inside its source window. Such a page
+requests a reset: keeping the older cached card would certify its stale state as current. Expanding
+the tail back to that card instead can download an entire long conversation for one screen. Scrolling
+back retrieves the complete tool at its original display position; forward catch-up still includes
+updates to older tools.
 
 A plan approval keeps the original proposal's tool-call identity through resolution and provider
 history replay. The pending approval UI can hide that tool from presentation, but the client model

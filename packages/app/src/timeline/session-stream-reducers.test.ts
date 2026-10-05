@@ -600,6 +600,74 @@ describe("processTimelineResponse", () => {
     expect(result.sideEffects.some((e) => e.type === "flush_pending_updates")).toBe(true);
   });
 
+  it("replaces stale older tools with a bounded tail and restores their final state on scroll", () => {
+    const tool = makeToolCallTimelineEntry(1, "old-tool", "running", {
+      type: "read",
+      filePath: "/project/example.ts",
+    });
+    const cached = processTimelineResponse({
+      ...baseTimelineInput,
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "tail",
+        reset: true,
+        startCursor: { seq: 1 },
+        endCursor: { seq: 2 },
+        entries: [tool, makeTimelineEntry(2, "older", "user_message")],
+      },
+    });
+    expect(getAgentToolCalls(cached.tail)).toHaveLength(1);
+
+    const latest = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: cached.tail,
+      currentCursor: cached.cursor ?? undefined,
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "tail",
+        reset: true,
+        window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+        startCursor: { seq: 3 },
+        endCursor: { seq: 4 },
+        hasOlder: true,
+        entries: [makeTimelineEntry(3, "latest")],
+      },
+    });
+    expect(getAgentToolCalls(latest.tail)).toEqual([]);
+    expect(getAssistantTexts(latest.tail)).toEqual(["latest"]);
+    expect(latest.older).toBe("available");
+    expect(latest.cursor).toEqual({ epoch: "epoch-1", startSeq: 3, endSeq: 4 });
+
+    const older = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: latest.tail,
+      currentCursor: latest.cursor ?? undefined,
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: "before",
+        window: { minSeq: 1, maxSeq: 4, nextSeq: 5 },
+        startCursor: { seq: 1 },
+        endCursor: { seq: 2 },
+        entries: [
+          {
+            ...makeToolCallTimelineEntry(1, "old-tool", "completed", {
+              type: "read",
+              filePath: "/project/example.ts",
+            }),
+            seqEnd: 4,
+          },
+          makeTimelineEntry(2, "older", "user_message"),
+        ],
+      },
+    });
+    expect(getAgentToolCalls(older.tail)).toHaveLength(1);
+    expect(getAgentToolCalls(older.tail)[0].payload.data.status).toBe("completed");
+    expect(getUserTexts(older.tail)).toEqual(["older"]);
+    expect(getAssistantTexts(older.tail)).toEqual(["latest"]);
+    expect(older.older).toBe("none");
+    expect(older.cursor).toEqual({ epoch: "epoch-1", startSeq: 1, endSeq: 4 });
+  });
+
   it("keeps a live assistant and submitted head prompt in one lane during replacement", () => {
     const submitted = makeSubmittedUserMessage("New prompt", "client-new-prompt");
     const liveAssistant = {

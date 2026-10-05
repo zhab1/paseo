@@ -762,7 +762,7 @@ describe("selectProjectedTimelinePage", () => {
     expect(anchoredPage.hasOlder).toBe(false);
   });
 
-  test("tail page includes a wide tool when its completion is the newest seq", () => {
+  test("tail resets within its limit when an omitted tool completion is the newest seq", () => {
     const rows: AgentTimelineRow[] = [
       toolRow(1, "running"),
       ...Array.from({ length: 499 }, (_, index) => ({
@@ -775,7 +775,8 @@ describe("selectProjectedTimelinePage", () => {
 
     const page = selectProjectedTimelinePage({ rows, direction: "tail", limit: 100 });
 
-    expect(page.entries.some((entry) => entry.item.type === "tool_call")).toBe(true);
-    expect(page.endSeq).toBe(501);
+    expect(page.entries).toHaveLength(100);
+    expect(page.entries.some((entry) => entry.item.type === "tool_call")).toBe(false);
+    expect(page).toMatchObject({ startSeq: 401, endSeq: 501, hasOlder: true, reset: true });
   });
 });

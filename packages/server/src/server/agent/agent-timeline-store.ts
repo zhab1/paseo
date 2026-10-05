@@ -3,6 +3,7 @@ import {
   TimelineProjection,
   selectProjectedTimelinePage,
   type ProjectedTimelineRow,
+  type ProjectedTimelinePageSelection,
 } from "./timeline-projection.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
@@ -28,6 +29,28 @@ interface AgentTimelineState {
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
 function cloneRow<T extends AgentTimelineRow>(row: T): T {
   return { ...row };
+}
+
+function getPriorAssistantMessageIds(
+  rows: readonly ProjectedTimelineRow[],
+  page: ProjectedTimelinePageSelection,
+): string[] {
+  const pageMessageIds = new Set(
+    page.entries.flatMap(({ item }) =>
+      item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
+    ),
+  );
+  const priorAssistantMessageIds = new Set<string>();
+  for (const row of rows) {
+    if (page.startSeq === null || row.seqStart >= page.startSeq) break;
+    if (
+      row.item.type === "assistant_message" &&
+      row.item.messageId &&
+      pageMessageIds.has(row.item.messageId)
+    )
+      priorAssistantMessageIds.add(row.item.messageId);
+  }
+  return [...priorAssistantMessageIds];
 }
 
 export class InMemoryAgentTimelineStore {
@@ -114,25 +137,10 @@ export class InMemoryAgentTimelineStore {
       cursorSeq: cursor?.seq,
       limit: options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT,
     });
-    const pageMessageIds = new Set(
-      page.entries.flatMap(({ item }) =>
-        item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
-      ),
-    );
-    const priorAssistantMessageIds = new Set<string>();
-    for (const row of rows) {
-      if (page.startSeq === null || row.seqStart >= page.startSeq) break;
-      if (
-        row.item.type === "assistant_message" &&
-        row.item.messageId &&
-        pageMessageIds.has(row.item.messageId)
-      )
-        priorAssistantMessageIds.add(row.item.messageId);
-    }
     return {
       epoch: state.epoch,
       direction,
-      reset,
+      reset: reset || page.reset === true,
       staleCursor,
       gap,
       window,
@@ -140,7 +148,7 @@ export class InMemoryAgentTimelineStore {
       hasNewer: page.hasNewer,
       startSeq: page.startSeq,
       endSeq: page.endSeq,
-      priorAssistantMessageIds: [...priorAssistantMessageIds],
+      priorAssistantMessageIds: getPriorAssistantMessageIds(rows, page),
       rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
     };
   }
