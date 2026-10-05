@@ -30,7 +30,11 @@ export function pagedHistoryRequest(request: Request): Request {
       const start = Number(input.cursor ?? 0);
       const end = start + Number(input.limit ?? 100);
       return {
-        data: turns.slice(start, end).map((turn) => Object.assign({}, turn, { items: [] })),
+        data: turns.slice(start, end).map((turn) =>
+          Object.assign({}, turn, {
+            items: input.itemsView === "full" ? (turn.items ?? []) : [],
+          }),
+        ),
         nextCursor: end < turns.length ? String(end) : null,
       };
     }

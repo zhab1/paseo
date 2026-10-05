@@ -20,7 +20,10 @@ const ItemsPageSchema = z.object({
   nextCursor: z.string().nullable(),
 });
 const MetadataSchema = z.object({
-  thread: z.object({ path: z.string().nullable().optional() }),
+  thread: z.object({
+    path: z.string().nullable().optional(),
+    historyMode: z.string().optional(),
+  }),
 });
 const PAGE_SIZE = 40;
 
@@ -79,6 +82,33 @@ export async function openCodexHistory(
 
   async function* items() {
     let itemCursor: string | null = null;
+    if (metadata.thread.historyMode === "legacy") {
+      // Codex only implements rollout fallback for turn pages. Never retain the
+      // item-bearing turn in the metadata map or request the whole legacy thread.
+      do {
+        const page = TurnsPageSchema.parse(
+          await requestPage("thread/turns/list", {
+            threadId,
+            limit: 1,
+            sortDirection: "asc",
+            itemsView: "full",
+            ...(itemCursor ? { cursor: itemCursor } : {}),
+          }),
+        );
+        for (const rawTurn of page.data) {
+          const { items: turnItems, ...turn } = TurnSchema.extend({
+            items: z.array(z.unknown()),
+          }).parse(rawTurn);
+          turns.set(turn.id, turn);
+          for (const item of turnItems) yield { turnId: turn.id, item, turn };
+          if (turn.id === throughTurnId) return;
+        }
+        if (page.nextCursor && page.nextCursor === itemCursor)
+          throw new Error("Codex turn cursor did not advance");
+        itemCursor = page.nextCursor;
+      } while (itemCursor);
+      return;
+    }
     do {
       const page = ItemsPageSchema.parse(
         await requestPage("thread/items/list", {

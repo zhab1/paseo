@@ -5,6 +5,34 @@ import { CodexAppServerRpcError } from "./app-server-transport.js";
 import { openCodexHistory } from "./history-reader.js";
 
 describe("native paged history", () => {
+  test.each([undefined, "old"])(
+    "restores legacy turn pages through %s without item-store support",
+    async (boundary) => {
+      const client = {
+        async request(method: string, params: Record<string, unknown>) {
+          if (method === "thread/read") return { thread: { historyMode: "legacy" } };
+          expect(method).toBe("thread/turns/list");
+          if (params.itemsView === "notLoaded")
+            return { data: [{ id: "old" }, { id: "new" }], nextCursor: null };
+          expect(params.limit).toBe(1);
+          expect(params.itemsView).toBe("full");
+          const id = params.cursor ? "new" : "old";
+          return {
+            data: [{ id, items: [{ id: `${id}-item` }] }],
+            nextCursor: params.cursor ? null : "next",
+          };
+        },
+      };
+      const history = await openCodexHistory(client, "legacy-thread", boundary);
+      const items = [];
+      for await (const entry of history.items) items.push(entry.item);
+      expect(items).toEqual(
+        boundary ? [{ id: "old-item" }] : [{ id: "old-item" }, { id: "new-item" }],
+      );
+      expect(history.turns.every((turn) => turn.items === undefined)).toBe(true);
+    },
+  );
+
   test("keeps turns created after the initial metadata page instead of dropping their history", async () => {
     let turnReads = 0;
     const client = {
