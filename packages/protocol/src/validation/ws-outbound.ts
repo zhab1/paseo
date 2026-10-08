@@ -2,7 +2,7 @@ import type { z } from "zod";
 import { WSOutboundMessageSchema } from "../generated/validation/ws-outbound.aot.js";
 import type { WSOutboundMessage } from "../messages.js";
 
-type WSOutboundValidationResult =
+export type WSOutboundValidationResult =
   | { success: true; data: WSOutboundMessage }
   | { success: false; error: z.ZodError };
 
