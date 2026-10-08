@@ -1,5 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
@@ -62,6 +63,33 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  it.runIf(process.platform === "linux")(
+    "bounds Node validation memory for repeated small messages",
+    () => {
+      const result = execFileSync(
+        process.execPath,
+        [
+          "--expose-gc",
+          "--import",
+          "tsx",
+          "--input-type=module",
+          "--eval",
+          `
+        import { validateWSOutboundMessage } from './src/validation/ws-outbound.node.ts';
+        for (let i = 0; i < 1000; i++) {
+          if (!validateWSOutboundMessage({ type: 'pong' }).success) throw new Error('valid frame rejected');
+        }
+        if (validateWSOutboundMessage({ type: 'not_a_message' }).success) throw new Error('invalid frame accepted');
+        global.gc();
+        console.log(JSON.stringify({ peakMiB: process.resourceUsage().maxRSS / 1024 }));
+      `,
+        ],
+        { cwd: protocolRoot, encoding: "utf8", timeout: 30_000 },
+      );
+      expect(JSON.parse(result).peakMiB).toBeLessThan(256);
+    },
+  );
+
   it("applies defaults inside discriminated-union branches", async () => {
     const schema = await compileInlineSchema(`
 const SourceSchema = z.discriminatedUnion("type", [
