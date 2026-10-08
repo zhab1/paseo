@@ -2,6 +2,7 @@ import { CachedTimelineProjection, type TimelineCache } from "./timeline-cache.j
 import { randomUUID } from "node:crypto";
 import {
   TimelineProjection,
+  projectTimelineRows,
   selectProjectedTimelinePage,
   type ProjectedTimelineRow,
   type ProjectedTimelinePageSelection,
@@ -26,6 +27,7 @@ interface AgentTimelineState {
   projection: TimelineProjection | CachedTimelineProjection;
   minSeq: number;
   nextSeq: number;
+  historySnapshots?: Set<AgentTimelineRow[][]>;
 }
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
 // Leave stable positive cursor positions for native history fetched backwards.
@@ -101,6 +103,27 @@ export class InMemoryAgentTimelineStore {
       .map((row) => row.item);
   }
 
+  async getSnapshot(
+    agentId: string,
+    loadHistory: () => Promise<unknown>,
+  ): Promise<AgentTimelineItem[]> {
+    const state = this.requireState(agentId);
+    const current = structuredClone(this.getRows(agentId));
+    const older: AgentTimelineRow[][] = [];
+    state.historySnapshots ??= new Set();
+    state.historySnapshots.add(older);
+    try {
+      await loadHistory();
+      if (this.states.get(agentId) !== state) throw new Error("Agent history was reloaded");
+      return projectTimelineRows({
+        rows: [...older.toReversed().flat(), ...current],
+        mode: "projected",
+      }).map((row) => row.item);
+    } finally {
+      state.historySnapshots.delete(older);
+    }
+  }
+
   getItemCount(agentId: string): number {
     const projection = this.requireState(agentId).projection;
     return projection instanceof CachedTimelineProjection
@@ -129,6 +152,10 @@ export class InMemoryAgentTimelineStore {
       state.projection = projection;
     }
     state.minSeq = startSeq;
+    // A complete turn snapshot accepts older history, including an in-flight
+    // scroll, but never live updates after its boundary. Keep the native rows
+    // before projection can merge them with a following turn's newer values.
+    for (const snapshot of state.historySnapshots ?? []) snapshot.push(structuredClone(rows));
   }
 
   getRows(agentId: string): ProjectedTimelineRow[] {

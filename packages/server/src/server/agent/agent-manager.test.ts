@@ -11739,70 +11739,122 @@ test.each(["create", "import"])(
   },
 );
 
-test("turn hooks explicitly load complete history without including a following turn", async () => {
-  let historyReads = 0;
-  const olderAllowed = deferred<void>();
-  const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
-  class PagedSession extends TestAgentSession {
-    readonly initialTimeline = [
-      { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
-    ];
-    hasOlderHistory() {
-      return historyReads === 0;
-    }
-    async loadOlderHistory() {
-      historyReads++;
-      await olderAllowed.promise;
-      return [{ item: { type: "user_message" as const, text: "Original prompt" } }];
-    }
-  }
-  const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
-  const client = new (class extends TestAgentClient {
-    override async createSession() {
-      return session;
-    }
-  })();
-  const lifecycle: PluginLifecycle = {
-    emit(name, event) {
-      if (name === "agent.turn_ended") {
-        void Promise.resolve(typeof event === "function" ? event() : event)
-          .then((value) => hook.resolve(value as PluginLifecycleEvents["agent.turn_ended"]))
-          .catch(hook.reject);
+test.each([false, true])(
+  "turn hooks explicitly freeze complete history with a prior scroll=%s",
+  async (scrollFirst) => {
+    let historyReads = 0;
+    const olderAllowed = deferred<void>();
+    const olderStarted = deferred<void>();
+    const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
+    const hookStarted = deferred<void>();
+    const plugin: AgentTimelineItem = {
+      type: "plugin",
+      id: "report",
+      pluginId: "test",
+      kind: "report",
+      version: 1,
+      data: "before",
+    };
+    const oldChild: AgentTimelineItem = {
+      type: "tool_call",
+      callId: "old-child",
+      name: "Sub-agent",
+      status: "completed",
+      error: null,
+      detail: { type: "unknown", input: "before", output: "before" },
+    };
+    class PagedSession extends TestAgentSession {
+      readonly initialTimeline = [
+        { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
+        { item: plugin },
+      ];
+      hasOlderHistory() {
+        return historyReads === 0;
       }
-    },
-    async before(_name, request) {
-      return request;
-    },
-  };
-  const manager = new AgentManager({
-    clients: { codex: client },
-    pluginLifecycle: lifecycle,
-    logger,
-  });
-  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {});
-  try {
-    expect(historyReads).toBe(0);
-    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
-    session.pushEvent({
-      type: "timeline",
-      provider: "codex",
-      item: {
-        type: "user_message",
-        text: "Following turn",
+      async loadOlderHistory() {
+        historyReads++;
+        olderStarted.resolve();
+        await olderAllowed.promise;
+        return [
+          { item: { type: "user_message" as const, text: "Original prompt" } },
+          { item: oldChild },
+          { item: { type: "assistant_message" as const, messageId: "recent", text: "earlier " } },
+        ];
+      }
+    }
+    const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
+    const client = new (class extends TestAgentClient {
+      override async createSession() {
+        return session;
+      }
+    })();
+    const lifecycle: PluginLifecycle = {
+      emit(name, event) {
+        if (name === "agent.turn_ended") {
+          void Promise.resolve(typeof event === "function" ? event() : event)
+            .then((value) => hook.resolve(value as PluginLifecycleEvents["agent.turn_ended"]))
+            .catch(hook.reject);
+          hookStarted.resolve();
+        }
       },
+      async before(_name, request) {
+        return request;
+      },
+    };
+    const manager = new AgentManager({
+      clients: { codex: client },
+      pluginLifecycle: lifecycle,
+      logger,
     });
-    olderAllowed.resolve();
-    const event = await hook.promise;
-    expect(event.timeline).toEqual([
-      { type: "user_message", text: "Original prompt" },
-      { type: "assistant_message", messageId: "recent", text: "recent" },
-    ]);
-    expect(historyReads).toBe(1);
-  } finally {
-    olderAllowed.resolve();
-    await manager.closeAgent(agent.id);
-  }
-});
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: process.cwd() },
+      undefined,
+      {},
+    );
+    try {
+      expect(historyReads).toBe(0);
+      const page = manager.fetchTimeline(agent.id, { limit: 1 });
+      const scroll = scrollFirst
+        ? manager.fetchTimelinePage(agent.id, {
+            direction: "before",
+            cursor: { epoch: page.epoch, seq: page.window.minSeq },
+            limit: 1,
+          })
+        : null;
+      if (scroll) await olderStarted.promise;
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
+      await hookStarted.promise;
+      await olderStarted.promise;
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "user_message",
+          text: "Following turn",
+        },
+      });
+      await manager.appendTimelineItem(agent.id, { ...plugin, data: "after" });
+      await manager.appendTimelineItem(agent.id, {
+        ...oldChild,
+        status: "running",
+        detail: { type: "unknown", input: "after", output: "after" },
+      });
+      olderAllowed.resolve();
+      await scroll;
+      const event = await hook.promise;
+      expect(event.timeline).toEqual([
+        { type: "user_message", text: "Original prompt" },
+        oldChild,
+        { type: "assistant_message", messageId: "recent", text: "earlier recent" },
+        plugin,
+      ]);
+      expect(historyReads).toBe(1);
+    } finally {
+      olderAllowed.resolve();
+      await manager.closeAgent(agent.id);
+    }
+  },
+);
 
 test("import retains a metadata title when the newest page contains no user prompt", async () => {
   const client = new (class extends TestAgentClient {
