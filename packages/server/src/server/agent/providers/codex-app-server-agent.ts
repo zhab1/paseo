@@ -2248,7 +2248,7 @@ function codexDescendantRoutes(
   return routes;
 }
 
-async function readCodexChildTurn(client: CodexAppServerClientLike, threadId: string) {
+async function readCodexLatestTurn(client: CodexAppServerClientLike, threadId: string) {
   const response = toObjectRecord(
     await client.request("thread/turns/list", {
       threadId,
@@ -2262,13 +2262,6 @@ async function readCodexChildTurn(client: CodexAppServerClientLike, threadId: st
     lastTurnId: nonEmptyString(toObjectRecord(turns[0])?.id),
     latestStatus: readCodexHistoricalTurnStatus(turns),
   };
-}
-
-function readCodexThread(client: CodexAppServerClientLike, threadId: string): Promise<unknown> {
-  return client.request("thread/read", {
-    threadId,
-    includeTurns: true,
-  });
 }
 
 function readActiveCodexTurnId(response: unknown): string | null {
@@ -4244,7 +4237,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       visitedThreadIds.add(next.route.childThreadId);
       const childThreadId = next.route.childThreadId;
-      const childTurn = await readCodexChildTurn(client, childThreadId).catch((error) => {
+      const childTurn = await readCodexLatestTurn(client, childThreadId).catch((error) => {
         this.logger.trace(
           { err: error, childThreadId },
           "Failed to read persisted Codex child status",
@@ -5457,9 +5450,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       throw new Error("Cannot interrupt Codex before the active thread is initialized");
     }
     if (!this.currentTurnId && !this.pendingForegroundTurnIdentification) {
-      const recoveredTurnId = readActiveCodexTurnId(
-        await readCodexThread(this.client, this.currentThreadId),
-      );
+      const latest = await readCodexLatestTurn(this.client, this.currentThreadId);
+      const recoveredTurnId = latest.latestStatus === "running" ? latest.lastTurnId : null;
       this.currentTurnId = recoveredTurnId;
       this.activeForegroundTurnId = recoveredTurnId;
     }

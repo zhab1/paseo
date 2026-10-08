@@ -48,6 +48,8 @@ child thread status, background terminals and, when enabled, active goals, and p
 with active turns, pending requests or approvals. An unavailable native safety check keeps the
 runtime attached. The next turn reconnects the same saved thread without replaying
 the already cached history. A failed idle shutdown blocks a second writer instead of spawning one.
+Stop recovery identifies the active turn from the latest native turn metadata, without fetching
+the full transcript.
 
 Mobile clients retain the fork's inline timestamp presentation. On reconnect, a canonical row
 containing both previously seen and new text is a full replacement and keeps its timestamp;

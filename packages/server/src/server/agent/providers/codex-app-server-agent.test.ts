@@ -4644,7 +4644,7 @@ describe("Codex app-server provider", () => {
     });
   });
 
-  test("recovers a missing autonomous turn id when interrupting", async () => {
+  test("recovers a missing autonomous turn id using only latest-turn metadata", async () => {
     const session = createSession();
     const requests: Array<{ method: string; params: unknown }> = [];
     session.activeForegroundTurnId = null;
@@ -4652,14 +4652,16 @@ describe("Codex app-server provider", () => {
     session.client = {
       request: async (method, params) => {
         requests.push({ method, params });
-        return method === "thread/read"
-          ? { thread: { turns: [{ id: "recovered-turn", status: "inProgress" }] } }
+        return method === "thread/turns/list"
+          ? { data: [{ id: "recovered-turn", status: "inProgress" }], nextCursor: null }
           : {};
       },
     };
 
     const interrupt = session.interrupt();
-    await Promise.resolve();
+    await vi.waitFor(() =>
+      expect(requests).toContainEqual(expect.objectContaining({ method: "turn/interrupt" })),
+    );
     asInternals(session).handleNotification("turn/completed", {
       threadId: "test-thread",
       turn: { id: "recovered-turn", status: "interrupted", items: [] },
@@ -4667,7 +4669,15 @@ describe("Codex app-server provider", () => {
     await interrupt;
 
     expect(requests).toEqual([
-      { method: "thread/read", params: { threadId: "test-thread", includeTurns: true } },
+      {
+        method: "thread/turns/list",
+        params: {
+          threadId: "test-thread",
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        },
+      },
       { method: "turn/interrupt", params: { threadId: "test-thread", turnId: "recovered-turn" } },
     ]);
   });
