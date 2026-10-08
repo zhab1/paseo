@@ -628,6 +628,11 @@ export interface AgentCreateSessionOptions {
    * Defaults to true. Providers that cannot honor false should no-op.
    */
   persistSession?: boolean;
+  /**
+   * Model ids added by provider configuration (`models` / `additionalModels`).
+   * Providers that validate against runtime-advertised models must accept these.
+   */
+  configuredModelIds?: readonly string[];
 }
 
 /** What a resumed session is for: driving the agent, or reading what it already did. */
@@ -639,6 +644,8 @@ export interface AgentResumeSessionOptions {
   purpose?: AgentResumePurpose;
   /** Skip provider history when Paseo already has the durable timeline. */
   loadHistory?: boolean;
+  /** See AgentCreateSessionOptions.configuredModelIds. */
+  configuredModelIds?: readonly string[];
 }
 
 /**
