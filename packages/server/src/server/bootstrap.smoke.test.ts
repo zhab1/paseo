@@ -599,6 +599,30 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test("shutdown closes internal sessions that are hidden from the agent list", async () => {
+    const closeSession = vi.fn(async () => {});
+    const daemonHandle = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients({ closeSession }),
+    });
+    const manager = daemonHandle.daemon.agentManager;
+    let agentId = "";
+    try {
+      const agent = await manager.createAgent(
+        { provider: "codex", cwd: daemonHandle.paseoHome, internal: true },
+        undefined,
+        { workspaceId: undefined },
+      );
+      agentId = agent.id;
+      expect(manager.listAgents()).toEqual([]);
+      expect(manager.getAgent(agentId)).not.toBeNull();
+      closeSession.mockClear();
+    } finally {
+      await daemonHandle.close();
+    }
+    expect(closeSession).toHaveBeenCalledOnce();
+    expect(manager.getAgent(agentId)).toBeNull();
+  });
+
   test("stops new connections and agent registrations before closing agents", async () => {
     const shutdown = await beginDaemonShutdownWithAgentClosing();
     try {
