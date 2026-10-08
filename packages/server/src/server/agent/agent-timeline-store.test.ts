@@ -310,6 +310,35 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
     expect(catchUp).toMatchObject({ reset: false, hasNewer: false, endSeq: 1002 });
   });
 
+  it("reconciles older tool activity with a later card beyond the page boundary", () => {
+    const store = createStore();
+    const tool = {
+      type: "tool_call" as const,
+      callId: "child",
+      name: "Sub-agent",
+      status: "completed" as const,
+      error: null,
+      detail: {
+        type: "sub_agent" as const,
+        subAgentType: "Child",
+        description: "Task",
+        log: "",
+        actions: [],
+      },
+    };
+    store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
+    store.append("a", { type: "assistant_message", messageId: "middle", text: "middle" });
+    const latest = store.append("a", { ...tool, status: "canceled" });
+    store.prepend("a", [{ item: tool }]);
+    const cards = store
+      .fetch("a", { limit: 0 })
+      .rows.filter((row) => row.item.type === "tool_call");
+    expect(cards).toHaveLength(1);
+    expect(cards[0].item).toMatchObject({ callId: "child", status: "canceled" });
+    expect(cards[0].seqEnd).toBe(latest.seq);
+    expect(cards[0].seqStart).toBeLessThan(PAGED_HISTORY_ORIGIN);
+  });
+
   it("opens the latest page, reads older pages on demand, and keeps live cursors stable", async () => {
     const store = createStore();
     const item = (n: number) => ({

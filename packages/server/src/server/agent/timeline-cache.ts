@@ -111,16 +111,31 @@ export class CachedTimelineProjection {
   }
 
   prepend(rows: readonly AgentTimelineRow[]): void {
-    const boundary = this.read(
-      "SELECT value FROM timeline_rows WHERE timeline = ? ORDER BY start LIMIT 1",
-    )[0];
+    const identities = [
+      ...new Set(
+        rows.flatMap(({ item }) => {
+          const identity = timelineItemIdentity(item);
+          return identity === null ? [] : [identity];
+        }),
+      ),
+    ];
+    // An older lifecycle item can match a later card beyond the first row.
+    // Read only those identities plus the adjacent text boundary.
+    const prior = this.read(
+      `SELECT value FROM timeline_rows WHERE timeline = ? AND
+        (start = (SELECT min(start) FROM timeline_rows WHERE timeline = ?)
+         ${identities.length ? `OR identity IN (${identities.map(() => "?").join(",")})` : ""})
+        ORDER BY start`,
+      this.key,
+      ...identities,
+    );
     const projection = new TimelineProjection();
     for (const row of rows) projection.append(row);
-    if (boundary) {
-      projection.append(boundary);
+    for (const row of prior) {
+      projection.append(row);
       this.cache.db
         .prepare("DELETE FROM timeline_rows WHERE timeline = ? AND start = ?")
-        .run(this.key, boundary.seqStart);
+        .run(this.key, row.seqStart);
     }
     for (const row of projection.getRows()) this.save(row);
   }

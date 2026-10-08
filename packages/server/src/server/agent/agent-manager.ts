@@ -660,14 +660,17 @@ function hasOlderProviderHistory(
   return session?.hasOlderHistory?.(subagentId) ?? false;
 }
 
-function buildImportedTimelineRows(entries: readonly ImportedTimelineEntry[]): AgentTimelineRow[] {
+function buildImportedTimelineRows(
+  entries: readonly ImportedTimelineEntry[],
+  startSeq: number,
+): AgentTimelineRow[] {
   const rows: AgentTimelineRow[] = [];
   for (const entry of entries) {
     if (entry.item.type === "user_message" && isSystemInjectedEnvelope(entry.item.text)) {
       continue;
     }
     rows.push({
-      seq: rows.length + 1,
+      seq: startSeq + rows.length,
       timestamp: entry.timestamp ?? new Date().toISOString(),
       item: limitAgentTimelineItemContent(entry.item),
     });
@@ -1534,7 +1537,8 @@ export class AgentManager {
       const importedConfig = await this.normalizeConfig(
         stripInternalPaseoMcpServer(imported.config),
       );
-      const timelineRows = buildImportedTimelineRows(imported.timeline);
+      const startSeq = hasOlderProviderHistory(imported.session) ? PAGED_HISTORY_ORIGIN : 1;
+      const timelineRows = buildImportedTimelineRows(imported.timeline, startSeq);
       const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
 
       handedToRegistration = true;
@@ -1542,7 +1546,7 @@ export class AgentManager {
         labels: input.labels,
         workspaceId: input.workspaceId,
         timelineRows,
-        timelineNextSeq: timelineRows.length + 1,
+        timelineNextSeq: startSeq + timelineRows.length,
         persistence: imported.persistence,
         historyPrimed: true,
         initialTitle,

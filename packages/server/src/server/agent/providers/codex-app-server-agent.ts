@@ -2119,16 +2119,23 @@ async function loadCodexThreadHistoryTimeline(params: {
   );
   const groups = [];
   for await (const entry of history.items) {
+    const activity = readCodexSubAgentActivity(entry.item);
     groups.push({
-      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map(
-        limitAgentTimelineItemContent,
+      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map((item) =>
+        limitAgentTimelineItemContent(
+          // Use the same identity as metadata-only child discovery, including
+          // when started/interacted/interrupted arrive on separate history pages.
+          activity && item.type === "tool_call"
+            ? { ...item, callId: `codex-subagent:${activity.agentThreadId}` }
+            : item,
+        ),
       ),
       turn: entry.turn,
       timestamp:
         readCodexHistoryTimestamp(entry.item) ??
         normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
         normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
-      activity: readCodexSubAgentActivity(entry.item),
+      activity,
       childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
     });
   }

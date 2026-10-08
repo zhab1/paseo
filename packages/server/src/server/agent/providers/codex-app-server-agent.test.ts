@@ -1,4 +1,5 @@
 import { pagedHistoryRequest } from "./codex/test-utils/paged-history.js";
+import { InMemoryAgentTimelineStore, PAGED_HISTORY_ORIGIN } from "../agent-timeline-store.js";
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -5358,7 +5359,7 @@ describe("Codex app-server provider", () => {
         },
       },
       {
-        callId: "v2-spawn-history",
+        callId: "codex-subagent:v2-child-thread",
         status: "completed",
         detail: { type: "sub_agent", description: "v2-child" },
       },
@@ -5390,7 +5391,7 @@ describe("Codex app-server provider", () => {
       event.type === "timeline" && event.item.type === "tool_call" ? [event.item] : [],
     );
     expect(new Set(liveToolCalls.map((item) => item.callId))).toEqual(
-      new Set(["v2-spawn-history"]),
+      new Set(["codex-subagent:v2-child-thread"]),
     );
     expect(liveToolCalls.at(-1)).toMatchObject({
       status: "running",
@@ -5756,6 +5757,61 @@ describe("Codex app-server provider", () => {
     expect(detail.log).toContain("Grandchild output finished");
   });
 
+  test("keeps one child card when its lifecycle spans three native history pages", async () => {
+    const session = createSession();
+    const activity = (kind: "started" | "interacted" | "interrupted") => ({
+      type: "subAgentActivity",
+      id: `activity-${kind}`,
+      kind,
+      agentThreadId: "history-child",
+      agentPath: "/root/history-child",
+    });
+    const padding = (prefix: string) =>
+      Array.from({ length: 205 }, (_, i) => ({
+        type: "agentMessage",
+        id: `${prefix}-${i}`,
+        text: `${prefix} ${i}`,
+      }));
+    const items = [
+      activity("started"),
+      ...padding("first"),
+      activity("interacted"),
+      ...padding("second"),
+      activity("interrupted"),
+    ];
+    session.client = {
+      request: pagedHistoryRequest(async (method, params) => {
+        if (method !== "thread/read") return {};
+        return {
+          thread: {
+            turns:
+              (params as { threadId?: string }).threadId === "test-thread"
+                ? [{ id: "turn", status: "completed", items }]
+                : [],
+          },
+        };
+      }),
+    };
+    await asInternals(session).loadPersistedHistory(session.client);
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline") store.append("a", event.item, { timestamp: event.timestamp });
+    }
+    const cards = () =>
+      store.fetch("a", { limit: 0 }).rows.filter((row) => row.item.type === "tool_call");
+    const latestCard = cards()[0].item;
+    expect(latestCard).toMatchObject({ status: "canceled" });
+    let pages = 1;
+    while (session.hasOlderHistory()) {
+      store.prepend("a", await session.loadOlderHistory());
+      pages++;
+      expect(cards()).toHaveLength(1);
+      expect(cards()[0].item).toEqual(latestCard);
+    }
+    expect(pages).toBe(3);
+  });
+
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {
     const session = createSession();
     session.client = {
@@ -5826,7 +5882,7 @@ describe("Codex app-server provider", () => {
         timestamp: "2026-07-09T10:00:00.000Z",
         item: expect.objectContaining({
           type: "tool_call",
-          callId: "child-started-history",
+          callId: "codex-subagent:history-child-thread",
           status: "canceled",
           detail: expect.objectContaining({
             type: "sub_agent",

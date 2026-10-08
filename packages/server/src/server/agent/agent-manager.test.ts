@@ -11658,57 +11658,81 @@ test("usage session is a pure read of the live adapter and disappears on close",
   expect(manager.usageSession(agent.id)).toBeNull();
 });
 
-test("initial native pages retain stable cursors while older history is loaded on demand", async () => {
-  let historyReads = 0;
-  class PagedSession extends TestAgentSession {
-    readonly initialTimeline = [
-      { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
-    ];
-    hasOlderHistory() {
-      return historyReads === 0;
-    }
-    async loadOlderHistory() {
-      historyReads++;
-      return [
-        {
-          item: {
-            type: "user_message" as const,
-            text: "<paseo-system>\ninternal\n</paseo-system>",
-          },
-        },
-        { item: { type: "assistant_message" as const, messageId: "older", text: "older" } },
+test.each(["create", "import"])(
+  "%s native pages retain stable cursors while older history is loaded on demand",
+  async (mode) => {
+    let historyReads = 0;
+    class PagedSession extends TestAgentSession {
+      readonly initialTimeline = [
+        { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
       ];
+      hasOlderHistory() {
+        return historyReads === 0;
+      }
+      async loadOlderHistory() {
+        historyReads++;
+        return [
+          {
+            item: {
+              type: "user_message" as const,
+              text: "<paseo-system>\ninternal\n</paseo-system>",
+            },
+          },
+          { item: { type: "assistant_message" as const, messageId: "older", text: "older" } },
+        ];
+      }
     }
-  }
-  class PagedClient extends TestAgentClient {
-    override async createSession(config: AgentSessionConfig) {
-      return new PagedSession(config);
+    class PagedClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig) {
+        return new PagedSession(config);
+      }
+      async importSession(
+        input: ImportProviderSessionInput,
+        context: ImportProviderSessionContext,
+      ) {
+        const session = new PagedSession(context.config);
+        const timeline = session.initialTimeline.splice(0);
+        return {
+          session,
+          config: context.config,
+          persistence: { provider: "codex" as const, sessionId: input.providerHandleId },
+          timeline,
+        };
+      }
     }
-  }
-  const manager = new AgentManager({ clients: { codex: new PagedClient() }, logger });
-  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
-    workspaceId: undefined,
-  });
-  try {
-    const recent = await manager.fetchTimelinePage(agent.id, { limit: 1 });
-    expect(historyReads).toBe(0);
-    expect(recent.rows.map((row) => row.item)).toEqual([
-      { type: "assistant_message", messageId: "recent", text: "recent" },
-    ]);
-    expect(recent.hasOlder).toBe(true);
-    const older = await manager.fetchTimelinePage(agent.id, {
-      direction: "before",
-      limit: 1,
-      cursor: { epoch: recent.epoch, seq: recent.startSeq! },
-    });
-    expect(historyReads).toBe(1);
-    expect(older.rows.map((row) => row.item)).toEqual([
-      { type: "assistant_message", messageId: "older", text: "older" },
-    ]);
-    expect(older.startSeq).toBeGreaterThan(0);
-    expect(older.hasOlder).toBe(false);
-    expect((await manager.fetchTimelinePage(agent.id, { limit: 1 })).endSeq).toBe(recent.endSeq);
-  } finally {
-    await manager.closeAgent(agent.id);
-  }
-});
+    const manager = new AgentManager({ clients: { codex: new PagedClient() }, logger });
+    const agent =
+      mode === "import"
+        ? await manager.importProviderSession({
+            provider: "codex",
+            providerHandleId: "paged-import",
+            cwd: process.cwd(),
+            workspaceId: "ws-import",
+          })
+        : await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+            workspaceId: undefined,
+          });
+    try {
+      const recent = await manager.fetchTimelinePage(agent.id, { limit: 1 });
+      expect(historyReads).toBe(0);
+      expect(recent.rows.map((row) => row.item)).toEqual([
+        { type: "assistant_message", messageId: "recent", text: "recent" },
+      ]);
+      expect(recent.hasOlder).toBe(true);
+      const older = await manager.fetchTimelinePage(agent.id, {
+        direction: "before",
+        limit: 1,
+        cursor: { epoch: recent.epoch, seq: recent.startSeq! },
+      });
+      expect(historyReads).toBe(1);
+      expect(older.rows.map((row) => row.item)).toEqual([
+        { type: "assistant_message", messageId: "older", text: "older" },
+      ]);
+      expect(older.startSeq).toBeGreaterThan(0);
+      expect(older.hasOlder).toBe(false);
+      expect((await manager.fetchTimelinePage(agent.id, { limit: 1 })).endSeq).toBe(recent.endSeq);
+    } finally {
+      await manager.closeAgent(agent.id);
+    }
+  },
+);
