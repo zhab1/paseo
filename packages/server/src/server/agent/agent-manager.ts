@@ -1435,8 +1435,8 @@ export class AgentManager {
       ? {
           ...resumeOptions,
           purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
-          // Reading a finished chat must not rebuild its native execution context.
-          // Running/unknown records still recover immediately after a daemon crash.
+          // The provider must confirm native inactivity before deferring these
+          // candidates; saved display state alone cannot prove a turn has ended.
           deferNativeResume:
             !record.archivedAt && (record.lastStatus === "idle" || record.lastStatus === "closed"),
         }

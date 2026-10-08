@@ -3866,17 +3866,48 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private async shouldResumeNativeThread(): Promise<boolean> {
-    if (!this.deferNativeResume) return true;
-    if (!this.goalsEnabled) return false;
+    if (!this.deferNativeResume || this.asyncQuestions.pending().length) return true;
     try {
-      const response = toObjectRecord(
-        await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
-      );
-      return toObjectRecord(response?.goal)?.status === "active";
+      // Paseo's last saved status can lag an acknowledged native turn/start.
+      const latest = await readCodexLatestTurn(this.client!, this.currentThreadId!);
+      if (!latest.latestStatus || latest.latestStatus === "running") return true;
+      // Defer only leaf threads. Resuming parents preserves native child/goal
+      // recovery without walking every child's state during a history request.
+      for (const archived of [false, true]) {
+        const children = toObjectRecord(
+          await this.client!.request(
+            "thread/list",
+            {
+              ancestorThreadId: this.currentThreadId,
+              sourceKinds: ["subAgentThreadSpawn"],
+              modelProviders: [],
+              useStateDbOnly: true,
+              archived,
+              limit: 1,
+            },
+            5_000,
+          ),
+        );
+        if (!Array.isArray(children?.data) || children.data.length || children.nextCursor)
+          return true;
+      }
+      if (this.goalsEnabled) {
+        const response = toObjectRecord(
+          await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
+        );
+        if (
+          !response ||
+          !("goal" in response) ||
+          toObjectRecord(response.goal)?.status === "active"
+        )
+          return true;
+      }
+      return false;
     } catch (error) {
-      // An idle display state can fall between autonomous goal turns. Preserve
-      // recovery if the native goal cannot be checked without loading the thread.
-      this.logger.warn({ err: error }, "Could not check saved Codex goal before deferred resume");
+      this.logger.warn(
+        { err: error },
+        "Could not confirm saved Codex thread is idle before resume",
+      );
       return true;
     }
   }

@@ -1926,6 +1926,7 @@ describe("Codex app-server provider", () => {
 
   test("reads an idle session without loading native context, then resumes on the next prompt", async () => {
     const appServer = createFakeCodexAppServer({
+      "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
       "thread/loaded/list": () => ({ data: [] }),
       "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
       "thread/read": () => ({
@@ -1975,6 +1976,7 @@ describe("Codex app-server provider", () => {
     let loaded = false;
     let sandbox: unknown;
     const appServer = createFakeCodexAppServer({
+      "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
       "thread/loaded/list": () => ({ data: loaded ? ["archived-thread-id"] : [] }),
       "thread/resume": () => {
         loaded = true;
@@ -2010,6 +2012,7 @@ describe("Codex app-server provider", () => {
     "preserves goal recovery when deferring a saved session: %s",
     async (status, resumed) => {
       const appServer = createFakeCodexAppServer({
+        "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
         "thread/loaded/list": () => ({ data: [] }),
         "thread/goal/get": () => {
           if (status === "unavailable") return Promise.reject(new Error("goal unavailable"));
@@ -2030,6 +2033,77 @@ describe("Codex app-server provider", () => {
         );
         expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
           resumed,
+        );
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each(["inProgress", "unknown", "unavailable"])(
+    "resumes native work despite stale idle display state: %s",
+    async (status) => {
+      const appServer = createFakeCodexAppServer({
+        "thread/loaded/list": () => ({ data: [] }),
+        "thread/turns/list": () =>
+          status === "unavailable"
+            ? Promise.reject(new Error("turn metadata unavailable"))
+            : { data: [{ id: "accepted-turn", status }] },
+        "thread/resume": () => ({
+          thread: {
+            id: "archived-thread-id",
+            turns: [{ id: "accepted-turn", status: "inProgress" }],
+          },
+        }),
+      });
+      const session = await createProviderWithFakeAppServer(appServer).resumeSession(
+        archivedThreadHandle(),
+        undefined,
+        undefined,
+        { deferNativeResume: true, loadHistory: false },
+      );
+      try {
+        expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+          true,
+        );
+        expect(session.getActiveTurnId?.()).toBe("accepted-turn");
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each([false, true, "unavailable"] as const)(
+    "keeps parent recovery when saved descendants may have goals: %s",
+    async (archived) => {
+      const appServer = createFakeCodexAppServer({
+        "thread/loaded/list": () => ({ data: [] }),
+        "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
+        "thread/list": (params) => {
+          if (archived === "unavailable") return Promise.reject(new Error("children unavailable"));
+          return {
+            data:
+              (params as { archived: boolean }).archived === archived
+                ? [{ id: "child-with-goal" }]
+                : [],
+            nextCursor: null,
+          };
+        },
+        "thread/goal/get": () => ({ goal: null }),
+        "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+      });
+      const provider = createProviderWithFakeAppServer(appServer);
+      castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+        Promise.resolve(true);
+      const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        deferNativeResume: true,
+        loadHistory: false,
+      });
+      try {
+        expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+          true,
         );
         appServer.assertNoErrors();
       } finally {
