@@ -379,13 +379,15 @@ initializing → idle ⇄ running
 `ManagedAgent` is a discriminated union over those lifecycle tags. Notes:
 
 - **AgentManager** is the source of truth for agent state and broadcasts updates to all subscribers
-- Timeline sequence allocation is append-only with epochs (each run starts a new epoch). The one
+- Live timeline sequence allocation is append-only within an epoch. Codex resumes with older
+  native history reserve positive positions before the initial page, so scrolling back does not
+  renumber existing rows or invalidate live cursors. The one
   permitted in-place enrichment adds a provider message id to the manager-owned row for an accepted
   prompt; it preserves the row's sequence, content, and timestamp. Storage uses sequence numbers for
   client-side dedup; the default fetch page is 200 items.
 - Timeline row `timestamp` values are canonical daemon-owned timestamps. Providers may supply original replay timestamps, but clients must not guess timestamp trust or hide time UI based on local clock heuristics.
 - Events stream to connected clients in real time; correctness is backed by authoritative timeline fetches and paged-to-completion catch-up.
-- Agent state persists to `$PASEO_HOME/agents/{cwd-with-dashes}/{agent-id}.json`. Timeline rows are runtime memory; provider history is the durable transcript authority and resumed agents rebuild from it. That storage path is derived from `cwd`, not from workspace id.
+- Agent state persists to `$PASEO_HOME/agents/{cwd-with-dashes}/{agent-id}.json`. Fetched timeline rows use the disposable `$PASEO_HOME/cache/timeline.sqlite` projection cache; provider history remains the durable transcript authority. The cache is rebuilt after a daemon restart. The agent JSON path is derived from `cwd`, not from workspace id.
 
 ## Right-sidebar boundary: directory-backed vs workspace-owned
 

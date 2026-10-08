@@ -5,10 +5,12 @@ Agent chat delivery has two paths:
 1. **Live stream** — `agent_stream` WebSocket messages for immediacy. These may be delta-shaped lifecycle updates.
 2. **Authoritative history** — `fetch_agent_timeline_request` for correctness. This always returns full projected timeline items, never lifecycle deltas.
 
-The daemon retains projected items in memory. Each source event advances the stream sequence,
+The daemon caches fetched projected items in a local SQLite file. Each source event advances the stream sequence,
 then replaces the previous tool state or merges into the current text item. Intermediate payloads
 are never retained for history or catch-up. Provider history is the durable transcript authority
-and rebuilds the projection when an agent resumes.
+and rebuilds the projection when an agent resumes. Routine appends read only the previous row
+and, for tool/plugin updates, the matching identity. Fetches load only the selected message
+bodies; unfetched history stays with the provider. Full export/search can explicitly request all rows.
 
 The invariants are:
 
@@ -27,13 +29,30 @@ Codex CLI 0.153.4+ is required for native history paging; older builds must be u
 Threads still marked `legacy` use native turn pages with one full turn per request because Codex's
 item API requires migrated storage. A large legacy turn can still allocate a large response;
 native migration is required for the 40-item working-set bound. Saved history stays unchanged.
-Codex hydration reads thread metadata and turn summaries without bodies, then consumes native
-`thread/items/list` pages of 40 items. Each mapped tool output is bounded before it enters the
-pending replay, so raw outputs from earlier pages can be released. Turns created during the scan
-remain part of restored history without relying on live notifications. Deferred child reads stop at
-their saved completed-turn boundary. Assistant timestamps still come from the canonical rollout
-reader, since native item-page timestamps can differ. This bounds the raw replay working set by a
-page; the completed projection still grows with retained conversation history.
+Codex hydration reads thread metadata and turn summaries without bodies, then fetches at most
+200 native items, newest first, in requests of 40. Scrolling before that window consumes the next
+opaque native cursor and prepends another page. There is no 200-item scrollback cutoff. Each mapped
+tool output is bounded before retention. Deferred child reads stop at their saved completed-turn
+boundary. Original item timestamps, native item-envelope timestamps, and turn timestamps are used
+in that order; restoring timestamps does not scan the rollout file.
+
+A resumed timeline with older pages starts at sequence `2 ** 40`, leaving room for stable positive
+backward cursors. Codex child timelines reserve those positions from creation, so deferred history
+can be prepended without loading and copying all their live output. Each older page lowers the
+minimum sequence without changing the live tail.
+Config-only session reloads preserve native paging cursors and rewind targets along with the cached
+timeline; a fresh history reload starts a new epoch from the latest native page.
+
+The Codex adapter releases its native process after 60 seconds idle. It verifies loaded root and
+child thread status, background terminals and, when enabled, active goals, and preserves runtimes
+with active turns, pending requests or approvals. An unavailable native safety check keeps the
+runtime attached. The next turn reconnects the same saved thread without replaying
+the already cached history. A failed idle shutdown blocks a second writer instead of spawning one.
+
+Mobile clients retain the fork's inline timestamp presentation. On reconnect, a canonical row
+containing both previously seen and new text is a full replacement and keeps its timestamp;
+only a genuinely separate earlier fragment suppresses a repeated stamp. This does not change
+the official client's Markdown block rendering or pagination protocol.
 
 The existing Codex connection-to-subscription handoff remains a separate delivery gap:
 `establishConnection()` finishes hydration before `AgentManager.registerSession()` subscribes.

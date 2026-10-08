@@ -578,7 +578,10 @@ export async function holdAssistantStream(page: Page, agentId: string) {
   return {
     waitForInitialTimeline: () => initialTimeline,
     async showThrough(prefix: string): Promise<void> {
-      while (forwardedText.length < prefix.length) {
+      // Count reply characters, keeping the fork's display prefix on the actual wire.
+      const body = () =>
+        forwardedText.replace(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\n\n/, "");
+      while (body().length < prefix.length) {
         const frame = pending.shift();
         if (!frame) {
           await new Promise<void>((resolve) => {
@@ -589,7 +592,7 @@ export async function holdAssistantStream(page: Page, agentId: string) {
         forwardedText += frame.text;
         frame.forward();
       }
-      if (forwardedText !== prefix) {
+      if (body() !== prefix) {
         throw new Error(
           `Stream did not stop at ${JSON.stringify(prefix)}: ${JSON.stringify(forwardedText)}`,
         );

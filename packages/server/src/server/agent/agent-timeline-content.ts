@@ -2,6 +2,8 @@ import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 
 const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
+// Initial native history page and child preview size; older history remains pageable.
+export const AGENT_TIMELINE_ITEM_LIMIT = 200;
 export const PLUGIN_TIMELINE_DATA_MAX_BYTES = 64 * 1024;
 
 function copyContentPrefix(content: string, length = TOOL_CALL_CONTENT_MAX_LENGTH): string {

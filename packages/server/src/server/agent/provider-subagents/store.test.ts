@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { PAGED_HISTORY_ORIGIN } from "../agent-timeline-store.js";
 import { ProviderSubagentStore } from "./store.js";
 import type { ImportedTimelineEntry } from "../agent-sdk-types.js";
 
@@ -40,8 +41,9 @@ describe("ProviderSubagentStore", () => {
       store.fetchTimeline("parent", "child", {
         cursor: { epoch: before.epoch, seq: 0 },
         direction: "after",
-      }).staleCursor,
+      }).gap,
     ).toBe(true);
+    expect(store.fetchTimeline("parent", "child").epoch).toBe(before.epoch);
     expect(store.fetchTimeline("parent", "child", { limit: 1 }).hasOlder).toBe(true);
   });
 
@@ -125,7 +127,7 @@ describe("ProviderSubagentStore", () => {
     ]);
     expect(subagents.fetchTimeline("parent-a", "child-1").rows).toMatchObject([
       {
-        seq: 1,
+        seq: PAGED_HISTORY_ORIGIN,
         timestamp: "2026-07-12T10:00:01.000Z",
         item: { type: "assistant_message", text: "Found it." },
       },

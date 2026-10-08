@@ -10,6 +10,7 @@ import { createMessageCollector } from "../test-utils/message-collector.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import type { AgentClient, AgentStreamEvent } from "./agent-sdk-types.js";
+import { PAGED_HISTORY_ORIGIN } from "./agent-timeline-store.js";
 
 test("projects Codex child history and confines old-client degradation to the child transcript", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-projected-contract-"));
@@ -68,19 +69,21 @@ test("projects Codex child history and confines old-client degradation to the ch
           ctx.daemon.daemon.agentManager.fetchProviderSubagentTimeline(agent.id, "child-thread")
             .window.maxSeq,
       )
-      .toBe(3);
+      .toBe(PAGED_HISTORY_ORIGIN + 2);
     const child = await ctx.client.fetchProviderSubagentTimeline(agent.id, "child-thread", {
       limit: 1,
     });
     expect(child.projection).toBe("projected");
-    expect(child.rows).toMatchObject([{ seqStart: 1, seqEnd: 3, item: { text: "ABC" } }]);
+    expect(child.rows).toMatchObject([
+      { seqStart: PAGED_HISTORY_ORIGIN, seqEnd: PAGED_HISTORY_ORIGIN + 2, item: { text: "ABC" } },
+    ]);
     const catchUp = await ctx.client.fetchProviderSubagentTimeline(agent.id, "child-thread", {
       direction: "after",
-      cursor: { epoch: child.epoch, seq: 1 },
+      cursor: { epoch: child.epoch, seq: PAGED_HISTORY_ORIGIN },
     });
     expect(catchUp.rows).toMatchObject([{ item: { text: "ABC" } }]);
     const oldChild = await legacy.fetchProviderSubagentTimeline(agent.id, "child-thread");
-    expect(oldChild.rows).toMatchObject([{ seq: 3, item: { text: "ABC" } }]);
+    expect(oldChild.rows).toMatchObject([{ seq: PAGED_HISTORY_ORIGIN + 2, item: { text: "ABC" } }]);
     expect(oldChild.hasOlder).toBe(false);
     expect(oldChild.hasNewer).toBe(false);
     expect((await legacy.listProviderSubagents(agent.id)).subagents).toHaveLength(1);

@@ -26,27 +26,32 @@ export function pagedHistoryRequest(request: Request): Request {
       return { ...response, thread: { ...thread, turns: [] } };
     }
     const turns = saved.get(threadId);
-    if (turns && method === "thread/turns/list" && input.sortDirection === "asc") {
+    if (turns && method === "thread/turns/list") {
       const start = Number(input.cursor ?? 0);
       const end = start + Number(input.limit ?? 100);
       return {
-        data: turns.slice(start, end).map((turn) =>
-          Object.assign({}, turn, {
-            items: input.itemsView === "full" ? (turn.items ?? []) : [],
-          }),
-        ),
+        data: (input.sortDirection === "desc" ? turns.toReversed() : turns)
+          .slice(start, end)
+          .map((turn) =>
+            Object.assign({}, turn, {
+              items: input.itemsView === "full" ? (turn.items ?? []) : [],
+            }),
+          ),
         nextCursor: end < turns.length ? String(end) : null,
       };
     }
     if (turns && method === "thread/items/list") {
-      const items = turns.flatMap((turn) =>
-        (Array.isArray(turn.items) ? turn.items : []).map((item) => ({
-          turnId: turn.id,
-          item,
-          startedAtMs: null,
-          completedAtMs: null,
-        })),
-      );
+      const items = turns
+        .filter((turn) => !input.turnId || turn.id === input.turnId)
+        .flatMap((turn) =>
+          (Array.isArray(turn.items) ? turn.items : []).map((item) => ({
+            turnId: turn.id,
+            item,
+            startedAtMs: null,
+            completedAtMs: null,
+          })),
+        );
+      if (input.sortDirection === "desc") items.reverse();
       const start = Number(input.cursor ?? 0);
       const end = start + Number(input.limit ?? 40);
       return { data: items.slice(start, end), nextCursor: end < items.length ? String(end) : null };

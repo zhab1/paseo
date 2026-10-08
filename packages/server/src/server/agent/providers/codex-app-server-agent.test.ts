@@ -4904,6 +4904,70 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("continues older pages and preserves rewind targets across a config-only reload", async () => {
+    const session = createSession();
+    const request = vi.fn(async (method: string, params: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+      if (method === "thread/turns/list")
+        return { data: [{ id: "turn", status: "completed" }], nextCursor: null };
+      if (method !== "thread/items/list") return { data: [], nextCursor: null };
+      const offset = Number(input.cursor ?? 0);
+      const count = Math.min(Number(input.limit), 450 - offset);
+      const data = [];
+      for (let i = 0; i < count; i++)
+        data.push({
+          turnId: "turn",
+          item: {
+            type: "userMessage",
+            id: `user-${449 - offset - i}`,
+            content: [{ type: "text", text: `Message ${449 - offset - i}` }],
+          },
+        });
+      return { data, nextCursor: offset + count < 450 ? String(offset + count) : null };
+    });
+    session.client = { request };
+    await asInternals(session).loadPersistedHistory(session.client);
+    expect(await session.loadOlderHistory?.()).toHaveLength(200);
+    const saved = session.describePersistence()!;
+    const reloaded = new CodexAppServerAgentSession(
+      createConfig(),
+      saved,
+      createTestLogger(),
+      async () => {
+        throw new Error("Unexpected native spawn");
+      },
+      {},
+      false,
+      false,
+      false,
+      undefined,
+      "interactive",
+      false,
+    );
+    const internals = reloaded as unknown as CodexTestSession;
+    internals.connectionState = "connected";
+    internals.client = { request };
+    expect(reloaded.hasOlderHistory()).toBe(true);
+    expect(asInternals(internals).codexUserMessageTurns().resolve("user-50")).toMatchObject({
+      turnId: "turn",
+    });
+    const remaining = await reloaded.loadOlderHistory();
+    expect(remaining).toHaveLength(50);
+    expect(remaining[0].item).toMatchObject({ messageId: "user-0" });
+    expect(remaining.at(-1)?.item).toMatchObject({ messageId: "user-49" });
+    expect(reloaded.hasOlderHistory()).toBe(false);
+    const fresh = new CodexAppServerAgentSession(
+      createConfig(),
+      saved,
+      createTestLogger(),
+      async () => {
+        throw new Error("Unexpected native spawn");
+      },
+    );
+    expect(fresh.hasOlderHistory()).toBe(false);
+  });
+
   test("loads Codex persisted history from the app-server thread", async () => {
     const session = createSession();
     const requests: Array<{ method: string; params: unknown }> = [];
@@ -4945,9 +5009,11 @@ describe("Codex app-server provider", () => {
       history.push(event);
     }
 
-    expect(requests.map((request) => [request.method, request.params])).toEqual([
-      ["thread/read", { threadId: "test-thread", includeTurns: false }],
-    ]);
+    expect(
+      requests
+        .filter((request) => request.method !== "thread/list")
+        .map((request) => [request.method, request.params]),
+    ).toEqual([["thread/read", { threadId: "test-thread", includeTurns: false }]]);
     expect(history).toEqual([
       {
         type: "timeline",
@@ -5934,65 +6000,39 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
-  test("uses per-message rollout timestamps before a shared Codex turn timestamp", async () => {
-    const rolloutDir = await mkdtemp(path.join(tmpdir(), "paseo-codex-rollout-"));
-    const rolloutPath = path.join(rolloutDir, "rollout.jsonl");
-    writeFileSync(
-      rolloutPath,
-      [
-        {
-          timestamp: "2026-09-20T14:11:20.000Z",
-          type: "response_item",
-          payload: {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "First" }],
-          },
-        },
-        {
-          timestamp: "2026-09-20T14:11:29.000Z",
-          type: "response_item",
-          payload: {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "Second" }],
-          },
-        },
-      ]
-        .map((entry) => JSON.stringify(entry))
-        .join("\n"),
-    );
+  test("uses native envelope timestamps without opening the rollout file", async () => {
     const session = createSession();
     session.client = {
-      request: vi.fn(async () => ({
-        thread: {
-          path: rolloutPath,
-          turns: [
-            {
-              completedAt: 1_789_927_616,
-              items: [
-                { type: "agentMessage", id: "message-first", text: "First" },
-                { type: "agentMessage", id: "message-second", text: "Second" },
-              ],
-            },
-          ],
-        },
-      })),
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/read") return { thread: { path: "/unavailable/rollout.jsonl" } };
+        if (method === "thread/turns/list")
+          return { data: [{ id: "turn", completedAt: 1_789_927_616 }], nextCursor: null };
+        if (method === "thread/items/list")
+          return {
+            data: [
+              {
+                turnId: "turn",
+                item: { type: "agentMessage", id: "second", text: "Second" },
+                startedAtMs: Date.parse("2026-09-20T14:11:29Z"),
+              },
+              {
+                turnId: "turn",
+                item: { type: "agentMessage", id: "first", text: "First" },
+                startedAtMs: Date.parse("2026-09-20T14:11:20Z"),
+              },
+            ],
+            nextCursor: null,
+          };
+        return {};
+      }),
     };
-
-    try {
-      session.client!.request = pagedHistoryRequest(session.client!.request);
-      await asInternals(session).loadPersistedHistory(session.client);
-      const timestamps: Array<string | undefined> = [];
-      for await (const event of session.streamHistory()) {
-        if (event.type === "timeline" && event.item.type === "assistant_message") {
-          timestamps.push(event.timestamp);
-        }
-      }
-      expect(timestamps).toEqual(["2026-09-20T14:11:20.000Z", "2026-09-20T14:11:29.000Z"]);
-    } finally {
-      rmSync(rolloutDir, { recursive: true, force: true });
+    await asInternals(session).loadPersistedHistory(session.client);
+    const timestamps = [];
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline" && event.item.type === "assistant_message")
+        timestamps.push(event.timestamp);
     }
+    expect(timestamps).toEqual(["2026-09-20T14:11:20.000Z", "2026-09-20T14:11:29.000Z"]);
   });
 
   test("preserves Codex app-server assistant item ids in persisted history", async () => {

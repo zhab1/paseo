@@ -36,8 +36,8 @@ interface ProjectedWindowSelection {
   maxSeq: number | null;
 }
 
-export interface ProjectedTimelinePageSelection {
-  entries: TimelineProjectionEntry[];
+export interface ProjectedTimelinePageSelection<T = TimelineProjectionEntry> {
+  entries: T[];
   startSeq: number | null;
   endSeq: number | null;
   hasOlder: boolean;
@@ -460,11 +460,7 @@ function getTimelineBounds(
   };
 }
 
-function firstSourceSeqInRange(
-  entry: TimelineProjectionEntry,
-  startSeq: number,
-  endSeq: number,
-): number | null {
+function firstSourceSeqInRange(entry: PageEntry, startSeq: number, endSeq: number): number | null {
   for (const range of entry.sourceSeqRanges) {
     const firstSeq = Math.max(range.startSeq, startSeq);
     if (firstSeq <= Math.min(range.endSeq, endSeq)) return firstSeq;
@@ -472,25 +468,29 @@ function firstSourceSeqInRange(
   return null;
 }
 
-interface ProjectedEntryCandidate {
-  entry: TimelineProjectionEntry;
+type PageEntry = Pick<TimelineProjectionEntry, "seqStart" | "seqEnd" | "sourceSeqRanges">;
+
+interface ProjectedEntryCandidate<T> {
+  entry: T;
   index: number;
   firstSourceSeq: number;
 }
 
-function selectProjectedEntriesAfter(input: {
-  entries: readonly TimelineProjectionEntry[];
+function selectProjectedEntriesAfter<T extends PageEntry>(input: {
+  entries: readonly T[];
   startSeq: number;
   maxSeq: number;
   limit: number;
-}): { entries: TimelineProjectionEntry[]; endSeq: number | null } {
+}): { entries: T[]; endSeq: number | null } {
   const eligible = input.entries
     .map((entry, index) => ({
       entry,
       index,
       firstSourceSeq: firstSourceSeqInRange(entry, input.startSeq, input.maxSeq),
     }))
-    .filter((candidate): candidate is ProjectedEntryCandidate => candidate.firstSourceSeq !== null)
+    .filter(
+      (candidate): candidate is ProjectedEntryCandidate<T> => candidate.firstSourceSeq !== null,
+    )
     .sort((left, right) => left.firstSourceSeq - right.firstSourceSeq || left.index - right.index);
   const selected = input.limit === 0 ? eligible : eligible.slice(0, input.limit);
   const selectedEntries = selected
@@ -516,11 +516,11 @@ function selectProjectedEntriesAfter(input: {
   };
 }
 
-function selectProjectedEntriesBefore(input: {
-  entries: readonly TimelineProjectionEntry[];
+function selectProjectedEntriesBefore<T extends PageEntry>(input: {
+  entries: readonly T[];
   endSeq: number;
   limit: number;
-}): { entries: TimelineProjectionEntry[]; startSeq: number | null; hasOlder: boolean } {
+}): { entries: T[]; startSeq: number | null; hasOlder: boolean } {
   // Older history follows projected display order. Lifecycle updates can move an
   // entry's seqEnd without moving its display anchor, so seqStart keeps the full
   // projected item on exactly one backward page.
@@ -537,11 +537,11 @@ function selectProjectedEntriesBefore(input: {
   };
 }
 
-function selectProjectedEntriesTail(
-  projectedAll: TimelineProjectionEntry[],
+function selectProjectedEntriesTail<T extends PageEntry>(
+  projectedAll: readonly T[],
   limit: number,
   bounds: { minSeq: number; maxSeq: number },
-): ProjectedTimelinePageSelection {
+): ProjectedTimelinePageSelection<T> {
   const start = limit === 0 ? 0 : Math.max(0, projectedAll.length - limit);
   const selected = projectedAll.slice(start);
   // An older tool may finish inside this source window. Replace the client's
@@ -565,9 +565,24 @@ export function selectProjectedTimelinePage(input: {
   cursorSeq?: number;
   limit?: number;
 }): ProjectedTimelinePageSelection {
+  return selectProjectedEntriesPage({
+    ...input,
+    bounds: input.bounds ?? getTimelineBounds(input.rows),
+    entries: projectTimelineRows({ rows: input.rows, mode: "projected" }),
+  });
+}
+
+/** Select using sequence metadata, without reading cached message bodies. */
+export function selectProjectedEntriesPage<T extends PageEntry>(input: {
+  entries: readonly T[];
+  bounds: { minSeq: number; maxSeq: number } | null;
+  direction: TimelineLimitDirection;
+  cursorSeq?: number;
+  limit?: number;
+}): ProjectedTimelinePageSelection<T> {
   const limit = input.limit === undefined ? 0 : Math.max(0, Math.floor(input.limit));
-  const bounds = input.bounds ?? getTimelineBounds(input.rows);
-  const projectedAll = projectTimelineRows({ rows: input.rows, mode: "projected" });
+  const bounds = input.bounds;
+  const projectedAll = input.entries;
   if (!bounds) {
     return {
       entries: [],

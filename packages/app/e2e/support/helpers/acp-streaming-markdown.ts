@@ -48,7 +48,10 @@ export async function requestAcpMarkdown(agent: AcpMarkdownAgent): Promise<void>
 
 export async function expectAcpMarkdown(page: Page, count: number): Promise<void> {
   // The message container has no semantic role; text and links inside it are user-facing assertions.
-  const messages = page.getByTestId("assistant-message");
+  const timestamp = /^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:$/;
+  const blocks = page.getByTestId("assistant-message");
+  await expect(blocks.filter({ hasText: timestamp })).toHaveCount(count);
+  const messages = blocks.filter({ hasNotText: timestamp });
   await expect(messages).toHaveCount(count);
   for (let index = 0; index < count; index++) {
     const message = messages.nth(index);

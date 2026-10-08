@@ -128,7 +128,12 @@ export async function expectWholeCompletedCard(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "Assistant complete", exact: true })).toHaveCount(
     1,
   );
-  await expect(page.getByText(ASSISTANT_TEXT, { exact: true })).toBeVisible();
+  const card = page.getByText(ASSISTANT_TEXT, { exact: false });
+  await expect(card).toBeVisible();
+  // Plugins receive the same timestamp-prefixed body as the default mobile renderer.
+  expect(
+    (await card.textContent())?.replace(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\s+/, ""),
+  ).toBe(ASSISTANT_TEXT);
   await expect(page.getByTestId("assistant-message")).toHaveCount(0);
 }
 

@@ -1,3 +1,4 @@
+import { CachedTimelineProjection, type TimelineCache } from "./timeline-cache.js";
 import { randomUUID } from "node:crypto";
 import {
   TimelineProjection,
@@ -22,11 +23,13 @@ export interface SeedAgentTimelineOptions {
 
 interface AgentTimelineState {
   epoch: string;
-  projection: TimelineProjection;
+  projection: TimelineProjection | CachedTimelineProjection;
   minSeq: number;
   nextSeq: number;
 }
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
+// Leave stable positive cursor positions for native history fetched backwards.
+export const PAGED_HISTORY_ORIGIN = 2 ** 40;
 function cloneRow<T extends AgentTimelineRow>(row: T): T {
   return { ...row };
 }
@@ -41,12 +44,14 @@ function getPriorAssistantMessageIds(
     ),
   );
   const priorAssistantMessageIds = new Set<string>();
+  const selectedAnchors = new Set(page.entries.map((entry) => entry.seqStart));
   for (const row of rows) {
     if (page.startSeq === null || row.seqStart >= page.startSeq) break;
     if (
       row.item.type === "assistant_message" &&
       row.item.messageId &&
-      pageMessageIds.has(row.item.messageId)
+      pageMessageIds.has(row.item.messageId) &&
+      !selectedAnchors.has(row.seqStart)
     )
       priorAssistantMessageIds.add(row.item.messageId);
   }
@@ -55,6 +60,9 @@ function getPriorAssistantMessageIds(
 
 export class InMemoryAgentTimelineStore {
   private readonly states = new Map<string, AgentTimelineState>();
+  private readonly historyLoads = new Map<string, Promise<void>>();
+
+  constructor(private readonly cache?: TimelineCache) {}
 
   has(agentId: string): boolean {
     return this.states.has(agentId);
@@ -66,18 +74,25 @@ export class InMemoryAgentTimelineStore {
       ? options.rows.map(cloneRow)
       : this.buildRowsFromItems(options?.items ?? [], options?.nextSeq ?? 1, timestamp);
     const nextSeq = rows.reduce((next, row) => Math.max(next, row.seq + 1), options?.nextSeq ?? 1);
-    const projection = new TimelineProjection();
+    this.delete(agentId);
+    const epoch = options?.epoch ?? randomUUID();
+    const projection = this.cache
+      ? new CachedTimelineProjection(this.cache, `${agentId}:${epoch}`)
+      : new TimelineProjection();
     for (const row of rows) projection.append(row);
     this.states.set(agentId, {
-      epoch: options?.epoch ?? randomUUID(),
+      epoch,
       projection,
-      minSeq: projection.getRows()[0]?.seqStart ?? 0,
+      minSeq: projection.getRows()[0]?.seqStart ?? (nextSeq > 1 ? nextSeq : 0),
       nextSeq,
     });
   }
 
   delete(agentId: string): void {
+    const state = this.states.get(agentId);
+    if (state) this.cache?.delete(`${agentId}:${state.epoch}`);
     this.states.delete(agentId);
+    this.historyLoads.delete(agentId);
   }
 
   getItems(agentId: string): AgentTimelineItem[] {
@@ -86,13 +101,46 @@ export class InMemoryAgentTimelineStore {
       .map((row) => row.item);
   }
 
+  getItemCount(agentId: string): number {
+    const projection = this.requireState(agentId).projection;
+    return projection instanceof CachedTimelineProjection
+      ? projection.size
+      : projection.getRows().length;
+  }
+
+  prepend(
+    agentId: string,
+    items: readonly { item: AgentTimelineItem; timestamp?: string }[],
+  ): void {
+    if (!items.length) return;
+    const state = this.requireState(agentId);
+    const startSeq = state.minSeq - items.length;
+    if (startSeq < 1) throw new Error("History cursor space exhausted");
+    const rows = items.map((entry, index) => ({
+      seq: startSeq + index,
+      timestamp: entry.timestamp ?? new Date().toISOString(),
+      item: entry.item,
+    }));
+    if (state.projection instanceof CachedTimelineProjection) {
+      state.projection.prepend(rows);
+    } else {
+      const projection = new TimelineProjection();
+      for (const row of [...rows, ...state.projection.getRows()]) projection.append(row);
+      state.projection = projection;
+    }
+    state.minSeq = startSeq;
+  }
+
   getRows(agentId: string): ProjectedTimelineRow[] {
     return this.requireState(agentId).projection.getRows().map(cloneRow);
   }
 
   getSubmittedUserMessage(agentId: string, clientMessageId: string): AgentTimelineRow | null {
-    const row = this.requireState(agentId)
-      .projection.getRows()
+    const projection = this.requireState(agentId).projection;
+    if (projection instanceof CachedTimelineProjection)
+      return projection.getSubmittedUserMessage(clientMessageId);
+    const row = projection
+      .getRows()
       .find(
         (candidate) =>
           candidate.item.type === "user_message" &&
@@ -120,23 +168,27 @@ export class InMemoryAgentTimelineStore {
     const state = this.requireState(agentId);
     const direction = options?.direction ?? "tail";
     const cursor = options?.cursor;
-    const rows = state.projection.getRows();
+    const rows =
+      state.projection instanceof CachedTimelineProjection ? null : state.projection.getRows();
     const window = { minSeq: state.minSeq, maxSeq: state.nextSeq - 1, nextSeq: state.nextSeq };
     const staleCursor = cursor !== undefined && cursor.epoch !== state.epoch;
     const gap =
       !staleCursor &&
       direction === "after" &&
       cursor !== undefined &&
-      rows.length > 0 &&
+      state.minSeq > 0 &&
       cursor.seq < state.minSeq - 1;
     const reset = staleCursor || gap;
-    const page = selectProjectedTimelinePage({
-      rows,
+    const selection = {
       bounds: window,
-      direction: reset ? "tail" : direction,
+      direction: reset ? ("tail" as const) : direction,
       cursorSeq: cursor?.seq,
       limit: options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT,
-    });
+    };
+    const page =
+      state.projection instanceof CachedTimelineProjection
+        ? state.projection.selectPage(selection)
+        : selectProjectedTimelinePage({ ...selection, rows: rows! });
     return {
       epoch: state.epoch,
       direction,
@@ -148,9 +200,45 @@ export class InMemoryAgentTimelineStore {
       hasNewer: page.hasNewer,
       startSeq: page.startSeq,
       endSeq: page.endSeq,
-      priorAssistantMessageIds: getPriorAssistantMessageIds(rows, page),
+      priorAssistantMessageIds:
+        "priorAssistantMessageIds" in page
+          ? (page.priorAssistantMessageIds as string[])
+          : getPriorAssistantMessageIds(rows!, page),
       rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
     };
+  }
+
+  async fetchPage(
+    agentId: string,
+    options: AgentTimelineFetchOptions | undefined,
+    history: {
+      hasOlder(): boolean;
+      loadOlder(): Promise<readonly { item: AgentTimelineItem; timestamp?: string }[]>;
+    },
+  ): Promise<AgentTimelineFetchResult> {
+    const state = this.requireState(agentId);
+    let page = this.fetch(agentId, options);
+    const limit = options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT;
+    while (!page.staleCursor && history.hasOlder()) {
+      if (options?.direction === "after" || (limit > 0 && page.rows.length >= limit)) break;
+      let pending = this.historyLoads.get(agentId);
+      if (!pending) {
+        pending = Promise.resolve().then(async () => {
+          const entries = await history.loadOlder();
+          if (this.states.get(agentId) !== state) throw new Error("Agent history was reloaded");
+          this.prepend(agentId, entries);
+          return undefined;
+        });
+        this.historyLoads.set(agentId, pending);
+      }
+      try {
+        await pending;
+      } finally {
+        if (this.historyLoads.get(agentId) === pending) this.historyLoads.delete(agentId);
+      }
+      page = this.fetch(agentId, options);
+    }
+    return { ...page, hasOlder: page.hasOlder || history.hasOlder() };
   }
 
   append(
@@ -174,10 +262,19 @@ export class InMemoryAgentTimelineStore {
 
   getLastItem(agentId: string): AgentTimelineItem | null {
     const state = this.requireState(agentId);
+    if (state.projection instanceof CachedTimelineProjection) {
+      const row = state.projection.getLastItem();
+      return row?.seqEnd === state.nextSeq - 1 ? row.item : null;
+    }
     return state.projection.getRows().find((row) => row.seqEnd === state.nextSeq - 1)?.item ?? null;
   }
 
   getLastAssistantMessage(agentId: string): string | null {
+    const projection = this.requireState(agentId).projection;
+    if (projection instanceof CachedTimelineProjection) {
+      const item = projection.getLastItem("assistant_message")?.item;
+      return item?.type === "assistant_message" ? item.text : null;
+    }
     const row = this.requireState(agentId)
       .projection.getRows()
       .findLast((candidate) => candidate.item.type === "assistant_message");

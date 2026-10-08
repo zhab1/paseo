@@ -7745,7 +7745,7 @@ export class Session {
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
 
-      const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const fetchedControlTimeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction,
         cursor,
         limit: pageLimit,
@@ -8017,7 +8017,7 @@ export class Session {
       const supportsProjection = source
         ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
         : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-      const timeline = this.agentManager.fetchProviderSubagentTimeline(
+      const timeline = await this.agentManager.fetchProviderSubagentTimelinePage(
         msg.parentAgentId,
         msg.subagentId,
         {
@@ -8098,7 +8098,7 @@ export class Session {
         logger: this.sessionLogger,
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction: "tail",
         limit: 0,
       });

@@ -1,3 +1,4 @@
+import type { TimelineCache } from "./timeline-cache.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -59,6 +60,7 @@ import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
+  PAGED_HISTORY_ORIGIN,
   type SeedAgentTimelineOptions,
 } from "./agent-timeline-store.js";
 import type {
@@ -324,6 +326,7 @@ export interface AgentManagerOptions {
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   durableTimelineStore?: AgentTimelineStore;
+  timelineCache?: TimelineCache;
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
@@ -650,6 +653,13 @@ function buildExplicitTimelineSeedForRegister(
   };
 }
 
+function hasOlderProviderHistory(
+  session: AgentSession | null | undefined,
+  subagentId?: string,
+): boolean {
+  return session?.hasOlderHistory?.(subagentId) ?? false;
+}
+
 function buildImportedTimelineRows(entries: readonly ImportedTimelineEntry[]): AgentTimelineRow[] {
   const rows: AgentTimelineRow[] = [];
   for (const entry of entries) {
@@ -721,8 +731,8 @@ export class AgentManager {
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
-  private readonly timelineStore = new InMemoryAgentTimelineStore();
-  private readonly providerSubagents = new ProviderSubagentStore();
+  private readonly timelineStore: InMemoryAgentTimelineStore;
+  private readonly providerSubagents: ProviderSubagentStore;
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
@@ -760,6 +770,8 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
+    this.timelineStore = new InMemoryAgentTimelineStore(options.timelineCache);
+    this.providerSubagents = new ProviderSubagentStore(options.timelineCache);
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
@@ -898,7 +910,7 @@ export class AgentManager {
         continue;
       }
 
-      const len = this.timelineStore.getItems(agent.id).length;
+      const len = this.timelineStore.getItemCount(agent.id);
       totalItems += len;
       if (len > maxItemsPerAgent) {
         maxItemsPerAgent = len;
@@ -1186,6 +1198,7 @@ export class AgentManager {
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
+    await this.fetchTimelinePage(id, { direction: "tail", limit: 0 });
     if (this.durableTimelineStore) {
       return projectTimelineRows({
         rows: await this.durableTimelineStore.getCommittedRows(id),
@@ -1198,6 +1211,37 @@ export class AgentManager {
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
+  }
+
+  async fetchTimelinePage(
+    id: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    return this.runLifecycleMutation(id, async () => {
+      const agent = this.requireAgent(id);
+      return this.timelineStore.fetchPage(id, options, {
+        hasOlder: () => agent.session?.hasOlderHistory?.() ?? false,
+        loadOlder: async () =>
+          ((await agent.session?.loadOlderHistory?.()) ?? []).filter(
+            (entry) =>
+              entry.item.type !== "user_message" || !isSystemInjectedEnvelope(entry.item.text),
+          ),
+      });
+    });
+  }
+
+  async fetchProviderSubagentTimelinePage(
+    parentAgentId: string,
+    subagentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    return this.runLifecycleMutation(parentAgentId, async () => {
+      const agent = this.requirePublicAgent(parentAgentId);
+      return this.providerSubagents.fetchTimelinePage(parentAgentId, subagentId, options, {
+        hasOlder: () => agent.session?.hasOlderHistory?.(subagentId) ?? false,
+        loadOlder: () => agent.session?.loadOlderHistory?.(subagentId) ?? Promise.resolve([]),
+      });
+    });
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
@@ -1234,11 +1278,15 @@ export class AgentManager {
   }
 
   async hydrateProviderSubagentTimeline(parentAgentId: string, subagentId: string): Promise<void> {
-    const agent = this.requirePublicAgent(parentAgentId);
-    const session = agent.session;
-    const load = session?.getProviderSubagentHistory?.bind(session);
-    if (!load) return;
-    await this.providerSubagents.hydrateTimeline(parentAgentId, subagentId, () => load(subagentId));
+    return this.runLifecycleMutation(parentAgentId, async () => {
+      const agent = this.requirePublicAgent(parentAgentId);
+      const session = agent.session;
+      const load = session?.getProviderSubagentHistory?.bind(session);
+      if (!load) return;
+      await this.providerSubagents.hydrateTimeline(parentAgentId, subagentId, () =>
+        load(subagentId),
+      );
+    });
   }
 
   createAgent(
@@ -1542,6 +1590,7 @@ export class AgentManager {
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
     const preservedAttention = existing.attention;
+    this.refreshSessionPersistence(existing);
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
     const client = this.requireClient(provider);
@@ -3269,6 +3318,7 @@ export class AgentManager {
   }
 
   private async getLastAssistantMessageFromStores(agentId: string): Promise<string | null> {
+    if (!this.durableTimelineStore) return this.timelineStore.getLastAssistantMessage(agentId);
     const liveTimeline = this.timelineStore.getItems(agentId);
     const liveSegment = this.getLastAssistantMessageSegmentFromTimeline(liveTimeline);
     if (!this.durableTimelineStore) {
@@ -3508,6 +3558,7 @@ export class AgentManager {
       const now = new Date();
       const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
         agentId: resolvedAgentId,
+        historyCanPrepend: hasOlderProviderHistory(session),
         now,
         options,
       });
@@ -3616,6 +3667,7 @@ export class AgentManager {
 
   private async initializeAgentTimelineForRegister(params: {
     agentId: string;
+    historyCanPrepend: boolean;
     now: Date;
     options:
       | {
@@ -3641,7 +3693,13 @@ export class AgentManager {
       (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1);
     const timelineSeed = explicitTimelineSeed ?? durableTimelineSeed;
     if (timelineSeed || !this.timelineStore.has(agentId)) {
-      this.timelineStore.initialize(agentId, timelineSeed ?? { timestamp: now.toISOString() });
+      this.timelineStore.initialize(
+        agentId,
+        timelineSeed ?? {
+          timestamp: now.toISOString(),
+          nextSeq: params.historyCanPrepend ? PAGED_HISTORY_ORIGIN : undefined,
+        },
+      );
     }
     if (options?.timelineRows?.length) {
       this.enqueueDurableTimelineBulkInsert(agentId, options.timelineRows);
@@ -4065,7 +4123,10 @@ export class AgentManager {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    this.timelineStore.initialize(agent.id, {
+      timestamp: new Date().toISOString(),
+      nextSeq: hasOlderProviderHistory(agent.session) ? PAGED_HISTORY_ORIGIN : undefined,
+    });
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -5073,7 +5134,7 @@ export class AgentManager {
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        this.timelineStore.getItems(agentId),
+        () => this.timelineStore.getItems(agentId),
       );
     }
   }

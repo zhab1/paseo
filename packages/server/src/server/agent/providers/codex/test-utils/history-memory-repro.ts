@@ -56,7 +56,7 @@ const client = {
     return {
       data: Array.from({ length: end - start }, (_, offset) => ({
         turnId: "turn",
-        item: item(start + offset),
+        item: item(params.sortDirection === "desc" ? count - start - offset - 1 : start + offset),
         startedAtMs: null,
         completedAtMs: null,
       })),
@@ -73,9 +73,19 @@ global.gc?.();
 const retained = process.memoryUsage().heapUsed - baseline;
 let rows = 0;
 let maxOutput = 0;
+const callIds: string[] = [];
 for await (const event of session.streamHistory()) {
   if (event.type !== "timeline") continue;
   rows++;
+  if (event.item.type === "tool_call") callIds.push(event.item.callId);
   maxOutput = Math.max(maxOutput, event.item.detail?.output?.length ?? 0);
 }
-process.stdout.write(JSON.stringify({ retained, rows, maxOutput }));
+process.stdout.write(
+  JSON.stringify({
+    retained,
+    rows,
+    maxOutput,
+    firstCallId: callIds[0],
+    lastCallId: callIds.at(-1),
+  }),
+);

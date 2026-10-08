@@ -168,6 +168,9 @@ function readProviderTurnId(params: unknown): string | undefined {
 }
 
 export class CodexAppServerClient {
+  get hasPendingRequests(): boolean {
+    return this.pending.size > 0;
+  }
   private readonly rl: readline.Interface;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly requestHandlers = new Map<string, RequestHandler>();
