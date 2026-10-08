@@ -9,6 +9,11 @@
   ],
   "type": "module",
   "exports": {
+    "./validation/ws-outbound": {
+      "types": "./dist/validation/ws-outbound.d.ts",
+      "node": "./dist/validation/ws-outbound.node.js",
+      "default": "./dist/validation/ws-outbound.js"
+    },
     "./*": {
       "types": "./dist/*.d.ts",
       "default": "./dist/*.js"

@@ -1,12 +1,14 @@
 # Protocol Validation
 
-The client validates inbound WebSocket messages with a zod-aot generated validator instead of runtime Zod on the hot path. Zod remains the authoring source of truth for schemas and TypeScript types.
+Mobile and browser clients validate inbound WebSocket messages with a zod-aot generated validator. Node clients use runtime Zod. Both paths use the same schemas and TypeScript types.
 
 The reason is mobile performance. A captured 353 KB provider snapshot cost about 10.9 ms and 5.9 MB allocated per message for `JSON.parse` plus Zod on Hermes. After moving provider-model normalization out of the schema so zod-aot could compile the hot subtree, the generated validator path measured about 2.5 ms and 1.2 MB allocated.
 
 ## Runtime Path
 
-`packages/protocol/src/validation/ws-outbound.ts` is the shipped boundary. It calls the generated `WSOutboundMessageSchema.safeParse` and returns the validated data. It does not normalize, repair, or re-validate the generated result.
+The `@getpaseo/protocol/validation/ws-outbound` export selects `ws-outbound.node.ts` for Node and `ws-outbound.ts` elsewhere. Neither path normalizes, repairs, or re-validates the result.
+
+The generated validator's V8 compilation has a large native-memory peak: 1,000 tiny pong messages on Node 24.19.0 reached about 1.1 GiB RSS with only 62 MiB of JavaScript heap. Runtime Zod stayed near 146 MiB RSS. Built-in plugins use the client inside the daemon, so this cost affects the host even without opening a large conversation. Increasing the JavaScript heap does not address it. Keep Node on the runtime schema and retain the measured Hermes optimization for mobile.
 
 Generated validators preserve unknown keys where Zod object parsing strips them. The client dispatch path uses known `type` and payload fields, so this passthrough behavior is accepted for inbound messages. The wire format is unchanged.
 
