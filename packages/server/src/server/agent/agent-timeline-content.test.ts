@@ -64,9 +64,20 @@ describe("agent timeline content", () => {
   });
   test("preserves UTF-16 content when the limit splits a surrogate pair", () => {
     const prefix = "界".repeat(64 * 1024 - 1) + "\ud83d";
+    const expected = contentItems(prefix);
+    const notice = "\n\n[Content truncated]";
+    expected[0] = {
+      ...expected[0],
+      detail: { type: "plain_text", text: prefix.slice(0, 64 * 1024 - notice.length) + notice },
+    };
     expect(contentItems(prefix + "\ude00tail").map(limitAgentTimelineItemContent)).toEqual(
-      contentItems(prefix),
+      expected,
     );
+    const plainText = "界".repeat(64 * 1024 - notice.length - 1) + "\ud83d\ude00" + "x".repeat(30);
+    const limited = limitAgentTimelineItemContent(contentItems(plainText)[0]);
+    expect(limited).toMatchObject({
+      detail: { text: plainText.slice(0, 64 * 1024 - notice.length) + notice },
+    });
   });
 
   test("keeps content at and below the limit unchanged", () => {
@@ -97,7 +108,7 @@ describe("agent timeline content", () => {
     30_000,
   );
 
-  test("limits terminal input to the tool-call content budget", () => {
+  test("marks truncated plain-text tool content within the content budget", () => {
     const oversizedInput = "x".repeat(64 * 1024 + 1);
 
     const item = limitAgentTimelineItemContent({
@@ -113,6 +124,7 @@ describe("agent timeline content", () => {
       },
     });
 
+    expect(limitAgentTimelineItemContent(item)).toEqual(item);
     expect(item).toEqual({
       type: "tool_call",
       callId: "terminal-session-4242",
@@ -121,7 +133,7 @@ describe("agent timeline content", () => {
       error: null,
       detail: {
         type: "plain_text",
-        text: "x".repeat(64 * 1024),
+        text: "x".repeat(64 * 1024 - "\n\n[Content truncated]".length) + "\n\n[Content truncated]",
         icon: "square_terminal",
       },
     });

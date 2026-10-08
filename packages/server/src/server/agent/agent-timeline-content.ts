@@ -4,10 +4,10 @@ import type { JsonValue } from "@getpaseo/protocol/agent-types";
 const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
 export const PLUGIN_TIMELINE_DATA_MAX_BYTES = 64 * 1024;
 
-function copyContentPrefix(content: string): string {
+function copyContentPrefix(content: string, length = TOOL_CALL_CONTENT_MAX_LENGTH): string {
   // V8 slices can retain the entire oversized source. Copy the UTF-16 code units,
   // including a surrogate split at the existing character limit, into bounded storage.
-  return Buffer.from(content.slice(0, TOOL_CALL_CONTENT_MAX_LENGTH), "utf16le").toString("utf16le");
+  return Buffer.from(content.slice(0, length), "utf16le").toString("utf16le");
 }
 
 export function assertPluginTimelineDataSize(data: JsonValue): void {
@@ -48,11 +48,13 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
   ) {
     return item;
   }
+  const notice = "\n\n[Content truncated]";
   return {
     ...item,
     detail: {
       ...item.detail,
-      text: copyContentPrefix(item.detail.text),
+      text:
+        copyContentPrefix(item.detail.text, TOOL_CALL_CONTENT_MAX_LENGTH - notice.length) + notice,
     },
   };
 }
