@@ -3691,6 +3691,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly agentId?: string,
     private readonly initialResumePurpose: "interactive" | "history" = "interactive",
     private readonly loadHistoryOnResume: boolean = true,
+    private readonly deferNativeResume?: boolean,
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3834,7 +3835,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.loadSkills();
 
       if (this.currentThreadId) {
-        await this.ensureThreadLoaded();
+        if (await this.shouldResumeNativeThread()) await this.ensureThreadLoaded();
         if (this.loadHistoryOnResume && !this.historyRestored) {
           await this.loadPersistedHistory(this.client);
           this.historyRestored = true;
@@ -3861,6 +3862,22 @@ export class CodexAppServerAgentSession implements AgentSession {
         );
       }
       throw error;
+    }
+  }
+
+  private async shouldResumeNativeThread(): Promise<boolean> {
+    if (!this.deferNativeResume) return true;
+    if (!this.goalsEnabled) return false;
+    try {
+      const response = toObjectRecord(
+        await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
+      );
+      return toObjectRecord(response?.goal)?.status === "active";
+    } catch (error) {
+      // An idle display state can fall between autonomous goal turns. Preserve
+      // recovery if the native goal cannot be checked without loading the thread.
+      this.logger.warn({ err: error }, "Could not check saved Codex goal before deferred resume");
+      return true;
     }
   }
 
@@ -5035,6 +5052,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const client = this.client;
     const threadId = this.currentThreadId;
     if (client && threadId) {
+      if (this.deferNativeResume) await this.ensureThreadLoaded();
       const preset = MODE_PRESETS[modeId];
       const params: Record<string, unknown> = { threadId };
       if (this.providerOptions.approval_policy === undefined) {
@@ -7978,6 +7996,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       options?.purpose ?? "interactive",
       options?.loadHistory !== false,
+      options?.deferNativeResume === true,
     );
     await session.connect();
     return session;

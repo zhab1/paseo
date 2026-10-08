@@ -644,6 +644,8 @@ export interface AgentResumeSessionOptions {
   purpose?: AgentResumePurpose;
   /** Skip provider history when Paseo already has the durable timeline. */
   loadHistory?: boolean;
+  /** Known-idle sessions may read history before loading native context on the next turn. */
+  deferNativeResume?: boolean;
   /** See AgentCreateSessionOptions.configuredModelIds. */
   configuredModelIds?: readonly string[];
 }
