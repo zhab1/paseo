@@ -50,6 +50,8 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
+import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
+import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
 const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
@@ -11736,3 +11738,93 @@ test.each(["create", "import"])(
     }
   },
 );
+
+test("turn hooks explicitly load complete history without including a following turn", async () => {
+  let historyReads = 0;
+  const olderAllowed = deferred<void>();
+  const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
+  class PagedSession extends TestAgentSession {
+    readonly initialTimeline = [
+      { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
+    ];
+    hasOlderHistory() {
+      return historyReads === 0;
+    }
+    async loadOlderHistory() {
+      historyReads++;
+      await olderAllowed.promise;
+      return [{ item: { type: "user_message" as const, text: "Original prompt" } }];
+    }
+  }
+  const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const lifecycle: PluginLifecycle = {
+    emit(name, event) {
+      if (name === "agent.turn_ended") {
+        void Promise.resolve(typeof event === "function" ? event() : event)
+          .then((value) => hook.resolve(value as PluginLifecycleEvents["agent.turn_ended"]))
+          .catch(hook.reject);
+      }
+    },
+    async before(_name, request) {
+      return request;
+    },
+  };
+  const manager = new AgentManager({
+    clients: { codex: client },
+    pluginLifecycle: lifecycle,
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {});
+  try {
+    expect(historyReads).toBe(0);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: {
+        type: "user_message",
+        text: "Following turn",
+      },
+    });
+    olderAllowed.resolve();
+    const event = await hook.promise;
+    expect(event.timeline).toEqual([
+      { type: "user_message", text: "Original prompt" },
+      { type: "assistant_message", messageId: "recent", text: "recent" },
+    ]);
+    expect(historyReads).toBe(1);
+  } finally {
+    olderAllowed.resolve();
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("import retains a metadata title when the newest page contains no user prompt", async () => {
+  const client = new (class extends TestAgentClient {
+    async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+      return {
+        session: new TestAgentSession(context.config),
+        config: { ...context.config, title: "Original purpose" },
+        persistence: { provider: "codex" as const, sessionId: input.providerHandleId },
+        timeline: [{ item: { type: "assistant_message" as const, text: "Recent output" } }],
+      };
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.importProviderSession({
+    provider: "codex",
+    providerHandleId: "metadata-title",
+    cwd: process.cwd(),
+    workspaceId: "import",
+  });
+  try {
+    expect(agent.config.title).toBe("Original purpose");
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});

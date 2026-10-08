@@ -249,6 +249,47 @@ afterEach(async () => {
 });
 
 describe("PluginRuntime", () => {
+  it("resolves a lazy event once for subscribers and skips it when no hook is registered", async () => {
+    const runtime = createTestRuntime();
+    const event = vi.fn(async () => ({
+      agent: {
+        id: "a",
+        workspaceId: null,
+        parentAgentId: null,
+        provider: "codex",
+        cwd: "/workspace",
+        title: null,
+      },
+      turnId: "turn",
+      timeline: [],
+      outcome: { kind: "completed" as const },
+    }));
+    runtime.emit("agent.turn_ended", event);
+    await runtime.drainEvents();
+    expect(event).not.toHaveBeenCalled();
+    const directory = await createPlugin(
+      "lazy-hook",
+      `
+export default function contribute(server) {
+  server.on("agent.turn_ended", event => console.log("ended:" + event.turnId));
+  return () => {};
+}`,
+    );
+    try {
+      await runtime.startPlugin("first-hook", directory);
+      await runtime.startPlugin("second-hook", directory);
+      runtime.emit("agent.turn_ended", event);
+      await runtime.drainEvents();
+      expect(event).toHaveBeenCalledTimes(1);
+      for (const id of ["first-hook", "second-hook"]) {
+        await expect.poll(() => pluginMessages(runtime, id)).toContain("ended:turn");
+      }
+    } finally {
+      await runtime.stopPluginById("first-hook");
+      await runtime.stopPluginById("second-hook");
+    }
+  });
+
   it.each([
     { specifier: "@getpaseo/plugin", moduleDirectory: "shared" },
     { specifier: "@getpaseo/plugin", moduleDirectory: "server" },

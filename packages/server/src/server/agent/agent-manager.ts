@@ -5145,7 +5145,16 @@ export class AgentManager {
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        () => this.timelineStore.getItems(agentId),
+        async () => {
+          const current = this.timelineStore.fetch(agentId, { limit: 1 });
+          const snapshot = await this.fetchTimelinePage(agentId, {
+            direction: "before",
+            cursor: { epoch: current.epoch, seq: current.window.nextSeq },
+            limit: 0,
+          });
+          if (snapshot.staleCursor) throw new Error("Agent history was reloaded during turn hook");
+          return snapshot.rows.map((row) => row.item);
+        },
       );
     }
   }

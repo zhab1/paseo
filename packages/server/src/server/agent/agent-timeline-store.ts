@@ -217,8 +217,12 @@ export class InMemoryAgentTimelineStore {
     },
   ): Promise<AgentTimelineFetchResult> {
     const state = this.requireState(agentId);
-    let page = this.fetch(agentId, options);
     const limit = options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT;
+    // A complete snapshot is an explicit consumer request. While fetching its
+    // older pages, inspect only a bounded window instead of copying all rows
+    // after every prepend; materialize the full result once at the end.
+    const windowOptions = limit === 0 ? { ...options, limit: 1 } : options;
+    let page = this.fetch(agentId, windowOptions);
     while (!page.staleCursor && history.hasOlder()) {
       // Native pages can project to fewer rows. Return available rows immediately;
       // filling the display limit here can replay the entire remaining history.
@@ -238,8 +242,9 @@ export class InMemoryAgentTimelineStore {
       } finally {
         if (this.historyLoads.get(agentId) === pending) this.historyLoads.delete(agentId);
       }
-      page = this.fetch(agentId, options);
+      page = this.fetch(agentId, windowOptions);
     }
+    if (limit === 0) page = this.fetch(agentId, options);
     return { ...page, hasOlder: page.hasOlder || history.hasOlder() };
   }
 

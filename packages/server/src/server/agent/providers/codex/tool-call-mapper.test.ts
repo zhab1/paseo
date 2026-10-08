@@ -257,7 +257,7 @@ describe("codex tool-call mapper", () => {
 
     expect(item).toEqual({
       type: "tool_call",
-      callId: `activity-${kind}`,
+      callId: "codex-subagent:child-thread-1",
       name: "Sub-agent",
       status,
       error: null,

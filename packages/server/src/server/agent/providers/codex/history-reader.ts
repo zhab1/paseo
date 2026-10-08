@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AGENT_TIMELINE_ITEM_LIMIT } from "../../agent-timeline-content.js";
+import { resolveCreateAgentTitles } from "../../create-agent-title.js";
 import { CodexAppServerRpcError } from "./app-server-transport.js";
 
 interface HistoryClient {
@@ -26,6 +27,8 @@ const MetadataSchema = z.object({
   thread: z.object({
     path: z.string().nullable().optional(),
     historyMode: z.string().optional(),
+    name: z.string().nullable().optional(),
+    preview: z.string().optional(),
   }),
 });
 const PAGE_SIZE = 40;
@@ -184,6 +187,11 @@ export async function openCodexHistory(
   }
   return {
     path: metadata.thread.path,
+    title:
+      resolveCreateAgentTitles({
+        configTitle: metadata.thread.name,
+        initialPrompt: metadata.thread.preview,
+      }).provisionalTitle ?? undefined,
     get nextCursor() {
       return nextCursor;
     },

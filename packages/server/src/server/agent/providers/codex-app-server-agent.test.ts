@@ -3520,7 +3520,7 @@ describe("Codex app-server provider", () => {
       expect(events.at(-1)).toMatchObject({
         type: "timeline",
         item: {
-          callId: "call-settled-child",
+          callId: "codex-subagent:settled-child-thread",
           status: "completed",
           detail: { type: "sub_agent", log: "[Assistant] Late trailing output." },
         },
@@ -3848,7 +3848,7 @@ describe("Codex app-server provider", () => {
       ]);
       expect(result.timeline.findLast((item) => item.type === "tool_call")).toMatchObject({
         type: "tool_call",
-        callId: "spawn-child-early",
+        callId: "codex-subagent:child-thread-early",
         status: "completed",
         detail: {
           type: "sub_agent",
@@ -3913,10 +3913,10 @@ describe("Codex app-server provider", () => {
       const result = await resultPromise;
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(new Set(toolCalls.map((item) => item.callId))).toEqual(
-        new Set(["spawn-child-stable"]),
+        new Set(["codex-subagent:child-thread-stable"]),
       );
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-stable",
+        callId: "codex-subagent:child-thread-stable",
         status: "canceled",
         detail: {
           type: "sub_agent",
@@ -3957,7 +3957,7 @@ describe("Codex app-server provider", () => {
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(toolCalls.map((item) => item.status)).toEqual(["running", "completed"]);
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-fast",
+        callId: "codex-subagent:child-thread-fast",
         status: "completed",
       });
       appServer.assertNoErrors();
@@ -3995,7 +3995,7 @@ describe("Codex app-server provider", () => {
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(toolCalls.map((item) => item.status)).toEqual(["running", "completed", "completed"]);
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-late-compaction",
+        callId: "codex-subagent:child-late-compaction",
         status: "completed",
         detail: { type: "sub_agent", log: "[Compacted]" },
       });
@@ -4043,11 +4043,11 @@ describe("Codex app-server provider", () => {
       const result = await resultPromise;
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(new Set(toolCalls.map((item) => item.callId))).toEqual(
-        new Set(["spawn-legacy-tool-child"]),
+        new Set(["codex-subagent:legacy-tool-child"]),
       );
       const finalToolCall = toolCalls.at(-1);
       expect(finalToolCall).toMatchObject({
-        callId: "spawn-legacy-tool-child",
+        callId: "codex-subagent:legacy-tool-child",
         status: "completed",
         detail: { type: "sub_agent" },
       });
@@ -4116,10 +4116,10 @@ describe("Codex app-server provider", () => {
       .filter((event) => event.type === "timeline" && event.item.type === "tool_call")
       .map((event) => event.item);
     expect(new Set(beforeParentCompletes.map((item) => item.callId))).toEqual(
-      new Set(["spawn-child-root"]),
+      new Set(["codex-subagent:child-thread-root"]),
     );
     expect(beforeParentCompletes.at(-1)).toMatchObject({
-      callId: "spawn-child-root",
+      callId: "codex-subagent:child-thread-root",
       status: "running",
       detail: { type: "sub_agent", log: expect.stringContaining("Grandchild findings.") },
     });
@@ -4130,7 +4130,7 @@ describe("Codex app-server provider", () => {
     });
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
-      item: { callId: "spawn-child-root", status: "completed" },
+      item: { callId: "codex-subagent:child-thread-root", status: "completed" },
     });
   });
 
@@ -4192,7 +4192,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
       item: {
-        callId: "spawn-child-root",
+        callId: "codex-subagent:child-thread-root",
         detail: { type: "sub_agent", log: expect.stringContaining("Still nested.") },
       },
     });
@@ -4231,7 +4231,7 @@ describe("Codex app-server provider", () => {
     });
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
-      item: { callId: "spawn-reused-foreign-thread", status: "running" },
+      item: { callId: "codex-subagent:unmapped-child-thread", status: "running" },
     });
   });
 
@@ -4291,7 +4291,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
       item: {
-        callId: "spawn-legacy-envelope-child",
+        callId: "codex-subagent:legacy-envelope-child",
         status: "completed",
       },
     });
@@ -4315,7 +4315,7 @@ describe("Codex app-server provider", () => {
       const resultPromise = session.run("Delegate the investigation.");
       await appServer.waitForTurnStart();
       const child = waitForProviderSubagent(session, "legacy-only-child-thread");
-      const spawn = waitForTimelineToolCall(session, "spawn-legacy-only-child");
+      const spawn = waitForTimelineToolCall(session, "codex-subagent:legacy-only-child-thread");
 
       appServer.startsTurn({ threadId: "thread-1", turnId: "turn-with-legacy-only-child" });
       appServer.startsLegacyOnlySubAgent({
@@ -4340,7 +4340,7 @@ describe("Codex app-server provider", () => {
         turnId: "codex-turn-0",
         item: {
           type: "tool_call",
-          callId: "spawn-legacy-only-child",
+          callId: "codex-subagent:legacy-only-child-thread",
           status: "running",
           detail: {
             type: "sub_agent",
@@ -4826,7 +4826,8 @@ describe("Codex app-server provider", () => {
     expect(timelineItems.every((item) => item.type === "tool_call")).toBe(true);
     expect(
       timelineItems.every(
-        (item) => item.type === "tool_call" && item.callId === "spawn-child-compaction",
+        (item) =>
+          item.type === "tool_call" && item.callId === "codex-subagent:child-thread-compaction",
       ),
     ).toBe(true);
     expect(timelineItems.at(-1)).toMatchObject({
@@ -5757,59 +5758,116 @@ describe("Codex app-server provider", () => {
     expect(detail.log).toContain("Grandchild output finished");
   });
 
-  test("keeps one child card when its lifecycle spans three native history pages", async () => {
+  test.each([false, true])(
+    "keeps one child card across pages with live activity=%s",
+    async (live) => {
+      const session = createSession();
+      const activity = (kind: "started" | "interacted" | "interrupted") => ({
+        type: "subAgentActivity",
+        id: `activity-${kind}`,
+        kind,
+        agentThreadId: "history-child",
+        agentPath: "/root/history-child",
+      });
+      const padding = (prefix: string) =>
+        Array.from({ length: 205 }, (_, i) => ({
+          type: "agentMessage",
+          id: `${prefix}-${i}`,
+          text: `${prefix} ${i}`,
+        }));
+      const items = [
+        activity("started"),
+        ...padding("first"),
+        activity("interacted"),
+        ...padding("second"),
+        activity("interrupted"),
+      ];
+      session.client = {
+        request: pagedHistoryRequest(async (method, params) => {
+          if (method !== "thread/read") return {};
+          return {
+            thread: {
+              turns:
+                (params as { threadId?: string }).threadId === "test-thread"
+                  ? [{ id: "turn", status: "completed", items }]
+                  : [],
+            },
+          };
+        }),
+      };
+      await asInternals(session).loadPersistedHistory(session.client);
+      const store = new InMemoryAgentTimelineStore();
+      store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
+      for await (const event of session.streamHistory()) {
+        if (event.type === "timeline")
+          store.append("a", event.item, { timestamp: event.timestamp });
+      }
+      const cards = () =>
+        store.fetch("a", { limit: 0 }).rows.filter((row) => row.item.type === "tool_call");
+      const latestCard = cards()[0].item;
+      expect(latestCard).toMatchObject({ status: "canceled" });
+      if (live) {
+        session.subscribe((event) => {
+          if (event.type === "timeline") store.append("a", event.item);
+        });
+        asInternals(session).handleNotification("item/started", {
+          threadId: "test-thread",
+          turnId: "new-turn",
+          item: { ...activity("interacted"), id: "new-activity" },
+        });
+        expect(cards()).toHaveLength(1);
+      }
+      const currentCard = cards()[0].item;
+      let pages = 1;
+      while (session.hasOlderHistory()) {
+        store.prepend("a", await session.loadOlderHistory());
+        pages++;
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0].item).toEqual(currentCard);
+      }
+      expect(pages).toBe(3);
+    },
+  );
+
+  test("imports the native first prompt from metadata without paging back through history", async () => {
     const session = createSession();
-    const activity = (kind: "started" | "interacted" | "interrupted") => ({
-      type: "subAgentActivity",
-      id: `activity-${kind}`,
-      kind,
-      agentThreadId: "history-child",
-      agentPath: "/root/history-child",
-    });
-    const padding = (prefix: string) =>
-      Array.from({ length: 205 }, (_, i) => ({
-        type: "agentMessage",
-        id: `${prefix}-${i}`,
-        text: `${prefix} ${i}`,
-      }));
-    const items = [
-      activity("started"),
-      ...padding("first"),
-      activity("interacted"),
-      ...padding("second"),
-      activity("interrupted"),
-    ];
-    session.client = {
-      request: pagedHistoryRequest(async (method, params) => {
+    const items = Array.from({ length: 401 }, (_, i) => ({
+      type: "userMessage",
+      id: `u${i}`,
+      content: [{ type: "text", text: `Prompt ${i}` }],
+    }));
+    const request = vi.fn(
+      pagedHistoryRequest(async (method, params) => {
         if (method !== "thread/read") return {};
         return {
           thread: {
+            preview: "Original purpose",
             turns:
               (params as { threadId?: string }).threadId === "test-thread"
-                ? [{ id: "turn", status: "completed", items }]
+                ? [
+                    {
+                      id: "saved",
+                      status: "completed",
+                      items,
+                    },
+                  ]
                 : [],
           },
         };
       }),
-    };
+    );
+    session.client = { request };
     await asInternals(session).loadPersistedHistory(session.client);
-    const store = new InMemoryAgentTimelineStore();
-    store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
-    for await (const event of session.streamHistory()) {
-      if (event.type === "timeline") store.append("a", event.item, { timestamp: event.timestamp });
-    }
-    const cards = () =>
-      store.fetch("a", { limit: 0 }).rows.filter((row) => row.item.type === "tool_call");
-    const latestCard = cards()[0].item;
-    expect(latestCard).toMatchObject({ status: "canceled" });
-    let pages = 1;
-    while (session.hasOlderHistory()) {
-      store.prepend("a", await session.loadOlderHistory());
-      pages++;
-      expect(cards()).toHaveLength(1);
-      expect(cards()[0].item).toEqual(latestCard);
-    }
-    expect(pages).toBe(3);
+    const provider = new CodexAppServerAgentClient(createTestLogger());
+    vi.spyOn(provider, "resumeSession").mockResolvedValue(session);
+    const config = createConfig();
+    const imported = await provider.importSession(
+      { providerHandleId: "test-thread", cwd: config.cwd },
+      { config, storedConfig: config },
+    );
+    expect(imported.timeline).toHaveLength(200);
+    expect(imported.config.title).toBe("Original purpose");
+    expect(request.mock.calls.filter(([method]) => method === "thread/items/list")).toHaveLength(5);
   });
 
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {

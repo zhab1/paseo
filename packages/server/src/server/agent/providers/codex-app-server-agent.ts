@@ -511,6 +511,7 @@ interface PersistedSubAgentRoute {
 }
 
 interface CodexThreadHistoryProjection {
+  title?: string;
   nextCursor: CodexHistoryCursor | null;
   timeline: PersistedTimelineEntry[];
   subAgentRoutes: PersistedSubAgentRoute[];
@@ -2121,14 +2122,8 @@ async function loadCodexThreadHistoryTimeline(params: {
   for await (const entry of history.items) {
     const activity = readCodexSubAgentActivity(entry.item);
     groups.push({
-      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map((item) =>
-        limitAgentTimelineItemContent(
-          // Use the same identity as metadata-only child discovery, including
-          // when started/interacted/interrupted arrive on separate history pages.
-          activity && item.type === "tool_call"
-            ? { ...item, callId: `codex-subagent:${activity.agentThreadId}` }
-            : item,
-        ),
+      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map(
+        limitAgentTimelineItemContent,
       ),
       turn: entry.turn,
       timestamp:
@@ -2188,6 +2183,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     },
   );
   return {
+    title: history.title,
     timeline,
     subAgentRoutes,
     latestTurnStatus: readCodexHistoricalTurnStatus(history.turns),
@@ -4191,6 +4187,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       client,
     });
     this.olderHistoryCursors.clear();
+    this.config.title ||= history.title;
     this.rememberOlderHistoryCursor(threadId, history.nextCursor);
     const { timeline, subAgentRoutes } = history;
     this.subAgentCallsByCallId.clear();
@@ -8039,12 +8036,19 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
-    return importSessionFromPersistence({
+    const imported = await importSessionFromPersistence({
       provider: CODEX_PROVIDER,
       request: input,
       context,
       resumeSession: this.resumeSession.bind(this),
     });
+    // The recent page need not contain the original prompt (or any user row).
+    // Reuse the native title/preview already read with the history metadata.
+    const title = imported.session.describePersistence()?.metadata?.title;
+    if (!imported.config.title && typeof title === "string" && title.trim()) {
+      imported.config.title = title;
+    }
+    return imported;
   }
 
   async getCatalogCacheKey(_options: FetchCatalogOptions): Promise<string> {
