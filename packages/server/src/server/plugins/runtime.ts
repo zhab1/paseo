@@ -516,19 +516,26 @@ export class PluginRuntime {
 
   emit<Name extends keyof PluginLifecycleEvents>(
     name: Name,
-    event: PluginLifecycleEvents[Name],
+    event: PluginLifecycleEvents[Name] | (() => Promise<PluginLifecycleEvents[Name]>),
   ): void {
+    let input: Promise<PluginLifecycleEvents[Name]> | undefined;
     for (const loaded of this.plugins.values()) {
       if (!loaded.hooks.events.includes(name)) {
         continue;
       }
-      const request = this.request(loaded, {
-        type: "hook",
-        requestId: randomUUID(),
-        kind: "event",
-        name,
-        input: event,
-      })
+      // Resolve once, and only for registered subscribers. Calling immediately
+      // lets the producer capture the turn boundary before another turn starts.
+      input ??= (async () => (typeof event === "function" ? event() : event))();
+      const request = input
+        .then((value) =>
+          this.request(loaded, {
+            type: "hook",
+            requestId: randomUUID(),
+            kind: "event",
+            name,
+            input: value,
+          }),
+        )
         .then(() => undefined)
         .catch((error) => {
           this.appendLog(

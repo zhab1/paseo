@@ -679,6 +679,9 @@ export interface AgentSession {
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
   /** Saved child history preceding live events in this session; null when already streamed. */
   getProviderSubagentHistory?(subagentId: string): Promise<ImportedTimelineEntry[] | null>;
+  /** Older saved rows are read only when requested, from the native history cursor. */
+  hasOlderHistory?(subagentId?: string): boolean;
+  loadOlderHistory?(subagentId?: string): Promise<ImportedTimelineEntry[]>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   /** Return the provider turn rejoined during session resume, if one is still running. */
   getActiveTurnId?(): string | null;

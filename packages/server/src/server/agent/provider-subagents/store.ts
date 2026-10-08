@@ -1,10 +1,11 @@
+import type { TimelineCache } from "../timeline-cache.js";
 import type {
   AgentProvider,
   AgentTimelineItem,
   ImportedTimelineEntry,
 } from "../agent-sdk-types.js";
 import { limitAgentTimelineItemContent } from "../agent-timeline-content.js";
-import { InMemoryAgentTimelineStore } from "../agent-timeline-store.js";
+import { InMemoryAgentTimelineStore, PAGED_HISTORY_ORIGIN } from "../agent-timeline-store.js";
 import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
@@ -81,7 +82,11 @@ function stickyField<T>(next: T | undefined, previous: T | null | undefined): T 
 
 export class ProviderSubagentStore {
   private readonly descriptors = new Map<string, ProviderSubagentDescriptor>();
-  private readonly timelines = new InMemoryAgentTimelineStore();
+  private readonly timelines: InMemoryAgentTimelineStore;
+
+  constructor(cache?: TimelineCache) {
+    this.timelines = new InMemoryAgentTimelineStore(cache);
+  }
   private readonly historyLoads = new Map<string, Promise<void>>();
 
   apply(
@@ -99,7 +104,9 @@ export class ProviderSubagentStore {
 
     if (event.type === "timeline") {
       if (!this.timelines.has(key)) {
-        this.timelines.initialize(key);
+        this.timelines.initialize(key, {
+          nextSeq: provider === "codex" ? PAGED_HISTORY_ORIGIN : undefined,
+        });
       }
       const row = this.timelines.append(key, limitAgentTimelineItemContent(event.item), {
         timestamp: event.timestamp,
@@ -116,7 +123,9 @@ export class ProviderSubagentStore {
 
     const previous = this.descriptors.get(key);
     if (!this.timelines.has(key)) {
-      this.timelines.initialize(key);
+      this.timelines.initialize(key, {
+        nextSeq: provider === "codex" ? PAGED_HISTORY_ORIGIN : undefined,
+      });
     }
     const timestamp = event.timestamp ?? new Date().toISOString();
     const subagent: ProviderSubagentDescriptor = {
@@ -159,6 +168,15 @@ export class ProviderSubagentStore {
     return this.timelines.fetch(storeKey(parentAgentId, subagentId), options);
   }
 
+  fetchTimelinePage(
+    parentAgentId: string,
+    subagentId: string,
+    options: AgentTimelineFetchOptions | undefined,
+    history: { hasOlder(): boolean; loadOlder(): Promise<ImportedTimelineEntry[]> },
+  ) {
+    return this.timelines.fetchPage(storeKey(parentAgentId, subagentId), options, history);
+  }
+
   async hydrateTimeline(
     parentAgentId: string,
     subagentId: string,
@@ -171,15 +189,15 @@ export class ProviderSubagentStore {
       const history = await load();
       if (this.historyLoads.get(key) !== pending) throw new Error("Provider subagent was reloaded");
       if (!history?.length) return undefined;
-      const live = this.timelines.getRows(key);
-      const timestamp = new Date().toISOString();
-      this.timelines.initialize(key, {
-        rows: [...history, ...live].map((entry, index) => ({
-          seq: index + 1,
-          timestamp: entry.timestamp ?? timestamp,
+      // Codex children reserve earlier sequence positions from creation. Prepending
+      // a bounded page preserves live cursors without materializing cached live output.
+      this.timelines.prepend(
+        key,
+        history.map((entry) => ({
+          timestamp: entry.timestamp,
           item: limitAgentTimelineItemContent(entry.item),
         })),
-      });
+      );
       return undefined;
     });
     this.historyLoads.set(key, pending);

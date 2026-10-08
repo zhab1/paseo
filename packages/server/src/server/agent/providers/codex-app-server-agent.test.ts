@@ -1,4 +1,5 @@
 import { pagedHistoryRequest } from "./codex/test-utils/paged-history.js";
+import { InMemoryAgentTimelineStore, PAGED_HISTORY_ORIGIN } from "../agent-timeline-store.js";
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -3519,7 +3520,7 @@ describe("Codex app-server provider", () => {
       expect(events.at(-1)).toMatchObject({
         type: "timeline",
         item: {
-          callId: "call-settled-child",
+          callId: "codex-subagent:settled-child-thread",
           status: "completed",
           detail: { type: "sub_agent", log: "[Assistant] Late trailing output." },
         },
@@ -3847,7 +3848,7 @@ describe("Codex app-server provider", () => {
       ]);
       expect(result.timeline.findLast((item) => item.type === "tool_call")).toMatchObject({
         type: "tool_call",
-        callId: "spawn-child-early",
+        callId: "codex-subagent:child-thread-early",
         status: "completed",
         detail: {
           type: "sub_agent",
@@ -3912,10 +3913,10 @@ describe("Codex app-server provider", () => {
       const result = await resultPromise;
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(new Set(toolCalls.map((item) => item.callId))).toEqual(
-        new Set(["spawn-child-stable"]),
+        new Set(["codex-subagent:child-thread-stable"]),
       );
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-stable",
+        callId: "codex-subagent:child-thread-stable",
         status: "canceled",
         detail: {
           type: "sub_agent",
@@ -3956,7 +3957,7 @@ describe("Codex app-server provider", () => {
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(toolCalls.map((item) => item.status)).toEqual(["running", "completed"]);
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-fast",
+        callId: "codex-subagent:child-thread-fast",
         status: "completed",
       });
       appServer.assertNoErrors();
@@ -3994,7 +3995,7 @@ describe("Codex app-server provider", () => {
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(toolCalls.map((item) => item.status)).toEqual(["running", "completed", "completed"]);
       expect(toolCalls.at(-1)).toMatchObject({
-        callId: "spawn-child-late-compaction",
+        callId: "codex-subagent:child-late-compaction",
         status: "completed",
         detail: { type: "sub_agent", log: "[Compacted]" },
       });
@@ -4042,11 +4043,11 @@ describe("Codex app-server provider", () => {
       const result = await resultPromise;
       const toolCalls = result.timeline.filter((item) => item.type === "tool_call");
       expect(new Set(toolCalls.map((item) => item.callId))).toEqual(
-        new Set(["spawn-legacy-tool-child"]),
+        new Set(["codex-subagent:legacy-tool-child"]),
       );
       const finalToolCall = toolCalls.at(-1);
       expect(finalToolCall).toMatchObject({
-        callId: "spawn-legacy-tool-child",
+        callId: "codex-subagent:legacy-tool-child",
         status: "completed",
         detail: { type: "sub_agent" },
       });
@@ -4115,10 +4116,10 @@ describe("Codex app-server provider", () => {
       .filter((event) => event.type === "timeline" && event.item.type === "tool_call")
       .map((event) => event.item);
     expect(new Set(beforeParentCompletes.map((item) => item.callId))).toEqual(
-      new Set(["spawn-child-root"]),
+      new Set(["codex-subagent:child-thread-root"]),
     );
     expect(beforeParentCompletes.at(-1)).toMatchObject({
-      callId: "spawn-child-root",
+      callId: "codex-subagent:child-thread-root",
       status: "running",
       detail: { type: "sub_agent", log: expect.stringContaining("Grandchild findings.") },
     });
@@ -4129,7 +4130,7 @@ describe("Codex app-server provider", () => {
     });
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
-      item: { callId: "spawn-child-root", status: "completed" },
+      item: { callId: "codex-subagent:child-thread-root", status: "completed" },
     });
   });
 
@@ -4191,7 +4192,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
       item: {
-        callId: "spawn-child-root",
+        callId: "codex-subagent:child-thread-root",
         detail: { type: "sub_agent", log: expect.stringContaining("Still nested.") },
       },
     });
@@ -4230,7 +4231,7 @@ describe("Codex app-server provider", () => {
     });
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
-      item: { callId: "spawn-reused-foreign-thread", status: "running" },
+      item: { callId: "codex-subagent:unmapped-child-thread", status: "running" },
     });
   });
 
@@ -4290,7 +4291,7 @@ describe("Codex app-server provider", () => {
     expect(events.at(-1)).toMatchObject({
       type: "timeline",
       item: {
-        callId: "spawn-legacy-envelope-child",
+        callId: "codex-subagent:legacy-envelope-child",
         status: "completed",
       },
     });
@@ -4314,7 +4315,7 @@ describe("Codex app-server provider", () => {
       const resultPromise = session.run("Delegate the investigation.");
       await appServer.waitForTurnStart();
       const child = waitForProviderSubagent(session, "legacy-only-child-thread");
-      const spawn = waitForTimelineToolCall(session, "spawn-legacy-only-child");
+      const spawn = waitForTimelineToolCall(session, "codex-subagent:legacy-only-child-thread");
 
       appServer.startsTurn({ threadId: "thread-1", turnId: "turn-with-legacy-only-child" });
       appServer.startsLegacyOnlySubAgent({
@@ -4339,7 +4340,7 @@ describe("Codex app-server provider", () => {
         turnId: "codex-turn-0",
         item: {
           type: "tool_call",
-          callId: "spawn-legacy-only-child",
+          callId: "codex-subagent:legacy-only-child-thread",
           status: "running",
           detail: {
             type: "sub_agent",
@@ -4644,7 +4645,7 @@ describe("Codex app-server provider", () => {
     });
   });
 
-  test("recovers a missing autonomous turn id when interrupting", async () => {
+  test("recovers a missing autonomous turn id using only latest-turn metadata", async () => {
     const session = createSession();
     const requests: Array<{ method: string; params: unknown }> = [];
     session.activeForegroundTurnId = null;
@@ -4652,14 +4653,16 @@ describe("Codex app-server provider", () => {
     session.client = {
       request: async (method, params) => {
         requests.push({ method, params });
-        return method === "thread/read"
-          ? { thread: { turns: [{ id: "recovered-turn", status: "inProgress" }] } }
+        return method === "thread/turns/list"
+          ? { data: [{ id: "recovered-turn", status: "inProgress" }], nextCursor: null }
           : {};
       },
     };
 
     const interrupt = session.interrupt();
-    await Promise.resolve();
+    await vi.waitFor(() =>
+      expect(requests).toContainEqual(expect.objectContaining({ method: "turn/interrupt" })),
+    );
     asInternals(session).handleNotification("turn/completed", {
       threadId: "test-thread",
       turn: { id: "recovered-turn", status: "interrupted", items: [] },
@@ -4667,7 +4670,15 @@ describe("Codex app-server provider", () => {
     await interrupt;
 
     expect(requests).toEqual([
-      { method: "thread/read", params: { threadId: "test-thread", includeTurns: true } },
+      {
+        method: "thread/turns/list",
+        params: {
+          threadId: "test-thread",
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        },
+      },
       { method: "turn/interrupt", params: { threadId: "test-thread", turnId: "recovered-turn" } },
     ]);
   });
@@ -4815,7 +4826,8 @@ describe("Codex app-server provider", () => {
     expect(timelineItems.every((item) => item.type === "tool_call")).toBe(true);
     expect(
       timelineItems.every(
-        (item) => item.type === "tool_call" && item.callId === "spawn-child-compaction",
+        (item) =>
+          item.type === "tool_call" && item.callId === "codex-subagent:child-thread-compaction",
       ),
     ).toBe(true);
     expect(timelineItems.at(-1)).toMatchObject({
@@ -4904,6 +4916,70 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("continues older pages and preserves rewind targets across a config-only reload", async () => {
+    const session = createSession();
+    const request = vi.fn(async (method: string, params: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+      if (method === "thread/turns/list")
+        return { data: [{ id: "turn", status: "completed" }], nextCursor: null };
+      if (method !== "thread/items/list") return { data: [], nextCursor: null };
+      const offset = Number(input.cursor ?? 0);
+      const count = Math.min(Number(input.limit), 450 - offset);
+      const data = [];
+      for (let i = 0; i < count; i++)
+        data.push({
+          turnId: "turn",
+          item: {
+            type: "userMessage",
+            id: `user-${449 - offset - i}`,
+            content: [{ type: "text", text: `Message ${449 - offset - i}` }],
+          },
+        });
+      return { data, nextCursor: offset + count < 450 ? String(offset + count) : null };
+    });
+    session.client = { request };
+    await asInternals(session).loadPersistedHistory(session.client);
+    expect(await session.loadOlderHistory?.()).toHaveLength(200);
+    const saved = session.describePersistence()!;
+    const reloaded = new CodexAppServerAgentSession(
+      createConfig(),
+      saved,
+      createTestLogger(),
+      async () => {
+        throw new Error("Unexpected native spawn");
+      },
+      {},
+      false,
+      false,
+      false,
+      undefined,
+      "interactive",
+      false,
+    );
+    const internals = reloaded as unknown as CodexTestSession;
+    internals.connectionState = "connected";
+    internals.client = { request };
+    expect(reloaded.hasOlderHistory()).toBe(true);
+    expect(asInternals(internals).codexUserMessageTurns().resolve("user-50")).toMatchObject({
+      turnId: "turn",
+    });
+    const remaining = await reloaded.loadOlderHistory();
+    expect(remaining).toHaveLength(50);
+    expect(remaining[0].item).toMatchObject({ messageId: "user-0" });
+    expect(remaining.at(-1)?.item).toMatchObject({ messageId: "user-49" });
+    expect(reloaded.hasOlderHistory()).toBe(false);
+    const fresh = new CodexAppServerAgentSession(
+      createConfig(),
+      saved,
+      createTestLogger(),
+      async () => {
+        throw new Error("Unexpected native spawn");
+      },
+    );
+    expect(fresh.hasOlderHistory()).toBe(false);
+  });
+
   test("loads Codex persisted history from the app-server thread", async () => {
     const session = createSession();
     const requests: Array<{ method: string; params: unknown }> = [];
@@ -4945,9 +5021,11 @@ describe("Codex app-server provider", () => {
       history.push(event);
     }
 
-    expect(requests.map((request) => [request.method, request.params])).toEqual([
-      ["thread/read", { threadId: "test-thread", includeTurns: false }],
-    ]);
+    expect(
+      requests
+        .filter((request) => request.method !== "thread/list")
+        .map((request) => [request.method, request.params]),
+    ).toEqual([["thread/read", { threadId: "test-thread", includeTurns: false }]]);
     expect(history).toEqual([
       {
         type: "timeline",
@@ -5282,7 +5360,7 @@ describe("Codex app-server provider", () => {
         },
       },
       {
-        callId: "v2-spawn-history",
+        callId: "codex-subagent:v2-child-thread",
         status: "completed",
         detail: { type: "sub_agent", description: "v2-child" },
       },
@@ -5314,7 +5392,7 @@ describe("Codex app-server provider", () => {
       event.type === "timeline" && event.item.type === "tool_call" ? [event.item] : [],
     );
     expect(new Set(liveToolCalls.map((item) => item.callId))).toEqual(
-      new Set(["v2-spawn-history"]),
+      new Set(["codex-subagent:v2-child-thread"]),
     );
     expect(liveToolCalls.at(-1)).toMatchObject({
       status: "running",
@@ -5680,6 +5758,118 @@ describe("Codex app-server provider", () => {
     expect(detail.log).toContain("Grandchild output finished");
   });
 
+  test.each([false, true])(
+    "keeps one child card across pages with live activity=%s",
+    async (live) => {
+      const session = createSession();
+      const activity = (kind: "started" | "interacted" | "interrupted") => ({
+        type: "subAgentActivity",
+        id: `activity-${kind}`,
+        kind,
+        agentThreadId: "history-child",
+        agentPath: "/root/history-child",
+      });
+      const padding = (prefix: string) =>
+        Array.from({ length: 205 }, (_, i) => ({
+          type: "agentMessage",
+          id: `${prefix}-${i}`,
+          text: `${prefix} ${i}`,
+        }));
+      const items = [
+        activity("started"),
+        ...padding("first"),
+        activity("interacted"),
+        ...padding("second"),
+        activity("interrupted"),
+      ];
+      session.client = {
+        request: pagedHistoryRequest(async (method, params) => {
+          if (method !== "thread/read") return {};
+          return {
+            thread: {
+              turns:
+                (params as { threadId?: string }).threadId === "test-thread"
+                  ? [{ id: "turn", status: "completed", items }]
+                  : [],
+            },
+          };
+        }),
+      };
+      await asInternals(session).loadPersistedHistory(session.client);
+      const store = new InMemoryAgentTimelineStore();
+      store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
+      for await (const event of session.streamHistory()) {
+        if (event.type === "timeline")
+          store.append("a", event.item, { timestamp: event.timestamp });
+      }
+      const cards = () =>
+        store.fetch("a", { limit: 0 }).rows.filter((row) => row.item.type === "tool_call");
+      const latestCard = cards()[0].item;
+      expect(latestCard).toMatchObject({ status: "canceled" });
+      if (live) {
+        session.subscribe((event) => {
+          if (event.type === "timeline") store.append("a", event.item);
+        });
+        asInternals(session).handleNotification("item/started", {
+          threadId: "test-thread",
+          turnId: "new-turn",
+          item: { ...activity("interacted"), id: "new-activity" },
+        });
+        expect(cards()).toHaveLength(1);
+      }
+      const currentCard = cards()[0].item;
+      let pages = 1;
+      while (session.hasOlderHistory()) {
+        store.prepend("a", await session.loadOlderHistory());
+        pages++;
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0].item).toEqual(currentCard);
+      }
+      expect(pages).toBe(3);
+    },
+  );
+
+  test("imports the native first prompt from metadata without paging back through history", async () => {
+    const session = createSession();
+    const items = Array.from({ length: 401 }, (_, i) => ({
+      type: "userMessage",
+      id: `u${i}`,
+      content: [{ type: "text", text: `Prompt ${i}` }],
+    }));
+    const request = vi.fn(
+      pagedHistoryRequest(async (method, params) => {
+        if (method !== "thread/read") return {};
+        return {
+          thread: {
+            preview: "Original purpose",
+            turns:
+              (params as { threadId?: string }).threadId === "test-thread"
+                ? [
+                    {
+                      id: "saved",
+                      status: "completed",
+                      items,
+                    },
+                  ]
+                : [],
+          },
+        };
+      }),
+    );
+    session.client = { request };
+    await asInternals(session).loadPersistedHistory(session.client);
+    const provider = new CodexAppServerAgentClient(createTestLogger());
+    vi.spyOn(provider, "resumeSession").mockResolvedValue(session);
+    const config = createConfig();
+    const imported = await provider.importSession(
+      { providerHandleId: "test-thread", cwd: config.cwd },
+      { config, storedConfig: config },
+    );
+    expect(imported.timeline).toHaveLength(200);
+    expect(imported.config.title).toBe("Original purpose");
+    expect(request.mock.calls.filter(([method]) => method === "thread/items/list")).toHaveLength(5);
+  });
+
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {
     const session = createSession();
     session.client = {
@@ -5750,7 +5940,7 @@ describe("Codex app-server provider", () => {
         timestamp: "2026-07-09T10:00:00.000Z",
         item: expect.objectContaining({
           type: "tool_call",
-          callId: "child-started-history",
+          callId: "codex-subagent:history-child-thread",
           status: "canceled",
           detail: expect.objectContaining({
             type: "sub_agent",
@@ -5934,65 +6124,39 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
-  test("uses per-message rollout timestamps before a shared Codex turn timestamp", async () => {
-    const rolloutDir = await mkdtemp(path.join(tmpdir(), "paseo-codex-rollout-"));
-    const rolloutPath = path.join(rolloutDir, "rollout.jsonl");
-    writeFileSync(
-      rolloutPath,
-      [
-        {
-          timestamp: "2026-09-20T14:11:20.000Z",
-          type: "response_item",
-          payload: {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "First" }],
-          },
-        },
-        {
-          timestamp: "2026-09-20T14:11:29.000Z",
-          type: "response_item",
-          payload: {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "Second" }],
-          },
-        },
-      ]
-        .map((entry) => JSON.stringify(entry))
-        .join("\n"),
-    );
+  test("uses native envelope timestamps without opening the rollout file", async () => {
     const session = createSession();
     session.client = {
-      request: vi.fn(async () => ({
-        thread: {
-          path: rolloutPath,
-          turns: [
-            {
-              completedAt: 1_789_927_616,
-              items: [
-                { type: "agentMessage", id: "message-first", text: "First" },
-                { type: "agentMessage", id: "message-second", text: "Second" },
-              ],
-            },
-          ],
-        },
-      })),
+      request: vi.fn(async (method: string) => {
+        if (method === "thread/read") return { thread: { path: "/unavailable/rollout.jsonl" } };
+        if (method === "thread/turns/list")
+          return { data: [{ id: "turn", completedAt: 1_789_927_616 }], nextCursor: null };
+        if (method === "thread/items/list")
+          return {
+            data: [
+              {
+                turnId: "turn",
+                item: { type: "agentMessage", id: "second", text: "Second" },
+                startedAtMs: Date.parse("2026-09-20T14:11:29Z"),
+              },
+              {
+                turnId: "turn",
+                item: { type: "agentMessage", id: "first", text: "First" },
+                startedAtMs: Date.parse("2026-09-20T14:11:20Z"),
+              },
+            ],
+            nextCursor: null,
+          };
+        return {};
+      }),
     };
-
-    try {
-      session.client!.request = pagedHistoryRequest(session.client!.request);
-      await asInternals(session).loadPersistedHistory(session.client);
-      const timestamps: Array<string | undefined> = [];
-      for await (const event of session.streamHistory()) {
-        if (event.type === "timeline" && event.item.type === "assistant_message") {
-          timestamps.push(event.timestamp);
-        }
-      }
-      expect(timestamps).toEqual(["2026-09-20T14:11:20.000Z", "2026-09-20T14:11:29.000Z"]);
-    } finally {
-      rmSync(rolloutDir, { recursive: true, force: true });
+    await asInternals(session).loadPersistedHistory(session.client);
+    const timestamps = [];
+    for await (const event of session.streamHistory()) {
+      if (event.type === "timeline" && event.item.type === "assistant_message")
+        timestamps.push(event.timestamp);
     }
+    expect(timestamps).toEqual(["2026-09-20T14:11:20.000Z", "2026-09-20T14:11:29.000Z"]);
   });
 
   test("preserves Codex app-server assistant item ids in persisted history", async () => {

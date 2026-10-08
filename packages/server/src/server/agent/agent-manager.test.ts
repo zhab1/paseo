@@ -50,6 +50,8 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
+import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
+import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
 const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
@@ -1828,6 +1830,32 @@ test("flush waits for rejected session cleanup that starts after shutdown", asyn
   expect(await creation).toBeInstanceOf(AgentManagerShuttingDownError);
   await flushing;
   expect(manager.listAgents()).toEqual([]);
+});
+
+test("shutdown flush commits events queued before the flush starts", async () => {
+  vi.useFakeTimers();
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    for (const text of ["first ", "last"]) {
+      client.sessions[0]!.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", messageId: "message", text },
+      });
+    }
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    expect(manager.getTimeline(agent.id)).toEqual([
+      { type: "assistant_message", messageId: "message", text: "first last" },
+    ]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    vi.useRealTimers();
+  }
 });
 
 test("does not persist an initializing session after shutdown closes it", async () => {
@@ -11630,4 +11658,225 @@ test("usage session is a pure read of the live adapter and disappears on close",
     await manager.closeAgent(agent.id);
   }
   expect(manager.usageSession(agent.id)).toBeNull();
+});
+
+test.each(["create", "import"])(
+  "%s native pages retain stable cursors while older history is loaded on demand",
+  async (mode) => {
+    let historyReads = 0;
+    class PagedSession extends TestAgentSession {
+      readonly initialTimeline = [
+        { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
+      ];
+      hasOlderHistory() {
+        return historyReads === 0;
+      }
+      async loadOlderHistory() {
+        historyReads++;
+        return [
+          {
+            item: {
+              type: "user_message" as const,
+              text: "<paseo-system>\ninternal\n</paseo-system>",
+            },
+          },
+          { item: { type: "assistant_message" as const, messageId: "older", text: "older" } },
+        ];
+      }
+    }
+    class PagedClient extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig) {
+        return new PagedSession(config);
+      }
+      async importSession(
+        input: ImportProviderSessionInput,
+        context: ImportProviderSessionContext,
+      ) {
+        const session = new PagedSession(context.config);
+        const timeline = session.initialTimeline.splice(0);
+        return {
+          session,
+          config: context.config,
+          persistence: { provider: "codex" as const, sessionId: input.providerHandleId },
+          timeline,
+        };
+      }
+    }
+    const manager = new AgentManager({ clients: { codex: new PagedClient() }, logger });
+    const agent =
+      mode === "import"
+        ? await manager.importProviderSession({
+            provider: "codex",
+            providerHandleId: "paged-import",
+            cwd: process.cwd(),
+            workspaceId: "ws-import",
+          })
+        : await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+            workspaceId: undefined,
+          });
+    try {
+      const recent = await manager.fetchTimelinePage(agent.id, { limit: 1 });
+      expect(historyReads).toBe(0);
+      expect(recent.rows.map((row) => row.item)).toEqual([
+        { type: "assistant_message", messageId: "recent", text: "recent" },
+      ]);
+      expect(recent.hasOlder).toBe(true);
+      const older = await manager.fetchTimelinePage(agent.id, {
+        direction: "before",
+        limit: 1,
+        cursor: { epoch: recent.epoch, seq: recent.startSeq! },
+      });
+      expect(historyReads).toBe(1);
+      expect(older.rows.map((row) => row.item)).toEqual([
+        { type: "assistant_message", messageId: "older", text: "older" },
+      ]);
+      expect(older.startSeq).toBeGreaterThan(0);
+      expect(older.hasOlder).toBe(false);
+      expect((await manager.fetchTimelinePage(agent.id, { limit: 1 })).endSeq).toBe(recent.endSeq);
+    } finally {
+      await manager.closeAgent(agent.id);
+    }
+  },
+);
+
+test.each([false, true])(
+  "turn hooks explicitly freeze complete history with a prior scroll=%s",
+  async (scrollFirst) => {
+    let historyReads = 0;
+    const olderAllowed = deferred<void>();
+    const olderStarted = deferred<void>();
+    const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
+    const hookStarted = deferred<void>();
+    const plugin: AgentTimelineItem = {
+      type: "plugin",
+      id: "report",
+      pluginId: "test",
+      kind: "report",
+      version: 1,
+      data: "before",
+    };
+    const oldChild: AgentTimelineItem = {
+      type: "tool_call",
+      callId: "old-child",
+      name: "Sub-agent",
+      status: "completed",
+      error: null,
+      detail: { type: "unknown", input: "before", output: "before" },
+    };
+    class PagedSession extends TestAgentSession {
+      readonly initialTimeline = [
+        { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
+        { item: plugin },
+      ];
+      hasOlderHistory() {
+        return historyReads === 0;
+      }
+      async loadOlderHistory() {
+        historyReads++;
+        olderStarted.resolve();
+        await olderAllowed.promise;
+        return [
+          { item: { type: "user_message" as const, text: "Original prompt" } },
+          { item: oldChild },
+          { item: { type: "assistant_message" as const, messageId: "recent", text: "earlier " } },
+        ];
+      }
+    }
+    const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
+    const client = new (class extends TestAgentClient {
+      override async createSession() {
+        return session;
+      }
+    })();
+    const lifecycle: PluginLifecycle = {
+      emit(name, event) {
+        if (name === "agent.turn_ended") {
+          void Promise.resolve(typeof event === "function" ? event() : event)
+            .then((value) => hook.resolve(value as PluginLifecycleEvents["agent.turn_ended"]))
+            .catch(hook.reject);
+          hookStarted.resolve();
+        }
+      },
+      async before(_name, request) {
+        return request;
+      },
+    };
+    const manager = new AgentManager({
+      clients: { codex: client },
+      pluginLifecycle: lifecycle,
+      logger,
+    });
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: process.cwd() },
+      undefined,
+      {},
+    );
+    try {
+      expect(historyReads).toBe(0);
+      const page = manager.fetchTimeline(agent.id, { limit: 1 });
+      const scroll = scrollFirst
+        ? manager.fetchTimelinePage(agent.id, {
+            direction: "before",
+            cursor: { epoch: page.epoch, seq: page.window.minSeq },
+            limit: 1,
+          })
+        : null;
+      if (scroll) await olderStarted.promise;
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
+      await hookStarted.promise;
+      await olderStarted.promise;
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: {
+          type: "user_message",
+          text: "Following turn",
+        },
+      });
+      await manager.appendTimelineItem(agent.id, { ...plugin, data: "after" });
+      await manager.appendTimelineItem(agent.id, {
+        ...oldChild,
+        status: "running",
+        detail: { type: "unknown", input: "after", output: "after" },
+      });
+      olderAllowed.resolve();
+      await scroll;
+      const event = await hook.promise;
+      expect(event.timeline).toEqual([
+        { type: "user_message", text: "Original prompt" },
+        oldChild,
+        { type: "assistant_message", messageId: "recent", text: "earlier recent" },
+        plugin,
+      ]);
+      expect(historyReads).toBe(1);
+    } finally {
+      olderAllowed.resolve();
+      await manager.closeAgent(agent.id);
+    }
+  },
+);
+
+test("import retains a metadata title when the newest page contains no user prompt", async () => {
+  const client = new (class extends TestAgentClient {
+    async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+      return {
+        session: new TestAgentSession(context.config),
+        config: { ...context.config, title: "Original purpose" },
+        persistence: { provider: "codex" as const, sessionId: input.providerHandleId },
+        timeline: [{ item: { type: "assistant_message" as const, text: "Recent output" } }],
+      };
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.importProviderSession({
+    provider: "codex",
+    providerHandleId: "metadata-title",
+    cwd: process.cwd(),
+    workspaceId: "import",
+  });
+  try {
+    expect(agent.config.title).toBe("Original purpose");
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
 });

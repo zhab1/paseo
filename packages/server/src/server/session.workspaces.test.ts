@@ -135,7 +135,7 @@ interface SessionTestAccess {
       extras?: unknown,
     ): Promise<unknown>;
     hydrateTimelineFromProvider(agentId: string): Promise<unknown>;
-    getTimeline(agentId: string): readonly unknown[];
+    getTimelineItemCount(agentId: string): number;
     setTitle(agentId: string, title: string): Promise<unknown>;
   };
   workspaceRegistry: {
@@ -4360,7 +4360,7 @@ test("import_agent_request registers a workspace for a never-seen cwd", async ()
   });
   session.agentManager.listAgents = () => [managed];
   session.agentManager.importProviderSession = async () => managed;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentManager.setTitle = async () => undefined;
   session.agentStorage.list = async () => [];
   session.agentStorage.get = async () => null;
@@ -4450,7 +4450,7 @@ test("import_agent_request imports into the workspace that opened the import she
       updatedAt: "2026-05-21T00:00:00.000Z",
     });
   };
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentStorage.list = async () => [];
   session.agentStorage.get = async () => null;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
@@ -5375,7 +5375,7 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   session.interruptAgentIfRunning = async () => undefined;
   session.agentManager.reloadAgentSession = async () => managed;
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
 
   const unarchivedWorkspaceIds: string[][] = [];
@@ -5473,7 +5473,7 @@ test("refresh_agent_request leaves workspace archival independent when its direc
   session.interruptAgentIfRunning = async () => undefined;
   session.agentManager.reloadAgentSession = async () => managed;
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
 
   await session.handleMessage({
@@ -5564,7 +5564,7 @@ test("refresh_agent_request does not recreate or unarchive a deleted worktree", 
   session.interruptAgentIfRunning = async () => undefined;
   session.agentManager.reloadAgentSession = async () => managed;
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
 
   const unarchivedWorkspaceIds: string[][] = [];
@@ -5663,7 +5663,7 @@ test("refresh_agent_request does not inspect an archived worktree branch", async
   session.interruptAgentIfRunning = async () => undefined;
   session.agentManager.reloadAgentSession = async () => managed;
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
 
   await session.handleMessage({
@@ -5792,7 +5792,7 @@ test("legacy refresh_agent_request restores a real deleted worktree", async () =
   session.interruptAgentIfRunning = async () => undefined;
   session.agentManager.reloadAgentSession = async () => managed;
   session.agentManager.hydrateTimelineFromProvider = async () => undefined;
-  session.agentManager.getTimeline = () => [];
+  session.agentManager.getTimelineItemCount = () => 0;
   session.agentUpdates.forwardLiveAgent = async () => undefined;
 
   await session.handleMessage({

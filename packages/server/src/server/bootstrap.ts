@@ -1,3 +1,4 @@
+import { TimelineCache } from "./agent/timeline-cache.js";
 import type { PluginRegistries } from "@getpaseo/protocol/plugin-registry";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
@@ -943,7 +944,9 @@ export async function createPaseoDaemon(
     if (git) configureGitProcessPolicy(git);
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  const timelineCache = new TimelineCache(path.join(config.paseoHome, "cache", "timeline.sqlite"));
   const agentManager = new AgentManager({
+    timelineCache,
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
@@ -1858,6 +1861,10 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    // WebSocket shutdown publishes final metrics, and provider shutdown can leave
+    // coalesced events. Keep the cache open until both readers and writers drain.
+    await agentManager.flushForShutdown();
+    timelineCache.close();
   };
 
   return {
@@ -1884,7 +1891,8 @@ export async function createPaseoDaemon(
 const AGENT_CLOSE_TIMEOUT_MS = 5_000;
 
 async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
-  const agents = agentManager.listAgents();
+  // Internal title-generation sessions also own event streams and cached history.
+  const agents = agentManager.listAgents({ includeInternal: true });
   await Promise.all(
     agents.map(async (agent) => {
       try {

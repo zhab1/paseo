@@ -16,7 +16,7 @@ describe("native paged history", () => {
             return { data: [{ id: "old" }, { id: "new" }], nextCursor: null };
           expect(params.limit).toBe(1);
           expect(params.itemsView).toBe("full");
-          const id = params.cursor ? "new" : "old";
+          const id = params.cursor ? "old" : "new";
           return {
             data: [{ id, items: [{ id: `${id}-item` }] }],
             nextCursor: params.cursor ? null : "next",
@@ -27,11 +27,45 @@ describe("native paged history", () => {
       const items = [];
       for await (const entry of history.items) items.push(entry.item);
       expect(items).toEqual(
-        boundary ? [{ id: "old-item" }] : [{ id: "old-item" }, { id: "new-item" }],
+        boundary ? [{ id: "old-item" }] : [{ id: "new-item" }, { id: "old-item" }],
       );
       expect(history.turns.every((turn) => turn.items === undefined)).toBe(true);
     },
   );
+
+  test("continues within a large legacy turn without dropping or duplicating older items", async () => {
+    const client = {
+      async request(method: string, params: Record<string, unknown>) {
+        if (method === "thread/read") return { thread: { historyMode: "legacy" } };
+        return {
+          data: [
+            {
+              id: "turn",
+              ...(params.itemsView === "full"
+                ? {
+                    items: Array.from({ length: 450 }, (_, id) => ({ id })),
+                  }
+                : {}),
+            },
+          ],
+          nextCursor: null,
+        };
+      },
+    };
+    const ids: number[] = [];
+    let cursor;
+    do {
+      const history = await openCodexHistory(client, "legacy", undefined, cursor);
+      let count = 0;
+      for await (const entry of history.items) {
+        ids.push((entry.item as { id: number }).id);
+        count++;
+      }
+      expect(count).toBeLessThanOrEqual(200);
+      cursor = history.nextCursor ?? undefined;
+    } while (cursor);
+    expect(ids).toEqual(Array.from({ length: 450 }, (_, i) => 449 - i));
+  });
 
   test("keeps turns created after the initial metadata page instead of dropping their history", async () => {
     let turnReads = 0;
@@ -99,9 +133,11 @@ describe("native paged history", () => {
           encoding: "utf8",
         }),
       );
-      expect(result.rows).toBe(400);
+      expect(result.rows).toBe(200);
+      expect(result.firstCallId).toBe(`${kind === "mcp" ? "mcp" : "command"}-200`);
+      expect(result.lastCallId).toBe(`${kind === "mcp" ? "mcp" : "command"}-399`);
       expect(result.maxOutput).toBe(64 * 1024);
-      // 200 MiB of native outputs must not remain behind a 25 MiB UI projection.
+      // The older half is never read; retained output is capped before reversing the tail.
       expect(result.retained).toBeLessThan(64 * 1024 * 1024);
     },
     30_000,
@@ -146,7 +182,7 @@ describe("native paged history", () => {
 
   test("freezes a deferred child at its completed turn and rejects a missing boundary", async () => {
     const client = {
-      async request(method: string) {
+      async request(method: string, params: Record<string, unknown>) {
         if (method === "thread/read") return { thread: {} };
         if (method === "thread/turns/list")
           return {
@@ -157,7 +193,7 @@ describe("native paged history", () => {
             nextCursor: null,
           };
         return {
-          data: ["old", "new"].map((turnId) => ({
+          data: [String(params.turnId)].map((turnId) => ({
             turnId,
             item: { id: turnId },
             startedAtMs: null,
@@ -188,5 +224,43 @@ describe("native paged history", () => {
     };
     const history = await openCodexHistory(client, "root");
     await expect(history.items.next()).rejects.toThrow("history unavailable");
+  });
+  test("opens the latest native page and continues older history without duplicates", async () => {
+    let pages = 0;
+    const client = {
+      async request(method: string, params: Record<string, unknown>) {
+        if (method === "thread/read") return { thread: {} };
+        if (method === "thread/turns/list") return { data: [{ id: "turn" }], nextCursor: null };
+        expect(params.sortDirection).toBe("desc");
+        const offset = Number(params.cursor ?? 0);
+        const limit = Number(params.limit);
+        expect(limit).toBeLessThanOrEqual(40);
+        pages++;
+        return {
+          data: Array.from({ length: limit }, (_, index) => ({
+            turnId: "turn",
+            item: { id: `item-${10300 - offset - index}` },
+            startedAtMs: 1791380000000,
+            completedAtMs: 1791380000123,
+          })),
+          nextCursor: String(offset + limit),
+        };
+      },
+    };
+    const history = await openCodexHistory(client, "root");
+    const items = [];
+    for await (const entry of history.items) items.push(entry);
+    expect(items).toHaveLength(200);
+    expect(items[0]).toMatchObject({ item: { id: "item-10300" }, startedAtMs: 1791380000000 });
+    expect(items.at(-1)?.item).toEqual({ id: "item-10101" });
+    expect(pages).toBe(5);
+    expect(history.nextCursor).toEqual({ nativeCursor: "200", turnIndex: 0 });
+    const older = await openCodexHistory(client, "root", undefined, history.nextCursor!);
+    const oldItems = [];
+    for await (const entry of older.items) oldItems.push(entry.item);
+    expect(oldItems).toHaveLength(200);
+    expect(oldItems[0]).toEqual({ id: "item-10100" });
+    expect(oldItems.at(-1)).toEqual({ id: "item-9901" });
+    expect(pages).toBe(10);
   });
 });

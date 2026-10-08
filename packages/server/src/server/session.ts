@@ -4535,7 +4535,7 @@ export class Session {
       await unarchiveAgentState(this.agentStorage, this.agentManager, snapshot.id);
       await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimeline(snapshot.id).length;
+      const timelineSize = this.agentManager.getTimelineItemCount(snapshot.id);
       if (requestId) {
         const agentPayload = await this.buildAgentPayload(snapshot);
         this.emit({
@@ -4684,7 +4684,7 @@ export class Session {
       }
       await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimeline(agentId).length;
+      const timelineSize = this.agentManager.getTimelineItemCount(agentId);
       if (requestId) {
         this.emit({
           type: "status",
@@ -7745,7 +7745,7 @@ export class Session {
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
 
-      const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const fetchedControlTimeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction,
         cursor,
         limit: pageLimit,
@@ -8017,7 +8017,7 @@ export class Session {
       const supportsProjection = source
         ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
         : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-      const timeline = this.agentManager.fetchProviderSubagentTimeline(
+      const timeline = await this.agentManager.fetchProviderSubagentTimelinePage(
         msg.parentAgentId,
         msg.subagentId,
         {
@@ -8098,7 +8098,7 @@ export class Session {
         logger: this.sessionLogger,
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction: "tail",
         limit: 0,
       });

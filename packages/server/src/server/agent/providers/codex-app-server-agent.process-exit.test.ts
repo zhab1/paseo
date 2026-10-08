@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "../agent-manager.js";
@@ -25,6 +25,7 @@ interface PendingPlanLifecycle {
   close(): Promise<void>;
   crashDuringActiveTurn(): Promise<void>;
   expectCanceledPlan(): void;
+  expectRuntimeAlive(): void;
 }
 
 async function withPendingPlan(
@@ -60,6 +61,7 @@ async function withPendingPlan(
     expect(request).toBeDefined();
     await runScenario({
       close: () => session.close(),
+      expectRuntimeAlive: () => expect(appServer.child.stdin.writable).toBe(true),
       async crashDuringActiveTurn() {
         appServer.startsTurn({ threadId: "thread-1", turnId: "autonomous-turn" });
         await expect
@@ -683,3 +685,155 @@ test("session close disposes a provider that arrives from an in-flight reconnect
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test("releases an idle native runtime and resumes the saved thread without replaying history", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const first = createFakeCodexAppServer();
+  const second = createFakeCodexAppServer();
+  const stopped = vi.spyOn(first.child, "kill");
+  const client = new ProcessExitCodexClient([first, second]);
+  const session = await client.createSession({
+    provider: "codex",
+    cwd: process.cwd(),
+    modeId: "auto",
+  });
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  try {
+    const initial = session.run("first");
+    await first.waitForTurnStart();
+    first.startsTurn({ threadId: "thread-1", turnId: "native-first" });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(stopped).not.toHaveBeenCalled();
+    first.completeTurn();
+    await initial;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(stopped).toHaveBeenCalledTimes(1);
+    const resumed = session.run("second");
+    const turn = await second.waitForTurnStart();
+    expect(turn.threadId).toBe("thread-1");
+    second.startsTurn({ threadId: "thread-1", turnId: "native-second" });
+    second.completeTurn();
+    await resumed;
+    expect(second.requests().some((request) => request.method === "thread/items/list")).toBe(false);
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("keeps a completed parent's runtime while its native child is running", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const appServer = createFakeCodexAppServer();
+  const stopped = vi.spyOn(appServer.child, "kill");
+  const session = await new ProcessExitCodexClient([appServer]).createSession({
+    provider: "codex",
+    cwd: process.cwd(),
+    modeId: "auto",
+  });
+  try {
+    const run = session.run("delegate");
+    await appServer.waitForTurnStart();
+    appServer.startsTurn({ threadId: "thread-1", turnId: "parent-turn" });
+    appServer.startsSubAgent({
+      callId: "spawn",
+      threadId: "child",
+      agentPath: "worker",
+      parentThreadId: "thread-1",
+    });
+    appServer.startsTurn({ threadId: "child", turnId: "child-turn" });
+    appServer.completeTurn({ threadId: "thread-1" });
+    await run;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(stopped).not.toHaveBeenCalled();
+    appServer.completeTurn({ threadId: "child" });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(stopped).toHaveBeenCalledTimes(1);
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("keeps pending plan approvals across the idle deadline", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await withPendingPlan(async (plan) => {
+      await vi.advanceTimersByTimeAsync(120_000);
+      plan.expectRuntimeAlive();
+      await plan.close();
+      plan.expectCanceledPlan();
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each(["child", "goal", "child goal", "terminal", "child terminal"])(
+  "keeps native %s work even when absent from the display window",
+  async (kind) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let busy = true;
+    const appServer = createFakeCodexAppServer({
+      "thread/backgroundTerminals/list": (params) => ({
+        data:
+          busy &&
+          kind.includes("terminal") &&
+          (params as { threadId: string }).threadId ===
+            (kind.includes("child") ? "old-child" : "thread-1")
+            ? [{ processId: "running-job" }]
+            : [],
+        nextCursor: null,
+      }),
+      "thread/loaded/list": () => ({
+        data: kind.includes("child") ? ["thread-1", "old-child"] : ["thread-1"],
+      }),
+      "thread/read": (params) => ({
+        thread: {
+          status: {
+            type:
+              busy && kind === "child" && (params as { threadId: string }).threadId === "old-child"
+                ? "active"
+                : "idle",
+          },
+          turns: [],
+        },
+      }),
+      "thread/goal/get": (params) => ({
+        goal:
+          busy &&
+          (params as { threadId: string }).threadId ===
+            (kind === "child goal" ? "old-child" : "thread-1")
+            ? { status: "active" }
+            : null,
+      }),
+    });
+    const stopped = vi.spyOn(appServer.child, "kill");
+    const session = new CodexAppServerAgentSession(
+      { provider: "codex", cwd: process.cwd(), modeId: "auto" },
+      null,
+      logger,
+      async () => appServer.child,
+      {},
+      false,
+      kind.includes("goal"),
+    );
+    try {
+      await session.connect();
+      const run = session.run("work");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "thread-1" });
+      appServer.completeTurn();
+      await run;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(stopped).not.toHaveBeenCalled();
+      busy = false;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(stopped).toHaveBeenCalledTimes(1);
+    } finally {
+      await session.close();
+      vi.useRealTimers();
+    }
+  },
+);

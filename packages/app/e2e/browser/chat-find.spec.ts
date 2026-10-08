@@ -393,7 +393,7 @@ test("finds text beyond the normal render cap and restores the cap when Find clo
   try {
     await agent.client.waitForFinish(agent.agentId, 15_000);
     await openAgentRoute(page, agent);
-    const message = page.getByTestId("assistant-message");
+    const message = page.getByTestId("assistant-message").filter({ hasText: "background" });
     await expect(message).toBeVisible();
     await expect(message).not.toContainText(tail);
     await searchChat(page, tail);

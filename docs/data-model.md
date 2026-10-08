@@ -34,6 +34,13 @@ Paseo uses **file-based JSON persistence** instead of a traditional database. Al
 
 All server-side stores live under `$PASEO_HOME` (defaults to `~/.paseo`).
 
+The timeline projection is an exception to JSON storage, but not a new transcript authority:
+`cache/timeline.sqlite` holds disposable fetched rows using Node's built-in SQLite support.
+The worker rebuilds this cache on restart and reads message bodies only for requested pages or
+rows affected by an update. Its SQLite page cache is 1 MiB. Native provider histories and agent
+JSON files are preserved; deleting the projection cache while the daemon is stopped loses no
+saved provider history. See [timeline sync](timeline-sync.md) for pagination and cursor rules.
+
 ## Store Surface Rules
 
 Store APIs own persistence atomicity and should not make services coordinate raw reads and writes. A good store method maps cleanly to one SQL statement or one SQL transaction, even when the current implementation is JSON files. If a caller needs a queue, lock, read-merge-write loop, or uniqueness race workaround, that behavior belongs behind the store surface.

@@ -112,7 +112,7 @@ class InMemoryAgentManager {
     };
   }
 
-  fetchTimeline(_agentId: string, options?: AgentTimelineFetchOptions) {
+  async fetchTimelinePage(_agentId: string, options?: AgentTimelineFetchOptions) {
     return this.timeline.fetch("agent-1", options);
   }
 

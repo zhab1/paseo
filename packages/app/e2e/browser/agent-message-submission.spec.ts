@@ -673,9 +673,11 @@ async function expectStaleCanonicalPagePreservesNewerLiveOutput(
     const nextPrompt = "Stream after the stale snapshot.";
     await agent.client.sendAgentMessage(agent.agentId, nextPrompt);
     const nextPromptRow = page.getByTestId("user-message").filter({ hasText: nextPrompt });
-    const liveAssistant = nextPromptRow.locator(
-      'xpath=following::*[@data-testid="assistant-message"][1]',
-    );
+    // The fork's timestamp is its own Markdown block before the reply body.
+    const liveAssistant = nextPromptRow
+      .locator('xpath=following::*[@data-testid="assistant-message"]')
+      .filter({ hasText: "Cycle 1" })
+      .first();
     await expect(nextPromptRow).toBeVisible();
     await expect(liveAssistant).toContainText("Cycle 1");
     gate.releaseHeldServerMessage();

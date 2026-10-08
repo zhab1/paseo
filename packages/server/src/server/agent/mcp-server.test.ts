@@ -12,6 +12,7 @@ import { z } from "zod";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer } from "./mcp-server.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
+import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type {
@@ -234,6 +235,9 @@ function buildAgentManagerSpies() {
     getAgent: vi.fn(),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
+    getTimelineItemCount: vi.fn(),
+    fetchTimeline: vi.fn(),
+    fetchTimelinePage: vi.fn(),
     resumeAgentFromPersistence: vi.fn(),
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
@@ -264,6 +268,17 @@ function buildAgentStorageSpies() {
 
 function createTestDeps(): TestDeps {
   const agentManagerSpies = buildAgentManagerSpies();
+  agentManagerSpies.getTimelineItemCount.mockImplementation(
+    () => agentManagerSpies.getTimeline().length,
+  );
+  agentManagerSpies.fetchTimeline.mockImplementation((id, options) => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize(id, { items: agentManagerSpies.getTimeline() });
+    return store.fetch(id, options);
+  });
+  agentManagerSpies.fetchTimelinePage.mockImplementation(async (id, options) =>
+    agentManagerSpies.fetchTimeline(id, options),
+  );
   const agentStorageSpies = buildAgentStorageSpies();
 
   return {
@@ -6252,6 +6267,9 @@ describe("agent snapshot MCP serialization", () => {
         currentModeId: "default",
       }),
     );
+    expect(spies.agentManager.fetchTimelinePage).toHaveBeenCalledWith("archived-activity-agent", {
+      limit: 0,
+    });
     expect(spies.agentManager.resumeAgentFromPersistence).toHaveBeenCalled();
     expect(spies.agentManager.hydrateTimelineFromProvider).toHaveBeenCalledWith(
       "archived-activity-agent",
@@ -6284,6 +6302,35 @@ describe("agent snapshot MCP serialization", () => {
 
     const content = String(response.structuredContent.content);
     expect(content).toContain("Hello world. How are you?");
+  });
+
+  it("reads a bounded activity page without materializing the cached transcript", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue(createManagedAgent({ id: "paged-activity" }));
+    spies.agentManager.getTimeline.mockImplementation(() => {
+      throw new Error("The cached transcript must not be materialized");
+    });
+    spies.agentManager.getTimelineItemCount.mockReturnValue(10000);
+    spies.agentManager.fetchTimelinePage.mockResolvedValue({
+      rows: [{ item: { type: "assistant_message", text: "Latest activity" } }],
+      hasOlder: true,
+    });
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      logger: createTestLogger(),
+      providerSnapshotManager: createClaudeOnlyManager(),
+    });
+    const response = await registeredTool(server, "get_agent_activity").handler({
+      agentId: "paged-activity",
+      limit: 1,
+    });
+    expect(response.structuredContent.content).toContain("Latest activity");
+    expect(response.structuredContent.content).not.toContain("Showing all");
+    expect(spies.agentManager.fetchTimelinePage).toHaveBeenCalledWith("paged-activity", {
+      limit: 1,
+    });
+    expect(spies.agentManager.getTimeline).not.toHaveBeenCalled();
   });
 
   it("get_agent_activity limit=2 returns the last two projected entries whole", async () => {

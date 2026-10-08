@@ -998,7 +998,9 @@ function mapSubAgentActivityItem(
   nativeName ||= "Sub-agent";
   return {
     type: "tool_call",
-    callId: item.id,
+    // Native activities have distinct item IDs across history pages and live
+    // notifications, but all update the same child card.
+    callId: `codex-subagent:${item.agentThreadId}`,
     name: "Sub-agent",
     status: item.kind === "interrupted" ? "canceled" : "running",
     error: null,

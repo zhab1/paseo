@@ -121,7 +121,7 @@ export class ImportSessionFlow {
       userText,
     );
     await expect(
-      this.page.getByTestId("assistant-message").filter({ visible: true }),
+      this.page.getByTestId("assistant-message").filter({ visible: true, hasText: assistantText }),
     ).toContainText(assistantText);
   }
   async showAll() {
