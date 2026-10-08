@@ -220,7 +220,9 @@ export class InMemoryAgentTimelineStore {
     let page = this.fetch(agentId, options);
     const limit = options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT;
     while (!page.staleCursor && history.hasOlder()) {
-      if (options?.direction === "after" || (limit > 0 && page.rows.length >= limit)) break;
+      // Native pages can project to fewer rows. Return available rows immediately;
+      // filling the display limit here can replay the entire remaining history.
+      if (options?.direction === "after" || (limit > 0 && page.rows.length > 0)) break;
       let pending = this.historyLoads.get(agentId);
       if (!pending) {
         pending = Promise.resolve().then(async () => {

@@ -1838,7 +1838,6 @@ export async function createPaseoDaemon(
     await agentStorage.flush().catch(() => undefined);
     await agentProviderRuntime.shutdown();
     await pluginRuntime.stopAllPlugins();
-    timelineCache.close();
     terminalManager.killAll();
     await speechService.stop();
     await scheduleService.stop().catch(() => undefined);
@@ -1862,6 +1861,10 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
+    // WebSocket shutdown publishes final metrics, and provider shutdown can leave
+    // coalesced events. Keep the cache open until both readers and writers drain.
+    await agentManager.flushForShutdown();
+    timelineCache.close();
   };
 
   return {

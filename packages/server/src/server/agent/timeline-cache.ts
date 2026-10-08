@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
@@ -17,6 +17,8 @@ export class TimelineCache {
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    // No cache data survives a worker. Recreate even an interrupted/corrupt file.
+    rmSync(path, { force: true });
     this.db = new DatabaseSync(path);
     chmodSync(path, 0o600);
     // A worker owns this cache; epochs and projections are rebuilt after restart.
@@ -24,7 +26,6 @@ export class TimelineCache {
       PRAGMA cache_size = -1024;
       PRAGMA journal_mode = MEMORY;
       PRAGMA synchronous = OFF;
-      DROP TABLE IF EXISTS timeline_rows;
       CREATE TABLE timeline_rows (
         timeline TEXT NOT NULL,
         start INTEGER NOT NULL,

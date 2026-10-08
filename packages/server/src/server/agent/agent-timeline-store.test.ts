@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { TimelineCache } from "./timeline-cache.js";
 import { beforeEach, afterEach, describe, expect, it } from "vitest";
@@ -358,6 +358,43 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
     expect(store.getItemCount("a")).toBe(7);
   });
 
+  it("does not fill a short projected page by downloading the remaining native history", async () => {
+    const store = createStore();
+    const item = (text: string) => ({ type: "user_message" as const, text });
+    store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN, items: [item("latest")] });
+    const older = [[item("middle")], [item("oldest")]];
+    let calls = 0;
+    const history = {
+      hasOlder: () => older.length > 0,
+      loadOlder: async () => {
+        calls++;
+        return older.shift()!.map((entry) => ({ item: entry }));
+      },
+    };
+    const tail = await store.fetchPage("a", undefined, history);
+    expect(calls).toBe(0);
+    expect(tail.rows.map((row) => row.item)).toEqual([item("latest")]);
+    expect(tail.hasOlder).toBe(true);
+    const middle = await store.fetchPage(
+      "a",
+      {
+        direction: "before",
+        cursor: { epoch: tail.epoch, seq: tail.startSeq! },
+      },
+      history,
+    );
+    expect(calls).toBe(1);
+    expect(middle.rows.map((row) => row.item)).toEqual([item("middle")]);
+    expect(middle.hasOlder).toBe(true);
+    const all = await store.fetchPage("a", { limit: 0 }, history);
+    expect(all.rows.map((row) => row.item)).toEqual([
+      item("oldest"),
+      item("middle"),
+      item("latest"),
+    ]);
+    expect(all.hasOlder).toBe(false);
+  });
+
   it("merges a message split at the fetched page boundary", () => {
     const store = createStore();
     store.initialize("a", {
@@ -403,6 +440,32 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
     expect(calls).toBe(1);
     expect(store.getItemCount("a")).toBe(2);
   });
+});
+
+it("recreates an interrupted disposable cache before restoring provider history", () => {
+  const directory = path.join(process.cwd(), ".dev", "timeline-cache-tests", randomUUID());
+  const file = path.join(directory, "timeline.sqlite");
+  let cache: TimelineCache | undefined;
+  try {
+    cache = new TimelineCache(file);
+    const savedHistory = path.join(directory, "native-history.jsonl");
+    writeFileSync(savedHistory, "saved provider history");
+    const old = new InMemoryAgentTimelineStore(cache);
+    old.initialize("a", { items: [{ type: "user_message", text: "previous worker" }] });
+    cache.close();
+    cache = undefined;
+    writeFileSync(file, "interrupted cache write");
+    cache = new TimelineCache(file);
+    expect(readFileSync(savedHistory, "utf8")).toBe("saved provider history");
+    const restored = new InMemoryAgentTimelineStore(cache);
+    restored.initialize("a", { items: [{ type: "user_message", text: "native history" }] });
+    expect(restored.fetch("a").rows.map((row) => row.item)).toEqual([
+      { type: "user_message", text: "native history" },
+    ]);
+  } finally {
+    cache?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 it.each(["tool", "assistant", "child"])(

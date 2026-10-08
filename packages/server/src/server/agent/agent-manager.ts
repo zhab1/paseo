@@ -1191,6 +1191,11 @@ export class AgentManager {
     await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
   }
 
+  getTimelineItemCount(id: string): number {
+    this.requireAgent(id);
+    return this.timelineStore.getItemCount(id);
+  }
+
   getTimeline(id: string): AgentTimelineItem[] {
     this.requireAgent(id);
     return this.timelineStore.getItems(id);

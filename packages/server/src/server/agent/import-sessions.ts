@@ -31,7 +31,7 @@ export type ImportSessionAgentManager = AgentLoaderManager &
     AgentManager,
     | "archiveSnapshot"
     | "closeAgent"
-    | "getTimeline"
+    | "getTimelineItemCount"
     | "importProviderSession"
     | "notifyAgentState"
     | "unarchiveSnapshot"
@@ -239,7 +239,7 @@ async function importProviderSessionNow(
       });
       return {
         snapshot,
-        timelineSize: input.agentManager.getTimeline(snapshot.id).length,
+        timelineSize: input.agentManager.getTimelineItemCount(snapshot.id),
       };
     } catch (error) {
       await rollbackArchivedImport(input, archivedRecord, archivedRecord.archivedAt);
@@ -258,7 +258,7 @@ async function importProviderSessionNow(
 
   return {
     snapshot,
-    timelineSize: input.agentManager.getTimeline(snapshot.id).length,
+    timelineSize: input.agentManager.getTimelineItemCount(snapshot.id),
   };
 }
 
