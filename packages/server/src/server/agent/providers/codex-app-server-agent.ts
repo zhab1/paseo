@@ -2259,7 +2259,7 @@ async function readCodexLatestTurn(client: CodexAppServerClientLike, threadId: s
   );
   const turns = Array.isArray(response?.data) ? response.data : [];
   return {
-    lastTurnId: nonEmptyString(toObjectRecord(turns[0])?.id),
+    lastTurnId: nonEmptyString(toObjectRecord(turns[0])?.id) ?? null,
     latestStatus: readCodexHistoricalTurnStatus(turns),
   };
 }
@@ -4272,7 +4272,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     route: PersistedSubAgentRoute,
     parentCallId: string | null,
     parentSubagentId: string | null,
-    childTurn: Awaited<ReturnType<typeof readCodexChildTurn>> | null,
+    childTurn: Awaited<ReturnType<typeof readCodexLatestTurn>> | null,
   ): void {
     const childThreadId = route.childThreadId;
     const lastTurnId = childTurn?.lastTurnId;
