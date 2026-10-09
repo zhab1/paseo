@@ -104,7 +104,8 @@ function classifyProbeError(error: unknown): boolean {
   ) {
     return false;
   }
-  return false;
+  // A failed launch (for example ENOMEM) is not evidence that the binary is absent.
+  throw error;
 }
 
 /**

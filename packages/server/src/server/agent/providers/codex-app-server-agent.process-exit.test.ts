@@ -709,14 +709,50 @@ test("releases an idle native runtime and resumes the saved thread without repla
     await initial;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(stopped).toHaveBeenCalledTimes(1);
+    await session.setThinkingOption?.("high");
+    expect(await session.getRuntimeInfo()).toMatchObject({
+      sessionId: "thread-1",
+      thinkingOptionId: "high",
+    });
+    expect(second.requests()).toEqual([]);
+    await session.setModel?.("gpt-5.4");
+    await session.setMode?.("read-only");
+    expect(await session.getRuntimeInfo()).toMatchObject({
+      model: "gpt-5.4",
+      modeId: "read-only",
+      thinkingOptionId: "high",
+    });
+    expect(second.requests()).toEqual([]);
     const resumed = session.run("second");
     const turn = await second.waitForTurnStart();
     expect(turn.threadId).toBe("thread-1");
+    expect(turn).toMatchObject({ model: "gpt-5.4", effort: "high" });
     second.startsTurn({ threadId: "thread-1", turnId: "native-second" });
     second.completeTurn();
     await resumed;
     expect(second.requests().some((request) => request.method === "thread/items/list")).toBe(false);
     expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+  } finally {
+    await session.close();
+    vi.useRealTimers();
+  }
+});
+
+test("initializes the first thread when metadata is read after an unused runtime is released", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const first = createFakeCodexAppServer();
+  const second = createFakeCodexAppServer();
+  const stopped = vi.spyOn(first.child, "kill");
+  const session = await new ProcessExitCodexClient([first, second]).createSession({
+    provider: "codex",
+    cwd: process.cwd(),
+    modeId: "auto",
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(await session.getRuntimeInfo()).toMatchObject({ sessionId: "thread-1" });
+    expect(second.requests().some((request) => request.method === "thread/start")).toBe(true);
   } finally {
     await session.close();
     vi.useRealTimers();

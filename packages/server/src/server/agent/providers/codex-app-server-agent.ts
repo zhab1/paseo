@@ -3595,7 +3595,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
-  private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
+  private runtimeInitialized = false;
   private serviceTier: string | null = null;
   private speedModels: CodexModel[] = [];
   private planModeEnabled = false;
@@ -3847,6 +3847,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         throw this.createClosedError();
       }
       this.connectionState = "connected";
+      this.runtimeInitialized = true;
       this.historyRestored = true;
     } catch (error) {
       try {
@@ -4111,7 +4112,6 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.config.featureValues = { ...this.config.featureValues, [featureId]: value };
     this.planModeEnabled = value;
     this.refreshResolvedCollaborationMode();
-    this.cachedRuntimeInfo = null;
   }
 
   private rememberPlanResult(item: ToolCallTimelineItem): void {
@@ -5038,8 +5038,12 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
-    if (this.cachedRuntimeInfo) return { ...this.cachedRuntimeInfo };
-    if (this.connectionState === "disconnected") {
+    if (this.idleReleasePromise) await this.idleReleasePromise;
+    // Settings are local after initialization; metadata reads must not wake an idle runtime.
+    if (
+      this.connectionState === "disconnected" &&
+      (!this.runtimeInitialized || !this.currentThreadId || this.client !== null)
+    ) {
       await this.connect();
     }
     if (!this.currentThreadId) {
@@ -5055,8 +5059,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         ? { collaborationMode: this.resolvedCollaborationMode.name }
         : undefined,
     };
-    this.cachedRuntimeInfo = info;
-    return { ...info };
+    return info;
   }
 
   getActiveTurnId(): string | null {
@@ -5079,7 +5082,6 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.currentMode = modeId;
     this.hasWorkflowModeOverride = true;
     this.config.modeId = modeId;
-    this.cachedRuntimeInfo = null;
     const client = this.client;
     const threadId = this.currentThreadId;
     if (client && threadId) {
@@ -5131,13 +5133,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.config.model = modelId ?? undefined;
     this.reconcileServiceTier();
     this.refreshResolvedCollaborationMode();
-    this.cachedRuntimeInfo = null;
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void | AgentProviderNotice> {
     this.config.thinkingOptionId = normalizeCodexThinkingOptionId(thinkingOptionId);
     this.refreshResolvedCollaborationMode();
-    this.cachedRuntimeInfo = null;
     if (this.activeForegroundTurnId) {
       return THINKING_APPLIES_NEXT_TURN_NOTICE;
     }
@@ -5164,7 +5164,6 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       this.serviceTier = value;
       this.reconcileServiceTier();
-      this.cachedRuntimeInfo = null;
       return;
     }
     if (featureId === "plan_mode") {
@@ -5477,7 +5476,6 @@ export class CodexAppServerAgentSession implements AgentSession {
       threadRollbackAvailable: this.threadRollbackAvailable,
       setThreadId: async (threadId) => {
         this.currentThreadId = threadId;
-        this.cachedRuntimeInfo = null;
         this.persistedHistory = [];
         this.historyPending = false;
         await this.loadPersistedHistory(this.client);
@@ -5997,7 +5995,6 @@ export class CodexAppServerAgentSession implements AgentSession {
       })
     ) {
       this.currentMode = "auto-review";
-      this.cachedRuntimeInfo = null;
     }
     this.currentThreadId = threadId;
   }
