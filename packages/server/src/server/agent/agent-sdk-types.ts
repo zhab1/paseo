@@ -644,6 +644,8 @@ export interface AgentResumeSessionOptions {
   purpose?: AgentResumePurpose;
   /** Skip provider history when Paseo already has the durable timeline. */
   loadHistory?: boolean;
+  /** Allow deferral only after the provider confirms native inactivity. */
+  deferNativeResume?: boolean;
   /** See AgentCreateSessionOptions.configuredModelIds. */
   configuredModelIds?: readonly string[];
 }

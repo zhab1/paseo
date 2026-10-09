@@ -1435,6 +1435,10 @@ export class AgentManager {
       ? {
           ...resumeOptions,
           purpose: record.archivedAt ? ("history" as const) : ("interactive" as const),
+          // The provider must confirm native inactivity before deferring these
+          // candidates; saved display state alone cannot prove a turn has ended.
+          deferNativeResume:
+            !record.archivedAt && (record.lastStatus === "idle" || record.lastStatus === "closed"),
         }
       : resumeOptions;
     const loadHistory =

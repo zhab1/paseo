@@ -25,8 +25,14 @@ Reload releases the old runtime before resuming its durable session: an idle pro
 still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
-Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
+Codex history viewing does not require loading its native execution context. Idle or closed records
+defer native resume only when the native latest turn is terminal, the thread has no descendants,
+and no active native goal or pending question needs recovery. A stale display status cannot hide
+accepted native work. Unknown or unavailable checks retain immediate recovery; parents also resume
+immediately to preserve child/goal recovery. Prompts and execution controls load deferred context.
+Codex also releases a runtime after 60 seconds of verified inactivity, retaining
+the Paseo identity and saved history. Active turns, children, approvals, goals and background terminals
+prevent release. Other providers retain their existing lifecycle.
 
 After an abrupt daemon-worker exit, startup resumes unarchived Codex agents whose last persisted
 status was `running` and whose Codex persistence handle is usable. Recovery starts only after the

@@ -3691,6 +3691,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly agentId?: string,
     private readonly initialResumePurpose: "interactive" | "history" = "interactive",
     private readonly loadHistoryOnResume: boolean = true,
+    private readonly deferNativeResume?: boolean,
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3834,7 +3835,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.loadSkills();
 
       if (this.currentThreadId) {
-        await this.ensureThreadLoaded();
+        if (await this.shouldResumeNativeThread()) await this.ensureThreadLoaded();
         if (this.loadHistoryOnResume && !this.historyRestored) {
           await this.loadPersistedHistory(this.client);
           this.historyRestored = true;
@@ -3861,6 +3862,53 @@ export class CodexAppServerAgentSession implements AgentSession {
         );
       }
       throw error;
+    }
+  }
+
+  private async shouldResumeNativeThread(): Promise<boolean> {
+    if (!this.deferNativeResume || this.asyncQuestions.pending().length) return true;
+    try {
+      // Paseo's last saved status can lag an acknowledged native turn/start.
+      const latest = await readCodexLatestTurn(this.client!, this.currentThreadId!);
+      if (!latest.latestStatus || latest.latestStatus === "running") return true;
+      // Defer only leaf threads. Resuming parents preserves native child/goal
+      // recovery without walking every child's state during a history request.
+      for (const archived of [false, true]) {
+        const children = toObjectRecord(
+          await this.client!.request(
+            "thread/list",
+            {
+              ancestorThreadId: this.currentThreadId,
+              sourceKinds: ["subAgentThreadSpawn"],
+              modelProviders: [],
+              useStateDbOnly: true,
+              archived,
+              limit: 1,
+            },
+            5_000,
+          ),
+        );
+        if (!Array.isArray(children?.data) || children.data.length || children.nextCursor)
+          return true;
+      }
+      if (this.goalsEnabled) {
+        const response = toObjectRecord(
+          await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
+        );
+        if (
+          !response ||
+          !("goal" in response) ||
+          toObjectRecord(response.goal)?.status === "active"
+        )
+          return true;
+      }
+      return false;
+    } catch (error) {
+      this.logger.warn(
+        { err: error },
+        "Could not confirm saved Codex thread is idle before resume",
+      );
+      return true;
     }
   }
 
@@ -5035,6 +5083,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const client = this.client;
     const threadId = this.currentThreadId;
     if (client && threadId) {
+      if (this.deferNativeResume) await this.ensureThreadLoaded();
       const preset = MODE_PRESETS[modeId];
       const params: Record<string, unknown> = { threadId };
       if (this.providerOptions.approval_policy === undefined) {
@@ -7978,6 +8027,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       launchContext?.agentId,
       options?.purpose ?? "interactive",
       options?.loadHistory !== false,
+      options?.deferNativeResume === true,
     );
     await session.connect();
     return session;
