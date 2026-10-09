@@ -6380,6 +6380,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!activity) {
       return false;
     }
+    // A child's message to its parent is not a new child of that parent.
+    if (activity.agentThreadId === this.currentThreadId) return true;
     const callId = this.subAgentCallIdByChildThreadId.get(activity.agentThreadId);
     if (!callId) {
       return false;

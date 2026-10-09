@@ -756,6 +756,44 @@ test("keeps a completed parent's runtime while its native child is running", asy
   }
 });
 
+test.each(["beginsSubAgentActivity", "completesSubAgentActivity"] as const)(
+  "releases an idle parent after %s targets the parent itself",
+  async (emitActivity) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const appServer = createFakeCodexAppServer();
+    const stopped = vi.spyOn(appServer.child, "kill");
+    const session = await new ProcessExitCodexClient([appServer]).createSession({
+      provider: "codex",
+      cwd: process.cwd(),
+      modeId: "auto",
+    });
+    try {
+      const run = session.run("delegate");
+      await appServer.waitForTurnStart();
+      appServer.startsTurn({ threadId: "thread-1", turnId: "parent-turn" });
+      appServer.startsSubAgent({ callId: "spawn", threadId: "child", agentPath: "worker" });
+      appServer.startsTurn({ threadId: "child", turnId: "child-turn" });
+      appServer[emitActivity]({
+        callId: "message-to-parent",
+        threadId: "thread-1",
+        agentPath: "/root",
+        kind: "interacted",
+        parentThreadId: "child",
+      });
+      appServer.completeTurn({ threadId: "thread-1" });
+      await run;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(stopped).not.toHaveBeenCalled();
+      appServer.completeTurn({ threadId: "child" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(stopped).toHaveBeenCalledTimes(1);
+    } finally {
+      await session.close();
+      vi.useRealTimers();
+    }
+  },
+);
+
 test("keeps pending plan approvals across the idle deadline", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
