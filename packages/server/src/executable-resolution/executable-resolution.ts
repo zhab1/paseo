@@ -100,6 +100,7 @@ function classifyProbeError(error: unknown): boolean {
     err.code === "ENOENT" ||
     err.code === "EACCES" ||
     err.code === "ENOEXEC" ||
+    err.code === "EFTYPE" ||
     err.code === "UNKNOWN"
   ) {
     return false;
