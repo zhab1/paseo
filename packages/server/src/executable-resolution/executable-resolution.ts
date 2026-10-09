@@ -100,11 +100,13 @@ function classifyProbeError(error: unknown): boolean {
     err.code === "ENOENT" ||
     err.code === "EACCES" ||
     err.code === "ENOEXEC" ||
+    err.code === "EFTYPE" ||
     err.code === "UNKNOWN"
   ) {
     return false;
   }
-  return false;
+  // A failed launch (for example ENOMEM) is not evidence that the binary is absent.
+  throw error;
 }
 
 /**
