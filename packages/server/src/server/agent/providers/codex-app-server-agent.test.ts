@@ -2075,9 +2075,17 @@ describe("Codex app-server provider", () => {
     },
   );
 
-  test.each([false, true])(
-    "opens a completed parent without native resume, including archived children: %s",
-    async (archived) => {
+  test.each([
+    [false, null],
+    [true, null],
+    [false, "paused"],
+    [false, "blocked"],
+    [false, "usageLimited"],
+    [false, "budgetLimited"],
+    [false, "complete"],
+  ] as const)(
+    "opens a completed parent without native resume: archived=%s goal=%s",
+    async (archived, goalStatus) => {
       const appServer = createFakeCodexAppServer({
         "thread/loaded/list": () => ({ data: [] }),
         "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
@@ -2090,7 +2098,7 @@ describe("Codex app-server provider", () => {
             nextCursor: null,
           };
         },
-        "thread/goal/get": () => ({ goal: null }),
+        "thread/goal/get": () => ({ goal: goalStatus === null ? null : { status: goalStatus } }),
         "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
       });
       const provider = createProviderWithFakeAppServer(appServer);

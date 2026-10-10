@@ -3943,7 +3943,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!response || !("goal" in response)) return false;
     return (
       response.goal === null ||
-      ["paused", "blocked", "usage_limited", "budget_limited", "complete"].includes(
+      ["paused", "blocked", "usageLimited", "budgetLimited", "complete"].includes(
         String(toObjectRecord(response.goal)?.status),
       )
     );
