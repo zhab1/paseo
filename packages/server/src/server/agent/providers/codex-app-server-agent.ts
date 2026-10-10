@@ -3,6 +3,7 @@ import {
   CodexHistoryCursorSchema,
   type CodexHistoryCursor,
 } from "./codex/history-reader.js";
+import { readCodexDescendantIds } from "./codex/thread-graph.js";
 import {
   AGENT_TIMELINE_ITEM_LIMIT,
   limitAgentTimelineItemContent,
@@ -2251,14 +2252,22 @@ function codexDescendantRoutes(
   return routes;
 }
 
-async function readCodexLatestTurn(client: CodexAppServerClientLike, threadId: string) {
+async function readCodexLatestTurn(
+  client: CodexAppServerClientLike,
+  threadId: string,
+  timeoutMs?: number,
+) {
   const response = toObjectRecord(
-    await client.request("thread/turns/list", {
-      threadId,
-      limit: 1,
-      sortDirection: "desc",
-      itemsView: "notLoaded",
-    }),
+    await client.request(
+      "thread/turns/list",
+      {
+        threadId,
+        limit: 1,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      },
+      timeoutMs,
+    ),
   );
   const turns = Array.isArray(response?.data) ? response.data : [];
   return {
@@ -3569,6 +3578,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly config: AgentSessionConfig;
   private readonly asyncQuestions: CodexAsyncQuestions;
   private readonly codexHome: string;
+  private nativeUserAgent: unknown;
   private currentMode: string;
   private hasWorkflowModeOverride: boolean;
   private readonly providerOptions: CodexProviderOptions;
@@ -3825,6 +3835,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         await client.request("initialize", buildCodexAppServerInitializeParams()),
       );
       this.threadRollbackAvailable = codexServerHasThreadRollback(initialized?.userAgent);
+      this.nativeUserAgent = initialized?.userAgent;
       client.notify("initialized", {});
 
       this.speedModels =
@@ -3867,41 +3878,42 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private async shouldResumeNativeThread(): Promise<boolean> {
-    if (!this.deferNativeResume || this.asyncQuestions.pending().length) return true;
+    // A failed version probe cannot prove that even a leaf has no saved goal.
+    if (!this.deferNativeResume || !this.goalsEnabled || this.asyncQuestions.pending().length)
+      return true;
+    const deadline = Date.now() + 5_000;
+    const remaining = () => {
+      const ms = deadline - Date.now();
+      if (ms <= 0) throw new Error("Codex idle metadata check timed out");
+      return ms;
+    };
     try {
+      // This is a fresh app-server. Do not defer a runtime that it already owns,
+      // including one with background terminals which require a loaded thread.
+      const loaded = toObjectRecord(
+        await this.client!.request("thread/loaded/list", {}, remaining()),
+      );
+      if (!Array.isArray(loaded?.data) || loaded.data.length) return true;
       // Paseo's last saved status can lag an acknowledged native turn/start.
-      const latest = await readCodexLatestTurn(this.client!, this.currentThreadId!);
-      if (!latest.latestStatus || latest.latestStatus === "running") return true;
-      // Defer only leaf threads. Resuming parents preserves native child/goal
-      // recovery without walking every child's state during a history request.
-      for (const archived of [false, true]) {
-        const children = toObjectRecord(
-          await this.client!.request(
-            "thread/list",
-            {
-              ancestorThreadId: this.currentThreadId,
-              sourceKinds: ["subAgentThreadSpawn"],
-              modelProviders: [],
-              useStateDbOnly: true,
-              archived,
-              limit: 1,
-            },
-            5_000,
-          ),
-        );
-        if (!Array.isArray(children?.data) || children.data.length || children.nextCursor)
-          return true;
-      }
-      if (this.goalsEnabled) {
-        const response = toObjectRecord(
-          await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
-        );
-        if (
-          !response ||
-          !("goal" in response) ||
-          toObjectRecord(response.goal)?.status === "active"
-        )
-          return true;
+      if (!(await this.savedThreadIsInactive(this.currentThreadId!, remaining))) return true;
+      // Completed children do not require restoring the parent's execution context.
+      // Only defer when the entire bounded tree can be confirmed inactive.
+      // The native database belongs to app-server startup, not this session's
+      // potentially different workspace config. The spawn inherits process.cwd().
+      const response = toObjectRecord(
+        await this.client!.request("config/read", { cwd: process.cwd() }, remaining()),
+      );
+      const config = toObjectRecord(response?.config);
+      if (!config) return true;
+      const descendants = readCodexDescendantIds(
+        config.sqlite_home ?? this.harnessEnvironment.CODEX_SQLITE_HOME ?? this.codexHome,
+        this.currentThreadId!,
+        this.nativeUserAgent,
+      );
+      remaining();
+      if (!descendants) return true;
+      for (const threadId of descendants) {
+        if (!(await this.savedThreadIsInactive(threadId, remaining))) return true;
       }
       return false;
     } catch (error) {
@@ -3911,6 +3923,21 @@ export class CodexAppServerAgentSession implements AgentSession {
       );
       return true;
     }
+  }
+
+  private async savedThreadIsInactive(threadId: string, remaining: () => number): Promise<boolean> {
+    const turn = await readCodexLatestTurn(this.client!, threadId, remaining());
+    if (!turn.latestStatus || turn.latestStatus === "running") return false;
+    const response = toObjectRecord(
+      await this.client!.request("thread/goal/get", { threadId }, remaining()),
+    );
+    if (!response || !("goal" in response)) return false;
+    return (
+      response.goal === null ||
+      ["paused", "blocked", "usageLimited", "budgetLimited", "complete"].includes(
+        String(toObjectRecord(response.goal)?.status),
+      )
+    );
   }
 
   private async loadResolvedWorkspaceWrite(): Promise<void> {

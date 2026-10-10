@@ -26,10 +26,19 @@ still own an exclusive writer. A close failure retains that runtime for cleanup 
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
 Codex history viewing does not require loading its native execution context. Idle or closed records
-defer native resume only when the native latest turn is terminal, the thread has no descendants,
-and no active native goal or pending question needs recovery. A stale display status cannot hide
-accepted native work. Unknown or unavailable checks retain immediate recovery; parents also resume
-immediately to preserve child/goal recovery. Prompts and execution controls load deferred context.
+can defer native resume when the root and all descendants have terminal latest turns and no active
+native goals or pending questions need recovery. This includes archived descendants. Checks use
+native turn/goal metadata and a read-only child-index query, with at most 100 descendants and five
+seconds for the entire check. Codex's descendant-list API can omit children whose optional metadata
+row is missing, so the index query uses the same unjoined edges as native recovery. It reads only
+IDs, never message histories. The query is bound to the inspected Codex 0.160.0 `state_5.sqlite`
+schema and the native process's startup SQLite home; inspect this contract before enabling it for
+another Codex release. Unsupported versions, incomplete graphs, unknown or unavailable state, and
+already-loaded native runtimes retain immediate recovery; deferral also requires goal support.
+Stopped goals (`paused`, `blocked`,
+`usageLimited`, `budgetLimited`, `complete`) permit deferral. These are app-server wire values;
+native SQLite storage uses different spellings for the limited states. A stale display status
+cannot hide accepted native work. Prompts and execution controls load deferred context.
 Codex also releases a runtime after 60 seconds of verified inactivity, retaining
 the Paseo identity and saved history. Active turns, children, approvals, goals and background terminals
 prevent release. Other providers retain their existing lifecycle.
