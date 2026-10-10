@@ -2075,18 +2075,17 @@ describe("Codex app-server provider", () => {
     },
   );
 
-  test.each([false, true, "unavailable"] as const)(
-    "keeps parent recovery when saved descendants may have goals: %s",
+  test.each([false, true])(
+    "opens a completed parent without native resume, including archived children: %s",
     async (archived) => {
       const appServer = createFakeCodexAppServer({
         "thread/loaded/list": () => ({ data: [] }),
         "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
         "thread/list": (params) => {
-          if (archived === "unavailable") return Promise.reject(new Error("children unavailable"));
           return {
             data:
               (params as { archived: boolean }).archived === archived
-                ? [{ id: "child-with-goal" }]
+                ? [{ id: "completed-child" }]
                 : [],
             nextCursor: null,
           };
@@ -2103,14 +2102,111 @@ describe("Codex app-server provider", () => {
       });
       try {
         expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+          false,
+        );
+        await session.startTurn("Continue");
+        expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
           true,
         );
+        appServer.completeTurn({ threadId: "archived-thread-id" });
         appServer.assertNoErrors();
       } finally {
         await session.close();
       }
     },
   );
+
+  test.each([
+    "running",
+    "unknown",
+    "active-goal",
+    "unknown-goal",
+    "goals-unavailable",
+    "unavailable",
+    "incomplete",
+    "too-many",
+    "loaded",
+  ])("preserves native parent recovery when descendant state is %s", async (state) => {
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: state === "loaded" ? ["child"] : [] }),
+      "thread/list": (params) => {
+        if (state === "unavailable") return Promise.reject(new Error("children unavailable"));
+        return {
+          data:
+            state === "too-many"
+              ? Array.from({ length: 60 }, (_, index) => ({
+                  id: `${(params as { archived: boolean }).archived}-${index}`,
+                }))
+              : [{ id: "child" }],
+          nextCursor: state === "incomplete" ? "more" : null,
+        };
+      },
+      "thread/turns/list": (params) => {
+        let status = "completed";
+        if ((params as { threadId: string }).threadId === "child") {
+          if (state === "running") status = "inProgress";
+          if (state === "unknown") status = "unknown";
+        }
+        return { data: [{ id: "last-turn", status }] };
+      },
+      "thread/goal/get": (params) => ({
+        goal:
+          (state === "active-goal" || state === "unknown-goal") &&
+          (params as { threadId: string }).threadId === "child"
+            ? { status: state === "active-goal" ? "active" : "unknown" }
+            : null,
+      }),
+      "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+      Promise.resolve(state !== "goals-unavailable");
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      deferNativeResume: true,
+      loadHistory: false,
+    });
+    try {
+      expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(true);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("bounds the whole idle metadata check before falling back to native recovery", async () => {
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/turns/list": () => ({ data: [{ id: "last-turn", status: "completed" }] }),
+      "thread/list": () => {
+        now += 5_001;
+        return { data: [{ id: "child" }], nextCursor: null };
+      },
+      "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+    });
+    try {
+      const session = await createProviderWithFakeAppServer(appServer).resumeSession(
+        archivedThreadHandle(),
+        undefined,
+        undefined,
+        { deferNativeResume: true, loadHistory: false },
+      );
+      try {
+        expect(
+          appServer.requests().filter((request) => request.method === "thread/list"),
+        ).toHaveLength(1);
+        expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+          true,
+        );
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    } finally {
+      clock.mockRestore();
+    }
+  });
 
   test("unarchives Codex when an active Paseo agent resumes an archived thread", async () => {
     const threadRequests: string[] = [];

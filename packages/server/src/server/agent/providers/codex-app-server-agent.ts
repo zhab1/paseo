@@ -2251,14 +2251,22 @@ function codexDescendantRoutes(
   return routes;
 }
 
-async function readCodexLatestTurn(client: CodexAppServerClientLike, threadId: string) {
+async function readCodexLatestTurn(
+  client: CodexAppServerClientLike,
+  threadId: string,
+  timeoutMs?: number,
+) {
   const response = toObjectRecord(
-    await client.request("thread/turns/list", {
-      threadId,
-      limit: 1,
-      sortDirection: "desc",
-      itemsView: "notLoaded",
-    }),
+    await client.request(
+      "thread/turns/list",
+      {
+        threadId,
+        limit: 1,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      },
+      timeoutMs,
+    ),
   );
   const turns = Array.isArray(response?.data) ? response.data : [];
   return {
@@ -3868,12 +3876,24 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async shouldResumeNativeThread(): Promise<boolean> {
     if (!this.deferNativeResume || this.asyncQuestions.pending().length) return true;
+    const deadline = Date.now() + 5_000;
+    const remaining = () => {
+      const ms = deadline - Date.now();
+      if (ms <= 0) throw new Error("Codex idle metadata check timed out");
+      return ms;
+    };
     try {
+      // This is a fresh app-server. Do not defer a runtime that it already owns,
+      // including one with background terminals which require a loaded thread.
+      const loaded = toObjectRecord(
+        await this.client!.request("thread/loaded/list", {}, remaining()),
+      );
+      if (!Array.isArray(loaded?.data) || loaded.data.length) return true;
       // Paseo's last saved status can lag an acknowledged native turn/start.
-      const latest = await readCodexLatestTurn(this.client!, this.currentThreadId!);
-      if (!latest.latestStatus || latest.latestStatus === "running") return true;
-      // Defer only leaf threads. Resuming parents preserves native child/goal
-      // recovery without walking every child's state during a history request.
+      if (!(await this.savedThreadIsInactive(this.currentThreadId!, remaining))) return true;
+      // Completed children do not require restoring the parent's execution context.
+      // Only defer when the entire bounded tree can be confirmed inactive.
+      const descendants = new Set<string>();
       for (const archived of [false, true]) {
         const children = toObjectRecord(
           await this.client!.request(
@@ -3884,24 +3904,24 @@ export class CodexAppServerAgentSession implements AgentSession {
               modelProviders: [],
               useStateDbOnly: true,
               archived,
-              limit: 1,
+              limit: 100,
             },
-            5_000,
+            remaining(),
           ),
         );
-        if (!Array.isArray(children?.data) || children.data.length || children.nextCursor)
-          return true;
+        if (!Array.isArray(children?.data) || children.nextCursor) return true;
+        for (const child of children.data) {
+          const id = nonEmptyString(toObjectRecord(child)?.id);
+          if (!id) return true;
+          descendants.add(id);
+        }
+        if (descendants.size > 100) return true;
       }
-      if (this.goalsEnabled) {
-        const response = toObjectRecord(
-          await this.client!.request("thread/goal/get", { threadId: this.currentThreadId }, 5_000),
-        );
-        if (
-          !response ||
-          !("goal" in response) ||
-          toObjectRecord(response.goal)?.status === "active"
-        )
-          return true;
+      // A failed version probe can disable goal support without proving that
+      // descendants have no saved goals. Keep native parent recovery in that case.
+      if (descendants.size > 0 && !this.goalsEnabled) return true;
+      for (const threadId of descendants) {
+        if (!(await this.savedThreadIsInactive(threadId, remaining))) return true;
       }
       return false;
     } catch (error) {
@@ -3911,6 +3931,22 @@ export class CodexAppServerAgentSession implements AgentSession {
       );
       return true;
     }
+  }
+
+  private async savedThreadIsInactive(threadId: string, remaining: () => number): Promise<boolean> {
+    const turn = await readCodexLatestTurn(this.client!, threadId, remaining());
+    if (!turn.latestStatus || turn.latestStatus === "running") return false;
+    if (!this.goalsEnabled) return true;
+    const response = toObjectRecord(
+      await this.client!.request("thread/goal/get", { threadId }, remaining()),
+    );
+    if (!response || !("goal" in response)) return false;
+    return (
+      response.goal === null ||
+      ["paused", "blocked", "usage_limited", "budget_limited", "complete"].includes(
+        String(toObjectRecord(response.goal)?.status),
+      )
+    );
   }
 
   private async loadResolvedWorkspaceWrite(): Promise<void> {
