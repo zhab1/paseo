@@ -3,6 +3,7 @@ import {
   CodexHistoryCursorSchema,
   type CodexHistoryCursor,
 } from "./codex/history-reader.js";
+import { readCodexDescendantIds } from "./codex/thread-graph.js";
 import {
   AGENT_TIMELINE_ITEM_LIMIT,
   limitAgentTimelineItemContent,
@@ -3577,6 +3578,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly config: AgentSessionConfig;
   private readonly asyncQuestions: CodexAsyncQuestions;
   private readonly codexHome: string;
+  private nativeUserAgent: unknown;
   private currentMode: string;
   private hasWorkflowModeOverride: boolean;
   private readonly providerOptions: CodexProviderOptions;
@@ -3833,6 +3835,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         await client.request("initialize", buildCodexAppServerInitializeParams()),
       );
       this.threadRollbackAvailable = codexServerHasThreadRollback(initialized?.userAgent);
+      this.nativeUserAgent = initialized?.userAgent;
       client.notify("initialized", {});
 
       this.speedModels =
@@ -3875,7 +3878,9 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private async shouldResumeNativeThread(): Promise<boolean> {
-    if (!this.deferNativeResume || this.asyncQuestions.pending().length) return true;
+    // A failed version probe cannot prove that even a leaf has no saved goal.
+    if (!this.deferNativeResume || !this.goalsEnabled || this.asyncQuestions.pending().length)
+      return true;
     const deadline = Date.now() + 5_000;
     const remaining = () => {
       const ms = deadline - Date.now();
@@ -3893,33 +3898,20 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (!(await this.savedThreadIsInactive(this.currentThreadId!, remaining))) return true;
       // Completed children do not require restoring the parent's execution context.
       // Only defer when the entire bounded tree can be confirmed inactive.
-      const descendants = new Set<string>();
-      for (const archived of [false, true]) {
-        const children = toObjectRecord(
-          await this.client!.request(
-            "thread/list",
-            {
-              ancestorThreadId: this.currentThreadId,
-              sourceKinds: ["subAgentThreadSpawn"],
-              modelProviders: [],
-              useStateDbOnly: true,
-              archived,
-              limit: 100,
-            },
-            remaining(),
-          ),
-        );
-        if (!Array.isArray(children?.data) || children.nextCursor) return true;
-        for (const child of children.data) {
-          const id = nonEmptyString(toObjectRecord(child)?.id);
-          if (!id) return true;
-          descendants.add(id);
-        }
-        if (descendants.size > 100) return true;
-      }
-      // A failed version probe can disable goal support without proving that
-      // descendants have no saved goals. Keep native parent recovery in that case.
-      if (descendants.size > 0 && !this.goalsEnabled) return true;
+      // The native database belongs to app-server startup, not this session's
+      // potentially different workspace config. The spawn inherits process.cwd().
+      const response = toObjectRecord(
+        await this.client!.request("config/read", { cwd: process.cwd() }, remaining()),
+      );
+      const config = toObjectRecord(response?.config);
+      if (!config) return true;
+      const descendants = readCodexDescendantIds(
+        config.sqlite_home ?? this.harnessEnvironment.CODEX_SQLITE_HOME ?? this.codexHome,
+        this.currentThreadId!,
+        this.nativeUserAgent,
+      );
+      remaining();
+      if (!descendants) return true;
       for (const threadId of descendants) {
         if (!(await this.savedThreadIsInactive(threadId, remaining))) return true;
       }
@@ -3936,7 +3928,6 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async savedThreadIsInactive(threadId: string, remaining: () => number): Promise<boolean> {
     const turn = await readCodexLatestTurn(this.client!, threadId, remaining());
     if (!turn.latestStatus || turn.latestStatus === "running") return false;
-    if (!this.goalsEnabled) return true;
     const response = toObjectRecord(
       await this.client!.request("thread/goal/get", { threadId }, remaining()),
     );

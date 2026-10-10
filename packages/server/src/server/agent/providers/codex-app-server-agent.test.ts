@@ -1,6 +1,7 @@
 import { pagedHistoryRequest } from "./codex/test-utils/paged-history.js";
 import { InMemoryAgentTimelineStore, PAGED_HISTORY_ORIGIN } from "../agent-timeline-store.js";
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { readCodexDescendantIds } from "./codex/thread-graph.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -9,6 +10,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
+
+vi.mock("./codex/thread-graph.js", () => ({ readCodexDescendantIds: vi.fn() }));
+beforeEach(() => {
+  vi.mocked(readCodexDescendantIds).mockReset().mockReturnValue([]);
+});
 
 import type {
   AgentLaunchContext,
@@ -1926,6 +1932,7 @@ describe("Codex app-server provider", () => {
 
   test("reads an idle session without loading native context, then resumes on the next prompt", async () => {
     const appServer = createFakeCodexAppServer({
+      "thread/goal/get": () => ({ goal: null }),
       "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
       "thread/loaded/list": () => ({ data: [] }),
       "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
@@ -1942,6 +1949,8 @@ describe("Codex app-server provider", () => {
       }),
     });
     const provider = createProviderWithFakeAppServer(appServer);
+    castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+      Promise.resolve(true);
     const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
       deferNativeResume: true,
     });
@@ -1976,6 +1985,7 @@ describe("Codex app-server provider", () => {
     let loaded = false;
     let sandbox: unknown;
     const appServer = createFakeCodexAppServer({
+      "thread/goal/get": () => ({ goal: null }),
       "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
       "thread/loaded/list": () => ({ data: loaded ? ["archived-thread-id"] : [] }),
       "thread/resume": () => {
@@ -1989,6 +1999,8 @@ describe("Codex app-server provider", () => {
       },
     });
     const provider = createProviderWithFakeAppServer(appServer);
+    castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+      Promise.resolve(true);
     const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
       deferNativeResume: true,
       loadHistory: false,
@@ -2008,6 +2020,7 @@ describe("Codex app-server provider", () => {
     ["active", true],
     ["complete", false],
     ["unavailable", true],
+    ["goals-disabled", true],
   ] as const)(
     "preserves goal recovery when deferring a saved session: %s",
     async (status, resumed) => {
@@ -2022,14 +2035,14 @@ describe("Codex app-server provider", () => {
       });
       const provider = createProviderWithFakeAppServer(appServer);
       castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
-        Promise.resolve(true);
+        Promise.resolve(status !== "goals-disabled");
       const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
         deferNativeResume: true,
         loadHistory: false,
       });
       try {
         expect(appServer.requests().some((request) => request.method === "thread/goal/get")).toBe(
-          true,
+          status !== "goals-disabled",
         );
         expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
           resumed,
@@ -2057,12 +2070,13 @@ describe("Codex app-server provider", () => {
           },
         }),
       });
-      const session = await createProviderWithFakeAppServer(appServer).resumeSession(
-        archivedThreadHandle(),
-        undefined,
-        undefined,
-        { deferNativeResume: true, loadHistory: false },
-      );
+      const provider = createProviderWithFakeAppServer(appServer);
+      castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+        Promise.resolve(true);
+      const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        deferNativeResume: true,
+        loadHistory: false,
+      });
       try {
         expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
           true,
@@ -2075,29 +2089,107 @@ describe("Codex app-server provider", () => {
     },
   );
 
+  test("preserves recovery for missing descendant metadata", async () => {
+    // Native graph recovery sees this child even when thread/list's metadata join omits it.
+    vi.mocked(readCodexDescendantIds).mockReturnValue(["missing-metadata-child"]);
+    const appServer = createFakeCodexAppServer({
+      "thread/loaded/list": () => ({ data: [] }),
+      "thread/list": () => ({ data: [], nextCursor: null }),
+      "thread/turns/list": (params) => ({
+        data: [
+          {
+            id: "last-turn",
+            status:
+              (params as { threadId: string }).threadId === "missing-metadata-child"
+                ? "inProgress"
+                : "completed",
+          },
+        ],
+      }),
+      "thread/goal/get": () => ({ goal: null }),
+      "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+    });
+    const provider = createProviderWithFakeAppServer(appServer);
+    castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+      Promise.resolve(true);
+    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+      deferNativeResume: true,
+      loadHistory: false,
+    });
+    try {
+      expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(true);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test.each([
-    [false, null],
-    [true, null],
-    [false, "paused"],
-    [false, "blocked"],
-    [false, "usageLimited"],
-    [false, "budgetLimited"],
-    [false, "complete"],
+    ["/configured/index", "/environment/index", "/configured/index"],
+    [null, "/environment/index", "/environment/index"],
+    [null, undefined, "/profile/codex"],
   ] as const)(
-    "opens a completed parent without native resume: archived=%s goal=%s",
-    async (archived, goalStatus) => {
+    "checks the native SQLite location: config=%s env=%s",
+    async (configured, environment, expected) => {
+      vi.mocked(readCodexDescendantIds).mockImplementation((home) =>
+        home === expected ? ["active-child"] : [],
+      );
+      const appServer = createFakeCodexAppServer({
+        "config/read": (params) => ({
+          config: {
+            sqlite_home:
+              (params as { cwd?: string }).cwd === process.cwd()
+                ? configured
+                : "/other-workspace/index",
+          },
+        }),
+        "thread/loaded/list": () => ({ data: [] }),
+        "thread/turns/list": (params) => ({
+          data: [
+            {
+              id: "saved",
+              status:
+                (params as { threadId: string }).threadId === "active-child"
+                  ? "inProgress"
+                  : "completed",
+            },
+          ],
+        }),
+        "thread/goal/get": () => ({ goal: null }),
+        "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
+      });
+      const provider = createProviderWithFakeAppServer(appServer, {
+        runtimeSettings: {
+          env: {
+            CODEX_HOME: "/profile/codex",
+            ...(environment ? { CODEX_SQLITE_HOME: environment } : {}),
+          },
+        },
+      });
+      castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+        Promise.resolve(true);
+      const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        deferNativeResume: true,
+        loadHistory: false,
+      });
+      try {
+        expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
+          true,
+        );
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each([null, "paused", "blocked", "usageLimited", "budgetLimited", "complete"])(
+    "opens a completed parent without native resume: goal=%s",
+    async (goalStatus) => {
+      vi.mocked(readCodexDescendantIds).mockReturnValue(["completed-child"]);
       const appServer = createFakeCodexAppServer({
         "thread/loaded/list": () => ({ data: [] }),
         "thread/turns/list": () => ({ data: [{ id: "saved-turn", status: "completed" }] }),
-        "thread/list": (params) => {
-          return {
-            data:
-              (params as { archived: boolean }).archived === archived
-                ? [{ id: "completed-child" }]
-                : [],
-            nextCursor: null,
-          };
-        },
         "thread/goal/get": () => ({ goal: goalStatus === null ? null : { status: goalStatus } }),
         "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
       });
@@ -2132,23 +2224,14 @@ describe("Codex app-server provider", () => {
     "goals-unavailable",
     "unavailable",
     "incomplete",
-    "too-many",
     "loaded",
   ])("preserves native parent recovery when descendant state is %s", async (state) => {
+    vi.mocked(readCodexDescendantIds).mockImplementation(() => {
+      if (state === "unavailable") throw new Error("child index unavailable");
+      return state === "incomplete" ? null : ["child"];
+    });
     const appServer = createFakeCodexAppServer({
       "thread/loaded/list": () => ({ data: state === "loaded" ? ["child"] : [] }),
-      "thread/list": (params) => {
-        if (state === "unavailable") return Promise.reject(new Error("children unavailable"));
-        return {
-          data:
-            state === "too-many"
-              ? Array.from({ length: 60 }, (_, index) => ({
-                  id: `${(params as { archived: boolean }).archived}-${index}`,
-                }))
-              : [{ id: "child" }],
-          nextCursor: state === "incomplete" ? "more" : null,
-        };
-      },
       "thread/turns/list": (params) => {
         let status = "completed";
         if ((params as { threadId: string }).threadId === "child") {
@@ -2184,26 +2267,26 @@ describe("Codex app-server provider", () => {
   test("bounds the whole idle metadata check before falling back to native recovery", async () => {
     let now = Date.now();
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.mocked(readCodexDescendantIds).mockImplementation(() => {
+      now += 5_001;
+      return ["child"];
+    });
     const appServer = createFakeCodexAppServer({
+      "thread/goal/get": () => ({ goal: null }),
       "thread/loaded/list": () => ({ data: [] }),
       "thread/turns/list": () => ({ data: [{ id: "last-turn", status: "completed" }] }),
-      "thread/list": () => {
-        now += 5_001;
-        return { data: [{ id: "child" }], nextCursor: null };
-      },
       "thread/resume": () => ({ thread: { id: "archived-thread-id" } }),
     });
     try {
-      const session = await createProviderWithFakeAppServer(appServer).resumeSession(
-        archivedThreadHandle(),
-        undefined,
-        undefined,
-        { deferNativeResume: true, loadHistory: false },
-      );
+      const provider = createProviderWithFakeAppServer(appServer);
+      castInternals<{ goalsEnabledPromise: Promise<boolean> }>(provider).goalsEnabledPromise =
+        Promise.resolve(true);
+      const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
+        deferNativeResume: true,
+        loadHistory: false,
+      });
       try {
-        expect(
-          appServer.requests().filter((request) => request.method === "thread/list"),
-        ).toHaveLength(1);
+        expect(readCodexDescendantIds).toHaveBeenCalledTimes(1);
         expect(appServer.requests().some((request) => request.method === "thread/resume")).toBe(
           true,
         );
