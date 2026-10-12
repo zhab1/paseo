@@ -5361,6 +5361,7 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
@@ -5462,6 +5463,7 @@ test("does not insert a timestamp when a streamed assistant message gains its tu
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
@@ -5521,6 +5523,7 @@ test("prepends mobile timestamps without changing assistant text", () => {
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
