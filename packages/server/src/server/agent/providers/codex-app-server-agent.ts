@@ -6229,13 +6229,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.handleTurnStartedNotification(parsed);
         return;
       case "turn_error":
-        if (
-          parsed.willRetry &&
-          parsed.threadId === this.currentThreadId &&
-          parsed.turnId === this.currentTurnId
-        ) {
-          this.firstRetryError ??= parsed.message;
-        }
+        this.handleTurnErrorNotification(parsed);
         return;
       case "turn_completed":
         this.handleTurnCompletedNotification(parsed);
@@ -6891,6 +6885,18 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.resetTurnTrackingState();
     this.emitEvent({ type: "turn_started", provider: CODEX_PROVIDER, turnId: parsed.turnId });
     this.pendingInterruptRollover?.(parsed.turnId);
+  }
+
+  private handleTurnErrorNotification(
+    parsed: Extract<ParsedCodexNotification, { kind: "turn_error" }>,
+  ): void {
+    if (
+      parsed.willRetry &&
+      parsed.threadId === this.currentThreadId &&
+      parsed.turnId === this.currentTurnId
+    ) {
+      this.firstRetryError ??= parsed.message;
+    }
   }
 
   private handleTurnCompletedNotification(
