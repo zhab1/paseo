@@ -5419,7 +5419,10 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
     event: {
       type: "timeline",
       provider: "mock",
-      item: { type: "assistant_message", text: "Failure" },
+      item: {
+        type: "assistant_message",
+        text: "[System Error] stream closed before response.completed",
+      },
     },
   });
   listener({
@@ -5448,11 +5451,11 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
         : [],
     ),
   ).toEqual([
-    "20 Sep 14:11:19 UTC:\n\n",
+    "\n\n20 Sep 14:11:19 UTC:\n\n",
     "Hel",
     "lo",
-    "20 Sep 14:11:29 UTC:\n\nFailure",
-    "20 Sep 14:11:31 UTC:\n\nStandalone reply",
+    "\n\n20 Sep 14:11:29 UTC:\n\n[System Error] stream closed before response.completed",
+    "\n\n20 Sep 14:11:31 UTC:\n\nStandalone reply",
   ]);
 });
 
@@ -5508,11 +5511,11 @@ test("does not insert a timestamp when a streamed assistant message gains its tu
       : [],
   );
   expect(assistantTexts).toEqual([
-    "20 Sep 14:11:20 UTC:\n\nThe",
+    "\n\n20 Sep 14:11:20 UTC:\n\nThe",
     " documentation PR is being checked",
   ]);
   expect(assistantTexts.join("")).toBe(
-    "20 Sep 14:11:20 UTC:\n\nThe documentation PR is being checked",
+    "\n\n20 Sep 14:11:20 UTC:\n\nThe documentation PR is being checked",
   );
 });
 
@@ -5592,7 +5595,7 @@ test("prepends mobile timestamps without changing assistant text", () => {
     "Answer",
     "\n\n---\n\n20 Sep 14:11:21 UTC:\n\nAnswer",
     "\n\n---\n\n20 Sep 14:11:22 UTC:\n\nHistory",
-    "20 Sep 14:11:23 UTC:\n\n19 Sep 01:02:03 UTC: Agent prefix",
+    "\n\n20 Sep 14:11:23 UTC:\n\n19 Sep 01:02:03 UTC: Agent prefix",
   ]);
 
   const seenMessageIds = new Set<string>();
@@ -5606,7 +5609,16 @@ test("prepends mobile timestamps without changing assistant text", () => {
     "2026-09-20T14:11:25.000Z",
     seenMessageIds,
   );
-  expect(first.text + resumed.text).toBe("20 Sep 14:11:24 UTC:\n\nThe ROADMAP brief locally");
+  expect(first.text + resumed.text).toBe("\n\n20 Sep 14:11:24 UTC:\n\nThe ROADMAP brief locally");
+  const error = asSessionInternals(session).projectTimelineItem(
+    { type: "assistant_message", text: "[System Error] stream closed before response.completed" },
+    "2026-09-20T14:11:26.000Z",
+    seenMessageIds,
+  );
+  // Android concatenates id-less error rows: their timestamp must remain a separate paragraph.
+  expect(first.text + resumed.text + error.text).toBe(
+    "\n\n20 Sep 14:11:24 UTC:\n\nThe ROADMAP brief locally\n\n20 Sep 14:11:26 UTC:\n\n[System Error] stream closed before response.completed",
+  );
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {

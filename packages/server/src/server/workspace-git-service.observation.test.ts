@@ -1,4 +1,5 @@
 import path from "node:path";
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type pino from "pino";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -1070,12 +1071,20 @@ describe("WorkspaceGitService checkout observation", () => {
     await flushPromises();
     expect(getCheckoutStatus).not.toHaveBeenCalled();
 
-    repoWatcher?.callback(null, [
-      {
-        path: path.join(createLinkedCheckoutFacts(WORKTREE_A).absoluteGitDir, "COMMIT_EDITMSG"),
-        type: "update",
-      },
-    ]);
+    const native = vi.spyOn(realpathSync, "native");
+    try {
+      repoWatcher?.callback(
+        null,
+        Array.from({ length: 64 }, (_, index) => ({
+          path: path.join(createLinkedCheckoutFacts(WORKTREE_A).absoluteGitDir, `ignored-${index}`),
+          type: "update" as const,
+        })),
+      );
+      // One filesystem resolution per event plus the small set of shared roots.
+      expect(native.mock.calls.length).toBeLessThanOrEqual(64 + 8);
+    } finally {
+      native.mockRestore();
+    }
     await vi.advanceTimersByTimeAsync(1_000);
     await flushPromises();
     expect(getCheckoutStatus).not.toHaveBeenCalled();

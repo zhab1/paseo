@@ -580,7 +580,7 @@ export async function holdAssistantStream(page: Page, agentId: string) {
     async showThrough(prefix: string): Promise<void> {
       // Count reply characters, keeping the fork's display prefix on the actual wire.
       const body = () =>
-        forwardedText.replace(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\n\n/, "");
+        forwardedText.replace(/^(?:\n\n)?\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\n\n/, "");
       while (body().length < prefix.length) {
         const frame = pending.shift();
         if (!frame) {

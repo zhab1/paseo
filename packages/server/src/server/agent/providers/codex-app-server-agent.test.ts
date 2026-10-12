@@ -835,6 +835,77 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test.each(["failed", "completed", "interrupted"])(
+    "retains the first retry diagnostic only within its own turn (%s)",
+    (status) => {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const notify = (method: string, params: unknown) =>
+        asInternals(session).handleNotification(method, params);
+      notify("turn/started", { threadId: "test-thread", turn: { id: "test-turn" } });
+      const retry = { threadId: "test-thread", turnId: "test-turn", willRetry: true };
+      notify("error", {
+        ...retry,
+        threadId: "unrelated-thread",
+        error: { message: "Wrong thread" },
+      });
+      notify("error", { ...retry, turnId: "old-turn", error: { message: "Wrong turn" } });
+      notify("error", {
+        ...retry,
+        error: { message: "High demand", additionalDetails: "Please try later" },
+      });
+      notify("error", { ...retry, error: { message: "Stream closed" } });
+      expect(events.map((event) => event.type)).toEqual(["turn_started"]);
+      notify("turn/completed", {
+        threadId: "test-thread",
+        turn: {
+          id: "test-turn",
+          status,
+          error: { message: "Stream closed", additionalDetails: "Response incomplete" },
+        },
+      });
+      if (status === "failed") {
+        expect(events.at(-1)).toMatchObject({
+          type: "turn_failed",
+          error: "Stream closed",
+          diagnostic:
+            "Response incomplete\n\nEarlier provider retry: High demand\n\nPlease try later",
+        });
+      } else {
+        expect(events.at(-1)?.type).toBe(
+          status === "completed" ? "turn_completed" : "turn_canceled",
+        );
+      }
+      notify("turn/started", { threadId: "test-thread", turn: { id: "next-turn" } });
+      notify("turn/completed", {
+        threadId: "test-thread",
+        turn: { id: "next-turn", status: "failed", error: { message: "Another failure" } },
+      });
+      expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "Another failure" });
+      expect(events.at(-1)).not.toHaveProperty("diagnostic");
+    },
+  );
+
+  test("does not duplicate the terminal error as an earlier retry", () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    asInternals(session).handleNotification("turn/started", { turn: { id: "test-turn" } });
+    asInternals(session).handleNotification("error", {
+      threadId: "test-thread",
+      turnId: "test-turn",
+      willRetry: true,
+      error: { message: "High demand" },
+    });
+    asInternals(session).handleNotification("turn/completed", {
+      threadId: "test-thread",
+      turn: { id: "test-turn", status: "failed", error: { message: "High demand" } },
+    });
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "High demand" });
+    expect(events.at(-1)).not.toHaveProperty("diagnostic");
+  });
+
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 
