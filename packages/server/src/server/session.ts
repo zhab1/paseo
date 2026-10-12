@@ -465,8 +465,9 @@ function formatAssistantTimestamp(timestamp: string): string | null {
 
 function prependAssistantTimestamp(text: string, timestamp: string): string {
   const boundary = text.startsWith("\n\n---\n\n") ? "\n\n---\n\n" : "";
-  // Keep the timestamp separate so leading Markdown syntax, including code fences, still parses.
-  return `${boundary}${timestamp}\n\n${text.slice(boundary.length)}`;
+  // Legacy clients concatenate id-less messages (including system errors) to the preceding reply.
+  // Separate the timestamp on both sides without changing streamed message chunks.
+  return `${boundary || "\n\n"}${timestamp}\n\n${text.slice(boundary.length)}`;
 }
 
 // Stub types for features under development (modules not yet available)
