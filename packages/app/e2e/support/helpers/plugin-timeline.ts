@@ -203,7 +203,10 @@ export async function expectWholeCompletedCard(page: Page): Promise<void> {
   await expect(card).toBeVisible();
   // Plugins receive the same timestamp-prefixed body as the default mobile renderer.
   expect(
-    (await card.textContent())?.replace(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\s+/, ""),
+    (await card.textContent())?.replace(
+      /^(?:\n\n)?\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:\s+/,
+      "",
+    ),
   ).toBe(ASSISTANT_TEXT);
   await expect(page.getByTestId("assistant-message")).toHaveCount(0);
 }

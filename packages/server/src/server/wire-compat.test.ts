@@ -386,7 +386,7 @@ describe("wire compatibility", () => {
 
     expect(mobile.payload.entries[0]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:20 UTC:\n\nDone",
+      text: "\n\n20 Sep 14:11:20 UTC:\n\nDone",
       messageId: "message-1",
     });
     expect(cli.payload.entries[0]?.item).toEqual({
@@ -396,12 +396,12 @@ describe("wire compatibility", () => {
     });
     expect(mobile.payload.entries[1]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:30 UTC:\n\n20 Sep 14:11:30 UTC:\n\nAlready timestamped",
+      text: "\n\n20 Sep 14:11:30 UTC:\n\n20 Sep 14:11:30 UTC:\n\nAlready timestamped",
       messageId: "message-2",
     });
     expect(mobile.payload.entries[2]?.item).toEqual({
       type: "assistant_message",
-      text: "20 Sep 14:11:31 UTC:\n\n",
+      text: "\n\n20 Sep 14:11:31 UTC:\n\n",
       messageId: "message-3",
     });
     expect(rows.map((row) => row.item)).toEqual([
