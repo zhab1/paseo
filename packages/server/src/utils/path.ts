@@ -90,9 +90,36 @@ export function normalizePathForIdentity(value: string): string {
  * must keep those two operations coupled.
  */
 export function getRealpathAwareRelativePath(root: string, candidate: string): string | null {
-  const rootVariants = collectPathVariants(root);
-  const candidateVariants = collectPathVariants(candidate);
+  return relativePathFromVariants(collectPathVariants(root), collectPathVariants(candidate));
+}
 
+/** Resolve each path once during one synchronous event batch, never across batches. */
+export function createRealpathAwarePathResolver() {
+  const variants = new Map<string, string[]>();
+  const resolve = (path: string): string[] => {
+    let value = variants.get(path);
+    if (!value) {
+      value = collectPathVariants(path);
+      variants.set(path, value);
+    }
+    return value;
+  };
+  return {
+    relativePath: (root: string, candidate: string) =>
+      relativePathFromVariants(resolve(root), resolve(candidate)),
+    matches: (root: string, candidate: string) =>
+      resolve(root).some((rootVariant) =>
+        resolve(candidate).some((candidateVariant) =>
+          areEquivalentPaths(rootVariant, candidateVariant),
+        ),
+      ),
+  };
+}
+
+function relativePathFromVariants(
+  rootVariants: string[],
+  candidateVariants: string[],
+): string | null {
   for (const rootVariant of rootVariants) {
     for (const candidateVariant of candidateVariants) {
       const relativePath = getRelativePathInsideRoot(rootVariant, candidateVariant);
