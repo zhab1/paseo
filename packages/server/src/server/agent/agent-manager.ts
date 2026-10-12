@@ -1266,10 +1266,10 @@ export class AgentManager {
       return this.timelineStore.fetchPage(id, options, {
         hasOlder: () => agent.session?.hasOlderHistory?.() ?? false,
         loadOlder: async () =>
-          ((await agent.session?.loadOlderHistory?.()) ?? []).filter(
-            (entry) =>
-              entry.item.type !== "user_message" || !isSystemInjectedEnvelope(entry.item.text),
-          ),
+          ((await agent.session?.loadOlderHistory?.()) ?? []).flatMap((entry) => {
+            const item = projectAgentMessage(entry.item);
+            return item ? [{ ...entry, item }] : [];
+          }),
       });
     });
   }
@@ -3716,7 +3716,7 @@ export class AgentManager {
           // Legacy/imported chats need their existing history before startup rows.
           await this.primeTimelineFromLegacyProviderHistory(managed, false, startupHistory);
         } else {
-          for (const entry of buildImportedTimelineRows(session.initialTimeline)) {
+          for (const entry of buildImportedTimelineRows(session.initialTimeline, 0)) {
             this.recordTimeline(managed.id, entry.item, { timestamp: entry.timestamp });
           }
         }

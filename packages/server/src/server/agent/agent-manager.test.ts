@@ -11900,6 +11900,13 @@ test.each(["create", "import"])(
               text: "<paseo-system>\ninternal\n</paseo-system>",
             },
           },
+          {
+            timestamp: "2026-10-12T10:00:00.000Z",
+            item: {
+              type: "user_message" as const,
+              text: '<paseo-system version="1" kind="agent-message" source-agent-id="sender" message-id="older-delivery">\nEarlier message\n</paseo-system>',
+            },
+          },
           { item: { type: "assistant_message" as const, messageId: "older", text: "older" } },
         ];
       }
@@ -11951,7 +11958,23 @@ test.each(["create", "import"])(
         { type: "assistant_message", messageId: "older", text: "older" },
       ]);
       expect(older.startSeq).toBeGreaterThan(0);
-      expect(older.hasOlder).toBe(false);
+      expect(older.hasOlder).toBe(true);
+      const notification = await manager.fetchTimelinePage(agent.id, {
+        direction: "before",
+        limit: 1,
+        cursor: { epoch: older.epoch, seq: older.startSeq! },
+      });
+      expect(notification.rows).toEqual([
+        expect.objectContaining({
+          timestamp: "2026-10-12T10:00:00.000Z",
+          item: expect.objectContaining({
+            type: "tool_call",
+            callId: "paseo-agent-message:older-delivery",
+            name: "agent_message",
+          }),
+        }),
+      ]);
+      expect(notification.hasOlder).toBe(false);
       expect((await manager.fetchTimelinePage(agent.id, { limit: 1 })).endSeq).toBe(recent.endSeq);
     } finally {
       await manager.closeAgent(agent.id);
