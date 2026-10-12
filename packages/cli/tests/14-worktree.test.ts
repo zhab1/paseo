@@ -26,7 +26,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { runPaseoCli, startTestDaemon } from "./helpers/test-daemon.ts";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, relative } from "path";
 
 $.verbose = false;
 
@@ -193,11 +193,13 @@ try {
     "Initial commit",
   ]);
 
+  // Remote relative paths resolve from the daemon's account home, not the CLI cwd.
+  const remoteRepository = relative(daemon.paseoHome, repo);
   for (const args of [
     ["worktree", "ls", "--json"],
     ["worktree", "ls", "--cwd", repo, "--json"],
     ["worktree", "ls", "--cwd", "./repository", "--json"],
-    ["worktree", "ls", "--host", `127.0.0.1:${daemon.port}`, "--cwd", ".", "--json"],
+    ["worktree", "ls", "--host", `127.0.0.1:${daemon.port}`, "--cwd", remoteRepository, "--json"],
   ]) {
     const explicit = args.includes("--cwd");
     const result = await runPaseoCli(daemon, args, {
@@ -219,7 +221,7 @@ try {
       "--host",
       `127.0.0.1:${daemon.port}`,
       "--cwd",
-      ".",
+      remoteRepository,
       "--json",
     ],
   ]) {

@@ -24,7 +24,9 @@ describe("native Codex descendant inventory", () => {
       );
       db.exec("CREATE INDEX parents ON thread_spawn_edges(parent_thread_id)");
       const insert = db.prepare("INSERT INTO thread_spawn_edges VALUES (?, ?)");
+      db.exec("BEGIN");
       for (const edge of edges) insert.run(...edge);
+      db.exec("COMMIT");
     } finally {
       db.close();
     }

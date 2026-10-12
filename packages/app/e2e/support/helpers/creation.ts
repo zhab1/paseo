@@ -203,7 +203,7 @@ export async function createCreationScenario(page: Page) {
     async expectPromptBeforeError(prompt: string) {
       const messages = page
         .getByTestId("user-message")
-        .or(page.getByTestId("assistant-message"))
+        .or(page.getByTestId("assistant-message").filter({ hasText: "[System Error]" }))
         .filter({ visible: true });
       await expect(messages).toHaveCount(2);
       await expect(messages.nth(0)).toContainText(prompt);
