@@ -5254,6 +5254,7 @@ test("unions viewed timelines across socket sources and removes detached sources
   const session = createSessionForTest({
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
@@ -5360,6 +5361,7 @@ test("prepends one timestamp to an unchanged streamed mobile assistant message",
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
@@ -5461,6 +5463,7 @@ test("does not insert a timestamp when a streamed assistant message gains its tu
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
@@ -5520,6 +5523,7 @@ test("prepends mobile timestamps without changing assistant text", () => {
     clientType: "mobile",
     messages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         listeners.push(listener);
         return () => {};
@@ -5613,6 +5617,7 @@ test("keeps selective delivery scoped per socket when a retained session also ha
     messages,
     targetedMessages,
     agentManager: {
+      getAgent: (id: string) => ({ id, internal: false }),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
