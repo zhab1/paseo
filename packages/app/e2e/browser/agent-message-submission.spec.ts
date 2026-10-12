@@ -303,7 +303,10 @@ async function retryRestoredSubmission(page: Page, prompt: string): Promise<void
 }
 
 async function expectRejectedPromptBeforeError(page: Page, prompt: string, errorMessage: string) {
-  const messages = page.getByTestId("user-message").or(page.getByTestId("assistant-message"));
+  // Assistant messages can render a separate timestamp paragraph.
+  const messages = page
+    .getByTestId("user-message")
+    .or(page.getByTestId("assistant-message").filter({ hasText: "[System Error]" }));
   await expect(messages).toHaveCount(2);
   await expect(messages.nth(0)).toContainText(prompt);
   await expect(messages.nth(1)).toContainText(`[System Error] ${errorMessage}`);
