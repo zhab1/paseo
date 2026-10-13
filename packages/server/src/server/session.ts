@@ -4798,7 +4798,10 @@ export class Session {
       );
       if (requestId) {
         const agent = this.agentManager.getAgent(agentId);
-        const payload = agent ? await this.buildAgentPayload(agent) : null;
+        const record = agent ? null : await this.agentStorage.get(agentId);
+        let payload: AgentSnapshotPayload | null = null;
+        if (agent) payload = await this.buildAgentPayload(agent);
+        else if (record) payload = this.buildStoredAgentPayload(record);
         this.emit({
           type: "cancel_agent_response",
           payload: {

@@ -70,6 +70,32 @@ older cancellation from settling a newer turn. If interruption is rejected or ti
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
 Accepting new work after an ambiguous interruption would create a split-brain session.
 
+## Claude five-hour quota continuation
+
+Ordinary Claude chats automatically resume after a five-hour subscription quota stops their main
+task. The phone can be disconnected. Eligibility requires both a main-session API `rate_limit`
+error and Claude's structured rejected `five_hour` event with a valid reset time. Account warnings,
+successful work, background-child errors, overage and unknown limits never arm a continuation.
+Weekly exhaustion cancels a pending continuation, including a block learned while the task is idle.
+
+The existing scheduler persists one private, same-agent job for the limited turn and sends five
+seconds after reset. Overdue quota jobs catch up on daemon startup; ordinary cron recovery still
+skips missed occurrences. Stop, a new user prompt or command, archive and deletion cancel the job.
+An accepted, supported rewind also cancels it before provider mutation, even if the provider later
+fails to rewind. An invalid or unsupported request leaves the pending task eligible.
+Admission checks the latest user message and the conversation's current run before submitting.
+The same interruption permits at most two further quota rearms. An interrupted delivery claim is
+retained as failed and is never blindly replayed after a daemon crash; resume that case manually.
+If accepted-turn metadata cannot be saved, the SDK run stays tracked and further automatic sends
+are disabled; its already-claimed slot still prevents replay.
+
+These jobs use `$PASEO_HOME/schedules`, the scheduler's atomic storage and existing daemon logging.
+They are hidden from user schedule lists and require no client setting or new cadence variant.
+Preserve their records with the durable Paseo home through upgrades for durable duplicate
+suppression. Use agent Stop to cancel; public schedule mutations cannot change or delete these
+private records. Look for `Five-hour task continuation scheduled`, admission, retry-limit and failed
+persistence messages in daemon logs when diagnosing a task that did not resume.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.

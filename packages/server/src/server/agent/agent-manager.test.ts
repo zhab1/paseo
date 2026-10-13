@@ -19,6 +19,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { setQuotaContinuationPending } from "./quota-continuation-presentation.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -1563,6 +1564,140 @@ async function createControlledInterruptFixture(options: {
     },
   };
 }
+
+test("quota-stop hooks run after the matching main run has settled", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "quota-settled",
+    agentId: "00000000-0000-4000-8000-000000000091",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async () => {},
+  });
+  const observed = deferred<void>();
+  const attention = vi.fn();
+  fixture.manager.setAgentAttentionCallback(attention);
+  fixture.manager.setQuotaContinuationHooks({
+    cancel: async () => false,
+    stopped: async () => {
+      expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
+      setQuotaContinuationPending(fixture.agentId, true);
+      observed.resolve();
+    },
+  });
+  await fixture.startForegroundRun();
+  fixture.session.pushEvent({
+    type: "turn_failed",
+    provider: "claude",
+    turnId: "limited-turn",
+    error: "quota",
+    subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
+  });
+  await observed.promise;
+  await fixture.manager.flush();
+  expect(attention).not.toHaveBeenCalled();
+  setQuotaContinuationPending(fixture.agentId, false);
+  await fixture.cleanup();
+});
+
+test("Stop before a queued quota terminal cannot rearm the task", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "quota-stop-race",
+    agentId: "00000000-0000-4000-8000-000000000092",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async (session) => {
+      session.pushEvent({
+        type: "turn_failed",
+        provider: "claude",
+        turnId: "limited-turn",
+        error: "quota",
+        subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
+      });
+    },
+  });
+  const stopped = vi.fn(async () => {});
+  fixture.manager.setQuotaContinuationHooks({ cancel: async () => false, stopped });
+  await fixture.startForegroundRun();
+  await fixture.manager.cancelAgentRun(fixture.agentId);
+  expect(stopped).not.toHaveBeenCalled();
+  await fixture.cleanup();
+});
+
+test.each(["Stop", "weekly", "archive"])(
+  "%s during quota admission cancels before the provider receives a prompt",
+  async (action) => {
+    const fixture = await createControlledInterruptFixture({
+      name: "quota-admission",
+      agentId: "00000000-0000-4000-8000-000000000093",
+      turnId: "limited-turn",
+      provider: "claude",
+      interrupt: async () => {},
+    });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const cancellationSeen = deferred<void>();
+    let cancelled = false;
+    fixture.manager.setQuotaContinuationHooks({
+      cancel: async () => {
+        cancelled = true;
+        cancellationSeen.resolve();
+        await release.promise;
+        return false;
+      },
+      stopped: async () => {},
+    });
+    const start = vi.spyOn(fixture.session, "startTurn");
+    const continuation = fixture.manager.continueQuotaStoppedAgent(
+      fixture.agentId,
+      null,
+      async () => {
+        const eligible = !cancelled;
+        entered.resolve();
+        await release.promise;
+        return eligible;
+      },
+      async () => {},
+    );
+    await entered.promise;
+    let stop: Promise<unknown>;
+    if (action === "Stop") stop = fixture.manager.cancelAgentRun(fixture.agentId);
+    else if (action === "archive") stop = fixture.manager.archiveAgent(fixture.agentId);
+    else {
+      fixture.session.pushEvent({ type: "subscription_blocked", provider: "claude" });
+      stop = cancellationSeen.promise;
+    }
+    await cancellationSeen.promise;
+    release.resolve();
+    expect(await continuation).toBe(false);
+    await stop;
+    expect(start).not.toHaveBeenCalled();
+    await fixture.cleanup();
+  },
+);
+
+test("an idle account weekly block cancels without broadcasting an unknown client event", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "weekly-idle",
+    agentId: "00000000-0000-4000-8000-000000000094",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async () => {},
+  });
+  const cancelled = deferred<void>();
+  const events: AgentManagerEvent[] = [];
+  fixture.manager.subscribe((event) => events.push(event), { replayState: false });
+  fixture.manager.setQuotaContinuationHooks({
+    cancel: async () => {
+      cancelled.resolve();
+      return false;
+    },
+    stopped: async () => {},
+  });
+  fixture.session.pushEvent({ type: "subscription_blocked", provider: "claude" });
+  await cancelled.promise;
+  expect(events.filter((event) => event.type === "agent_stream")).toEqual([]);
+  await fixture.cleanup();
+});
 
 class HeldRuntimeInfoSession extends TestAgentSession {
   private readonly runtimeInfoRequested = deferred<void>();
@@ -11036,6 +11171,40 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each(["success", "failure"])(
+  "out-of-band command waits for durable quota cancellation: %s",
+  async (outcome) => {
+    const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+      workspaceId: undefined,
+    });
+    const cancellation = deferred<boolean>();
+    const run = vi.fn(async () => {});
+    agent.session!.tryHandleOutOfBand = () => ({ run });
+    manager.setQuotaContinuationHooks({
+      cancel: () => cancellation.promise,
+      stopped: async () => {},
+    });
+    const onDispatch = vi.fn();
+    const command = startAgentRun(manager, agent.id, "/handled", logger, { onDispatch });
+    const settled = command.then(
+      () => "accepted",
+      () => "rejected",
+    );
+    await Promise.resolve();
+    expect(run).not.toHaveBeenCalled();
+    expect(onDispatch).not.toHaveBeenCalled();
+    expect(manager.fetchTimeline(agent.id, { direction: "tail", limit: 20 }).rows).toEqual([]);
+    if (outcome === "failure") cancellation.reject(new Error("Durable cancellation failed"));
+    else cancellation.resolve(false);
+    expect(await settled).toBe(outcome === "failure" ? "rejected" : "accepted");
+    expect(run).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
+    expect(onDispatch).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+  },
+);
 
 test("authoritative timeline records a daemon-handled submitted prompt before its output", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-daemon-handled-prompt-"));

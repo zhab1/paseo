@@ -1374,6 +1374,11 @@ export async function createPaseoDaemon(
     archiveWorkspace: archiveScheduleWorkspaceExternal,
   });
   await scheduleService.start();
+  agentManager.setQuotaContinuationHooks({
+    cancel: (agentId) => scheduleService.cancelQuotaContinuation(agentId),
+    stopped: (agentId, event, lastUserMessageAt) =>
+      scheduleService.handleQuotaStop(agentId, event, lastUserMessageAt),
+  });
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);

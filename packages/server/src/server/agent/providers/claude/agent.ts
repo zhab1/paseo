@@ -14,6 +14,7 @@ import {
   type Query,
   type SDKMessage,
   type SDKPartialAssistantMessage,
+  type SDKRateLimitInfo,
   type SDKResultMessage,
   type SDKSystemMessage,
   type SDKUserMessage,
@@ -2215,6 +2216,11 @@ class ClaudeAgentSession implements AgentSession {
    * cleared by the turn's result or an idle session state. See observeMainTurnBracket.
    */
   private mainTurnInFlight = false;
+  private mainQuotaStop = false;
+  private mainSubscriptionLimit: Extract<
+    AgentStreamEvent,
+    { type: "turn_failed" }
+  >["subscriptionLimit"];
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
   private readonly contextUsage: ClaudeContextUsageState;
@@ -4040,6 +4046,8 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     if (isClaudeTurnInit(message)) {
+      this.mainQuotaStop = false;
+      this.mainSubscriptionLimit = undefined;
       this.mainTurnInFlight = true;
       // A new turn has begun, so the interrupted one is over. An interrupt that landed after its
       // turn had already ended gets no result, and the leftover flag would swallow this turn's.
@@ -4060,10 +4068,47 @@ class ClaudeAgentSession implements AgentSession {
     return isClaudeTurnInit(message) && !this.activeForegroundTurnId;
   }
 
-  private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
-    if (this.consumeSessionStateChange(message)) {
-      return;
+  private readSubscriptionLimit(info: SDKRateLimitInfo): typeof this.mainSubscriptionLimit {
+    if (info.rateLimitType?.startsWith("seven_day")) return { type: "weekly" };
+    if (
+      info.rateLimitType !== "five_hour" ||
+      info.isUsingOverage ||
+      info.overageInUse ||
+      typeof info.resetsAt !== "number" ||
+      !Number.isFinite(info.resetsAt) ||
+      info.resetsAt <= 0 ||
+      !Number.isFinite(new Date(info.resetsAt * 1000).getTime())
+    )
+      return undefined;
+    return { type: "five_hour", resetsAt: info.resetsAt };
+  }
+
+  private observeSubscriptionQuota(message: SDKMessage): void {
+    if (
+      message.type === "rate_limit_event" &&
+      message.rate_limit_info.status === "rejected" &&
+      message.rate_limit_info.rateLimitType?.startsWith("seven_day")
+    ) {
+      // Weekly exhaustion is an account block, including when learned while the main task is idle.
+      this.notifySubscribers({ type: "subscription_blocked", provider: "claude" });
     }
+    // Account warnings can arrive from background work. Correlate a rejected window only
+    // with a main-session API quota error inside Claude's own init/result bracket.
+    if (this.mainTurnInFlight && !readClaudeParentToolUseId(message)) {
+      if (message.type === "assistant" && message.error === "rate_limit") {
+        this.mainQuotaStop = true;
+      }
+      if (message.type === "rate_limit_event" && message.rate_limit_info.status === "rejected") {
+        const info = message.rate_limit_info;
+        if (this.mainSubscriptionLimit?.type !== "weekly")
+          this.mainSubscriptionLimit = this.readSubscriptionLimit(info);
+      }
+    }
+  }
+
+  private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
+    this.observeSubscriptionQuota(message);
+    if (this.consumeSessionStateChange(message)) return;
     this.observeMainTurnBracket(message);
     if (this.shouldSuppressStaleResult(message)) {
       return;
@@ -4695,6 +4740,20 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
+    if (this.mainQuotaStop) {
+      events.push(...this.sidechainTracker.finishAll("failed"));
+      const error = this.mainSubscriptionLimit
+        ? "Claude subscription usage limit stopped the task"
+        : (message.subtype !== "success" && message.errors.join("\n")) ||
+          "Claude API rate limit stopped the task";
+      events.push({
+        ...this.buildTurnFailedEvent(error),
+        ...(this.mainSubscriptionLimit ? { subscriptionLimit: this.mainSubscriptionLimit } : {}),
+      });
+      this.mainQuotaStop = false;
+      this.mainSubscriptionLimit = undefined;
+      return;
+    }
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")

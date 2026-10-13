@@ -18,6 +18,7 @@ import type {
   ImportableProviderSession,
 } from "./agent-sdk-types.js";
 import type { ManagedAgent } from "./agent-manager.js";
+import { quotaContinuationStatus } from "./quota-continuation-presentation.js";
 import type { JsonValue } from "../json-utils.js";
 import {
   isStoredAgentProviderAvailable,
@@ -124,7 +125,7 @@ export function toAgentPayload(
     createdAt: agent.createdAt.toISOString(),
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
-    status: agent.lifecycle,
+    status: quotaContinuationStatus(agent.id, agent.lifecycle),
     activeTurn: agent.activeTurnId
       ? {
           turnId: agent.activeTurnId,
@@ -237,7 +238,7 @@ export function buildStoredAgentPayload(
     createdAt: createdAt.toISOString(),
     updatedAt: updatedAt.toISOString(),
     lastUserMessageAt: lastUserMessageAt ? lastUserMessageAt.toISOString() : null,
-    status: record.lastStatus,
+    status: quotaContinuationStatus(record.id, record.lastStatus, record.archivedAt),
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,
     availableModes: [],

@@ -19,6 +19,7 @@ export type AgentRunController = Pick<
   AgentManager,
   | "getAgent"
   | "tryRunOutOfBand"
+  | "cancelQuotaContinuationForIntent"
   | "hasInFlightRun"
   | "replaceAgentRun"
   | "steerOrReplaceActiveTurn"
@@ -115,7 +116,9 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  if (agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
+  const cancellation = agentManager.cancelQuotaContinuationForIntent(agentId);
+  if (cancellation) await cancellation;
+  if (await agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions)) {
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }

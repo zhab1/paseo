@@ -70,6 +70,16 @@ export const StoredScheduleSchema = z.object({
   expiresAt: z.string().nullable(),
   maxRuns: z.number().int().positive().nullable(),
   runs: z.array(ScheduleRunSchema),
+  // Optional metadata keeps the existing cadence and summary wire format readable by old clients.
+  quotaContinuation: z
+    .object({
+      turnId: z.string(),
+      lastUserMessageAt: z.string().nullable(),
+      attempt: z.number().int().min(0).max(2),
+      deliveredTurnId: z.string().optional(),
+      cancelled: z.boolean().optional(),
+    })
+    .optional(),
 });
 export type StoredSchedule = z.infer<typeof StoredScheduleSchema>;
 

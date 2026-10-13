@@ -6,6 +6,7 @@ import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
+import { hasQuotaContinuationPending } from "./quota-continuation-presentation.js";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -80,7 +81,7 @@ import {
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
 } from "./agent-run-state.js";
-import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import { resolveRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { projectAgentMessage } from "./agent-messages/index.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
@@ -784,6 +785,20 @@ export class AgentManager {
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private onAgentArchived?: AgentArchivedCallback;
+  private quotaContinuationHooks?: {
+    cancel: (agentId: string) => Promise<boolean>;
+    stopped: (
+      agentId: string,
+      event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
+      lastUserMessageAt: string | null,
+    ) => Promise<void>;
+  };
+  private readonly quotaContinuationStarts = new WeakSet<AgentRunOptions>();
+  private readonly quotaContinuationAdmissions = new WeakMap<
+    AgentRunOptions,
+    (turnId: string) => Promise<void>
+  >();
+  private readonly quotaStoppedByUser = new Set<string>();
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: {
@@ -881,6 +896,110 @@ export class AgentManager {
 
   setAgentArchivedCallback(callback: AgentArchivedCallback): void {
     this.onAgentArchived = callback;
+  }
+
+  setQuotaContinuationHooks(hooks: NonNullable<AgentManager["quotaContinuationHooks"]>): void {
+    this.quotaContinuationHooks = hooks;
+  }
+
+  cancelQuotaContinuationForIntent(agentId: string): Promise<boolean> | undefined {
+    this.quotaStoppedByUser.add(agentId);
+    return this.quotaContinuationHooks?.cancel(agentId);
+  }
+
+  async reportQuotaReloadFailure(
+    agentId: string,
+    lastUserMessageAt: string | null,
+    error: unknown,
+  ): Promise<void> {
+    await this.runLifecycleMutation(agentId, async () => {
+      const registry = this.requireRegistry();
+      const record = await registry.get(agentId);
+      if (
+        !record ||
+        record.archivedAt ||
+        record.internal ||
+        record.requiresAttention ||
+        this.agents.has(agentId) ||
+        this.inFlightAgentCloses.has(agentId) ||
+        this.quotaStoppedByUser.has(agentId) ||
+        (record.lastUserMessageAt ?? null) !== lastUserMessageAt
+      )
+        return;
+      const updatedAt = this.nextStoredUpdatedAt(record);
+      const next: StoredAgentRecord = {
+        ...record,
+        updatedAt,
+        lastStatus: "error",
+        lastError: error instanceof Error ? error.message : String(error),
+        requiresAttention: true,
+        attentionReason: "error",
+        attentionTimestamp: updatedAt,
+      };
+      await registry.upsert(next);
+      if (
+        this.quotaStoppedByUser.has(agentId) ||
+        this.agents.has(agentId) ||
+        this.inFlightAgentCloses.has(agentId)
+      ) {
+        const current = await registry.get(agentId);
+        if (current?.attentionTimestamp === updatedAt)
+          await registry.upsert({
+            ...current,
+            requiresAttention: record.requiresAttention,
+            attentionReason: record.attentionReason,
+            attentionTimestamp: record.attentionTimestamp,
+          });
+        return;
+      }
+      this.dispatchStoredAgentState(next);
+      this.broadcastAgentAttention(next, "error");
+    });
+  }
+
+  async continueQuotaStoppedAgent(
+    agentId: string,
+    lastUserMessageAt: string | null,
+    claim: () => Promise<boolean>,
+    onStarted: (turnId: string) => Promise<void>,
+  ): Promise<boolean> {
+    return this.runForegroundMutation(agentId, async () => {
+      await this.drainSessionEvents(agentId);
+      const agent = this.requireSessionAgent(agentId);
+      if (
+        this.hasInFlightRun(agentId) ||
+        this.quotaStoppedByUser.has(agentId) ||
+        (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
+      )
+        return false;
+      if (
+        !(await claim()) ||
+        this.hasInFlightRun(agentId) ||
+        this.quotaStoppedByUser.has(agentId) ||
+        this.agents.get(agentId) !== agent ||
+        (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
+      )
+        return false;
+      const options: AgentRunOptions = {};
+      this.quotaContinuationStarts.add(options);
+      this.quotaContinuationAdmissions.set(options, onStarted);
+      const iterator = this.streamAgent(
+        agentId,
+        "Continue the task that was interrupted by the five-hour usage limit. Resume from the existing context and completed work.",
+        options,
+      );
+      await iterator.next();
+      void (async () => {
+        try {
+          for await (const _event of iterator) {
+            /* Normal subscribers own delivery. */
+          }
+        } catch (error) {
+          this.logger.error({ err: error, agentId }, "Quota continuation failed after admission");
+        }
+      })();
+      return true;
+    });
   }
 
   setMcpBaseUrl(url: string | null): void {
@@ -1904,6 +2023,7 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    this.quotaStoppedByUser.add(agentId);
     return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId));
   }
 
@@ -1911,7 +2031,9 @@ export class AgentManager {
     agentId: string,
     requestedArchivedAt?: string,
   ): Promise<{ archivedAt: string }> {
+    this.quotaStoppedByUser.add(agentId);
     const agent = this.requireAgent(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     if (agent.internal) {
       // Nothing about an internal agent is on disk, and archiving must not put
       // it there. Its final snapshot is kept in memory for a while (see
@@ -2295,7 +2417,20 @@ export class AgentManager {
 
   notifyAgentState(agentId: string): void {
     const agent = this.agents.get(agentId);
-    if (!agent || agent.internal) {
+    if (!agent) {
+      const task = this.registry
+        ?.get(agentId)
+        .then((record) => {
+          if (record && !this.agents.has(agentId)) this.dispatchStoredAgentState(record);
+          return undefined;
+        })
+        .catch((err) => {
+          this.logger.error({ err, agentId }, "Failed to publish stored agent state");
+        });
+      if (task) this.trackBackgroundTask(task);
+      return;
+    }
+    if (agent.internal) {
       return;
     }
     this.touchUpdatedAt(agent);
@@ -2352,6 +2487,7 @@ export class AgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+    this.quotaStoppedByUser.add(agentId);
     return this.runLifecycleMutation(agentId, () =>
       this.archiveSnapshotUnlocked(agentId, archivedAt),
     );
@@ -2371,6 +2507,8 @@ export class AgentManager {
       return archivedRecord;
     }
 
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     const record = await registry.get(agentId);
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
@@ -2539,12 +2677,18 @@ export class AgentManager {
    * emitted by the handler flow through dispatchStream so they persist and
    * broadcast like normal timeline events.
    */
-  tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
+  async tryRunOutOfBand(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<boolean> {
     const agent = this.requireSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
       return false;
     }
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
       this.emitState(agent);
@@ -2623,7 +2767,17 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
+      if (!options || !this.quotaContinuationStarts.has(options)) {
+        const cancellation = this.cancelQuotaContinuationForIntent(agentId);
+        if (cancellation) await cancellation;
+      }
+      if (pendingRun.settled)
+        throw new Error(`Agent ${agentId} run was canceled before its turn started`);
+      if (!options || !this.quotaContinuationStarts.has(options))
+        this.quotaStoppedByUser.delete(agentId);
       const result = await agent.session.startTurn(prompt, options);
+      const admitted = options ? this.quotaContinuationAdmissions.get(options) : undefined;
+      if (admitted) await this.persistQuotaContinuationAdmission(agentId, result.turnId, admitted);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -2656,6 +2810,31 @@ export class AgentManager {
       this.finalizeForegroundTurn(agent);
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
+    }
+  }
+
+  private async persistQuotaContinuationAdmission(
+    agentId: string,
+    turnId: string,
+    admitted: (turnId: string) => Promise<void>,
+  ): Promise<void> {
+    try {
+      await admitted(turnId);
+    } catch (err) {
+      // The provider accepted the turn. Keep its run owned, and suppress further automatic sends.
+      this.quotaStoppedByUser.add(agentId);
+      this.logger.error(
+        { err, agentId, turnId },
+        "Accepted quota continuation identity was not saved",
+      );
+      try {
+        if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+      } catch (cancelError) {
+        this.logger.error(
+          { err: cancelError, agentId },
+          "Failed to end claimed quota continuation",
+        );
+      }
     }
   }
 
@@ -2695,10 +2874,17 @@ export class AgentManager {
     }
 
     const agent = existingAgent;
+    if (!options || !this.quotaContinuationStarts.has(options))
+      this.quotaStoppedByUser.add(agentId);
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
+    if (options && this.quotaContinuationStarts.has(options)) {
+      // A real pending run owns this attempt, including a transport rejection before acceptance.
+      agent.lifecycle = "running";
+      this.emitState(agent);
+    }
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -2794,7 +2980,11 @@ export class AgentManager {
     return streamForwarder;
   }
 
-  private finalizeForegroundTurn(agent: ActiveManagedAgent, turnId?: string): void {
+  private finalizeForegroundTurn(
+    agent: ActiveManagedAgent,
+    turnId?: string,
+    deferState = false,
+  ): void {
     const mutableAgent = agent;
     if (turnId) {
       this.runs.rememberFinalizedTurn(mutableAgent, turnId);
@@ -2832,7 +3022,7 @@ export class AgentManager {
       },
       "agent.manager.finalize",
     );
-    if (!shouldHoldBusyForReplacement) {
+    if (!shouldHoldBusyForReplacement && !deferState) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
     }
@@ -2974,6 +3164,8 @@ export class AgentManager {
     operation: () => Promise<T>,
   ): Promise<T> {
     return this.runForegroundMutation(agent.id, async () => {
+      const cancellation = this.cancelQuotaContinuationForIntent(agent.id);
+      if (cancellation) await cancellation;
       await this.drainSessionEvents(agent.id);
       this.agentStreamCoalescer.flushFor(agent.id);
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
@@ -3040,6 +3232,7 @@ export class AgentManager {
     clientMessageId: string | undefined,
     expectedTurnId: string,
   ): Promise<void> {
+    this.quotaStoppedByUser.delete(agent.id);
     if (!clientMessageId) {
       return;
     }
@@ -3203,6 +3396,10 @@ export class AgentManager {
   }
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+    const pendingQuota = hasQuotaContinuationPending(agentId);
+    const cancellation = this.cancelQuotaContinuationForIntent(agentId);
+    if (cancellation) await cancellation;
+    if (pendingQuota && !this.agents.has(agentId)) return { status: "settled" };
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
   }
 
@@ -3343,6 +3540,9 @@ export class AgentManager {
       throw new Error("Cannot rewind before the provider acknowledges the submitted prompt");
     }
     const providerMessageId = submittedRow?.providerMessageId ?? messageId;
+    const rewind = resolveRewindCapability(agent.session, mode);
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
 
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "rewind");
@@ -3354,7 +3554,7 @@ export class AgentManager {
         { agentId, provider: agent.provider, messageId, mode },
         "agent.rewind.start",
       );
-      await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
+      await rewind({ messageId: providerMessageId });
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, {
           force: true,
@@ -3388,6 +3588,8 @@ export class AgentManager {
   }
 
   async deleteAgentState(agentId: string): Promise<void> {
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     this.discardRetainedAgentState(agentId);
     await this.deleteCommittedTimeline(agentId);
   }
@@ -3944,6 +4146,7 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.quotaStoppedByUser.delete(agentId);
     this.timelineStore.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     for (const event of this.providerSubagents.deleteParent(agentId)) {
@@ -3971,6 +4174,11 @@ export class AgentManager {
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+    if (
+      event.type === "subscription_blocked" ||
+      (event.type === "turn_failed" && event.subscriptionLimit?.type === "weekly")
+    )
+      this.quotaStoppedByUser.add(agentId);
     this.logger.trace(
       {
         agentId,
@@ -4393,6 +4601,9 @@ export class AgentManager {
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
     event = limitAgentStreamEventContent(event);
+    const cancellation = this.quotaLifecycleCancellation(agent, event, options?.fromHistory);
+    if (cancellation) await cancellation;
+    if (event.type === "subscription_blocked") return false;
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
     event = identified.event;
     const eventTurnId = identified.turnId;
@@ -4426,6 +4637,7 @@ export class AgentManager {
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
+    const quotaWait = this.isExpectedQuotaWait(event);
 
     const dispatchPromise = this.dispatchStreamEventByType({
       agent,
@@ -4444,18 +4656,111 @@ export class AgentManager {
       if (isTurnTerminalEvent(event)) {
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {
-          this.finalizeForegroundTurn(agent, eventTurnId);
+          this.finalizeForegroundTurn(agent, eventTurnId, quotaWait);
         }
+        if (this.quotaContinuationHooks)
+          await this.handleQuotaTerminal(agent, event, terminalDisposition);
       }
 
-      if (flags.shouldDispatchEvent) {
-        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
-      }
+      this.publishLiveStreamEvent({ agent, event, flags, quotaWait });
     }
 
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private publishLiveStreamEvent(params: {
+    agent: ActiveManagedAgent;
+    event: AgentStreamEvent;
+    flags: StreamEventFlags;
+    quotaWait: boolean;
+  }): void {
+    const { agent, event, flags, quotaWait } = params;
+    if (flags.shouldDispatchEvent)
+      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+    // Publish pending task status after its terminal provider frame so old clients retain Stop.
+    if (quotaWait) this.emitState(agent);
+  }
+
+  private isExpectedQuotaWait(event: AgentStreamEvent): boolean {
+    return (
+      event.type === "turn_failed" &&
+      event.subscriptionLimit?.type === "five_hour" &&
+      !!this.quotaContinuationHooks
+    );
+  }
+
+  private quotaLifecycleCancellation(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    fromHistory?: boolean,
+  ): Promise<void> | undefined {
+    if (!this.quotaContinuationHooks) return undefined;
+    if (
+      event.type === "subscription_blocked" ||
+      (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)
+    ) {
+      return this.quotaContinuationHooks.cancel(agent.id).then((endedQuotaWait) => {
+        if (
+          event.type === "subscription_blocked" &&
+          endedQuotaWait &&
+          !hasQuotaContinuationPending(agent.id) &&
+          agent.lifecycle === "error" &&
+          !agent.internal &&
+          !agent.attention.requiresAttention
+        ) {
+          agent.attention = {
+            requiresAttention: true,
+            attentionReason: "error",
+            attentionTimestamp: new Date(),
+          };
+          this.broadcastAgentAttention(agent, "error");
+          this.emitState(agent);
+        }
+        return undefined;
+      });
+    }
+    return undefined;
+  }
+
+  private async handleQuotaTerminal(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    disposition: ActiveTurnTerminalDisposition,
+  ): Promise<void> {
+    if (
+      event.type !== "turn_failed" ||
+      disposition === "stale" ||
+      this.quotaStoppedByUser.has(agent.id) ||
+      !this.quotaContinuationHooks
+    )
+      return;
+    try {
+      const lastUserMessageAt = agent.lastUserMessageAt;
+      if (event.subscriptionLimit?.type === "five_hour") {
+        // A durable job must never outlive the durable ownership snapshot it references.
+        await this.persistSnapshot(agent);
+        if (
+          this.agents.get(agent.id) !== agent ||
+          agent.lastUserMessageAt !== lastUserMessageAt ||
+          this.quotaStoppedByUser.has(agent.id) ||
+          this.hasInFlightRun(agent.id) ||
+          agent.lifecycle !== "error"
+        )
+          return;
+      }
+      await this.quotaContinuationHooks.stopped(
+        agent.id,
+        event,
+        lastUserMessageAt?.toISOString() ?? null,
+      );
+    } catch (error) {
+      this.logger.error(
+        { err: error, agentId: agent.id, turnId: event.turnId },
+        "Failed to persist quota continuation; resume manually",
+      );
+    }
   }
 
   private traceHandleStreamEventStart(
@@ -4723,7 +5028,9 @@ export class AgentManager {
     options: { fromHistory?: boolean } | undefined;
   }): Promise<void> {
     const { agent, event, eventTurnId, isForegroundEvent, terminalDisposition, options } = params;
-    this.logger.warn(
+    const quotaWait =
+      event.subscriptionLimit?.type === "five_hour" && !!this.quotaContinuationHooks;
+    this.logger[quotaWait ? "info" : "warn"](
       {
         agentId: agent.id,
         provider: agent.provider,
@@ -4743,14 +5050,16 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
-    await this.appendSystemErrorTimelineMessage(
-      agent,
-      event.provider,
-      this.formatTurnFailedMessage(event),
-      options,
-    );
+    if (!quotaWait) {
+      await this.appendSystemErrorTimelineMessage(
+        agent,
+        event.provider,
+        this.formatTurnFailedMessage(event),
+        options,
+      );
+    }
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
-    if (!isForegroundEvent && !agent.activeForegroundTurnId) {
+    if (!isForegroundEvent && !agent.activeForegroundTurnId && !quotaWait) {
       this.emitState(agent);
     }
   }
@@ -5097,7 +5406,7 @@ export class AgentManager {
     this.previousStatuses.set(agent.id, currentStatus);
 
     // Skip attention tracking for internal agents
-    if (agent.internal) {
+    if (agent.internal || hasQuotaContinuationPending(agent.id)) {
       return;
     }
 
@@ -5229,7 +5538,7 @@ export class AgentManager {
   }
 
   private broadcastAgentAttention(
-    agent: ManagedAgent,
+    agent: Pick<ManagedAgent, "id" | "provider" | "labels">,
     reason: "finished" | "error" | "permission",
   ): void {
     if (isDelegatedAgent(agent)) {

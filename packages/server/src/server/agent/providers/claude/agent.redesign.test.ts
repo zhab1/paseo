@@ -1342,6 +1342,190 @@ const rateLimitEvent = {
   session_id: "sess-1",
 };
 
+test("a main API quota stop retains its five-hour reset even when the SDK result is success", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  const query = createPendingQueryMock();
+  await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+  await internal.routeSdkMessageFromPump(helperTaskStarted, query);
+  await internal.routeSdkMessageFromPump(
+    {
+      ...rateLimitEvent,
+      rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000 },
+    },
+    query,
+  );
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "assistant",
+      error: "rate_limit",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "text", text: "Session limit reached" }] },
+    },
+    query,
+  );
+  await internal.routeSdkMessageFromPump(successResult(), query);
+  expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+    expect.objectContaining({ subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 } }),
+  ]);
+  expect(events.filter((event) => event.type === "turn_completed")).toEqual([]);
+  await session.close();
+});
+
+test.each([
+  { status: "allowed", rateLimitType: "five_hour", resetsAt: 1780000000 },
+  { status: "allowed_warning", rateLimitType: "five_hour", resetsAt: 1780000000 },
+  { status: "rejected", rateLimitType: "five_hour", resetsAt: NaN },
+  { status: "rejected", rateLimitType: "five_hour", resetsAt: -1 },
+  { status: "rejected", rateLimitType: "five_hour" },
+  { status: "rejected", rateLimitType: "overage", resetsAt: 1780000000 },
+  { status: "rejected", rateLimitType: "unknown", resetsAt: 1780000000 },
+  { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000, isUsingOverage: true },
+])(
+  "ineligible structured quota classification never enables five-hour continuation: %j",
+  async (info) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const query = createPendingQueryMock();
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    await internal.routeSdkMessageFromPump({ ...rateLimitEvent, rate_limit_info: info }, query);
+    await internal.routeSdkMessageFromPump(
+      { type: "assistant", error: "rate_limit", message: { content: [] } },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(
+      {
+        ...abortedResult(),
+        errors: ["API request throughput limit: retry this request"],
+      },
+      query,
+    );
+    expect(events.filter((e) => e.type === "turn_failed")).toEqual([
+      expect.objectContaining({
+        error: "API request throughput limit: retry this request",
+      }),
+    ]);
+    expect(events.find((e) => e.type === "turn_failed")).not.toHaveProperty("subscriptionLimit");
+    await session.close();
+  },
+);
+
+test.each([successResult(), { ...abortedResult(), errors: [] }])(
+  "an unclassified main API stop without SDK error detail remains a neutral failure: %j",
+  async (result) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const query = createPendingQueryMock();
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    await internal.routeSdkMessageFromPump(
+      { type: "assistant", error: "rate_limit", message: { content: [] } },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(result, query);
+    const failed = events.filter((event) => event.type === "turn_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ error: expect.any(String) });
+    expect(failed[0]).not.toHaveProperty("subscriptionLimit");
+    expect(failed[0].type === "turn_failed" && failed[0].error).not.toMatch(/subscription/i);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
+    await session.close();
+  },
+);
+
+test.each(["sidechain", "background"])(
+  "rejected account events cannot turn %s quota failure into a main quota stop",
+  async (kind) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const query = createPendingQueryMock();
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    if (kind === "background") await internal.routeSdkMessageFromPump(helperTaskStarted, query);
+    await internal.routeSdkMessageFromPump(
+      {
+        ...rateLimitEvent,
+        rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000 },
+      },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(
+      kind === "background"
+        ? {
+            ...helperCompleted,
+            status: "failed",
+            summary: "Subagent hit a rate limit",
+          }
+        : {
+            type: "assistant",
+            parent_tool_use_id: "child-tool",
+            error: "rate_limit",
+            message: { content: [] },
+          },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(successResult(), query);
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([]);
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    await session.close();
+  },
+);
+
+test.each(["seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"])(
+  "weekly block %s cancels even outside a main turn",
+  async (rateLimitType) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await internal.routeSdkMessageFromPump(
+      {
+        ...rateLimitEvent,
+        rate_limit_info: { status: "rejected", rateLimitType, resetsAt: 1780000000 },
+      },
+      createPendingQueryMock(),
+    );
+    expect(events.filter((event) => event.type === "subscription_blocked")).toEqual([
+      { type: "subscription_blocked", provider: "claude" },
+    ]);
+    expect(events.filter((event) => event.type === "turn_started")).toEqual([]);
+    await session.close();
+  },
+);
+
+test("the main API stop can precede its structured reset and weekly exhaustion wins", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  const query = createPendingQueryMock();
+  await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+  await internal.routeSdkMessageFromPump(
+    { type: "assistant", error: "rate_limit", message: { content: [] } },
+    query,
+  );
+  for (const rateLimitType of ["five_hour", "seven_day", "five_hour"]) {
+    await internal.routeSdkMessageFromPump(
+      {
+        ...rateLimitEvent,
+        rate_limit_info: { status: "rejected", rateLimitType, resetsAt: 1780000000 },
+      },
+      query,
+    );
+  }
+  await internal.routeSdkMessageFromPump(successResult(), query);
+  expect(events.filter((event) => event.type === "turn_failed")).toEqual([
+    expect.objectContaining({ subscriptionLimit: { type: "weekly" } }),
+  ]);
+  await session.close();
+});
+
 function createPendingQueryMock(): QueryMock {
   return createBaseQueryMock(vi.fn(() => new Promise<never>(() => {})));
 }

@@ -36,6 +36,10 @@ class FakePermissionAgentManager {
     return this.outOfBandHandled;
   }
 
+  async cancelQuotaContinuationForIntent(): Promise<boolean> {
+    return false;
+  }
+
   getAgent() {
     return undefined;
   }
