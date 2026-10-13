@@ -4742,8 +4742,12 @@ class ClaudeAgentSession implements AgentSession {
     const usage = this.convertUsage(message, message.modelUsage);
     if (this.mainQuotaStop) {
       events.push(...this.sidechainTracker.finishAll("failed"));
+      const error = this.mainSubscriptionLimit
+        ? "Claude subscription usage limit stopped the task"
+        : (message.subtype !== "success" && message.errors.join("\n")) ||
+          "Claude API rate limit stopped the task";
       events.push({
-        ...this.buildTurnFailedEvent("Claude subscription usage limit stopped the task"),
+        ...this.buildTurnFailedEvent(error),
         ...(this.mainSubscriptionLimit ? { subscriptionLimit: this.mainSubscriptionLimit } : {}),
       });
       this.mainQuotaStop = false;

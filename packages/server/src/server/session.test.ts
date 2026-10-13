@@ -31,6 +31,9 @@ import type { AgentManagerEvent } from "./agent/agent-manager.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { ScheduleService } from "./schedule/service.js";
+import { ScheduleStore } from "./schedule/store.js";
+import { startAgentRun } from "./agent/agent-prompt.js";
+import { createPaseoToolCatalog } from "./agent/tools/paseo-tools.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
@@ -131,9 +134,13 @@ test("interruptAgentIfRunning rejects when graceful cancellation is refused", as
   );
 });
 
-test.each(["loaded", "stored", "claimed"])(
-  "cancel_agent_request cancels durable quota work: %s",
-  async (mode) => {
+test.each(
+  ["loaded", "stored", "claimed"].flatMap((mode) =>
+    ["WebSocket/CLI", "MCP"].map((transport) => ({ mode, transport })),
+  ),
+)(
+  "$transport Stop cancels durable quota work before provider admission: $mode",
+  async ({ mode, transport }) => {
     const storedOnly = mode === "stored";
     const home = mkdtempSync(join(tmpdir(), "session-quota-stop-"));
     const logger = pino({ level: "silent" });
@@ -163,6 +170,8 @@ test.each(["loaded", "stored", "claimed"])(
     const agent = await manager.createAgent({ provider: "claude", cwd: home }, undefined, {
       workspaceId: undefined,
     });
+    let tick: Promise<void> | undefined;
+    let releaseClaim: (() => void) | undefined;
     try {
       const job = await service.armQuotaContinuation({
         agentId: agent.id,
@@ -206,8 +215,6 @@ test.each(["loaded", "stored", "claimed"])(
           cancelAgentRun: manager.cancelAgentRun.bind(manager),
         },
       });
-      let tick: Promise<void> | undefined;
-      let releaseClaim: (() => void) | undefined;
       const start = manager.getAgent(agent.id)?.session;
       const submit = start ? vi.spyOn(start, "startTurn") : null;
       if (mode === "claimed") {
@@ -238,30 +245,45 @@ test.each(["loaded", "stored", "claimed"])(
         await claimed;
         expect(manager.hasInFlightRun(agent.id)).toBe(false);
       }
-      const stop = session.handleMessage({
-        type: "cancel_agent_request",
-        agentId: agent.id,
-        requestId: "quota-stop",
+      const catalog = createPaseoToolCatalog({
+        agentManager: manager,
+        agentStorage: storage,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        logger,
       });
+      const stop =
+        transport === "MCP"
+          ? catalog.executeTool("cancel_agent", { agentId: agent.id })
+          : session.handleMessage({
+              type: "cancel_agent_request",
+              agentId: agent.id,
+              requestId: "quota-stop",
+            });
       if (releaseClaim) {
         await cancelled;
         releaseClaim();
       }
-      await stop;
+      const stopped = await stop;
       await tick;
-      expect(messages).toContainEqual(
-        expect.objectContaining({
-          type: "cancel_agent_response",
-          payload: expect.objectContaining({ error: null }),
-        }),
-      );
-      const response = messages.find((message) => message.type === "cancel_agent_response");
-      expect(response?.type === "cancel_agent_response" && response.payload.agent?.id).toBe(
-        agent.id,
-      );
-      expect(response?.type === "cancel_agent_response" && response.payload.agent?.status).not.toBe(
-        "running",
-      );
+      if (transport === "MCP") {
+        expect(stopped).toMatchObject({
+          structuredContent: { success: mode !== "claimed" },
+        });
+      } else {
+        expect(messages).toContainEqual(
+          expect.objectContaining({
+            type: "cancel_agent_response",
+            payload: expect.objectContaining({ error: null }),
+          }),
+        );
+        const response = messages.find((message) => message.type === "cancel_agent_response");
+        expect(response?.type === "cancel_agent_response" && response.payload.agent?.id).toBe(
+          agent.id,
+        );
+        expect(
+          response?.type === "cancel_agent_response" && response.payload.agent?.status,
+        ).not.toBe("running");
+      }
       expect(await service.inspect(job!.id)).toMatchObject({
         status: "completed",
         quotaContinuation: { cancelled: true },
@@ -272,6 +294,8 @@ test.each(["loaded", "stored", "claimed"])(
       if (submit) expect(submit).not.toHaveBeenCalled();
       if (storedOnly) expect(manager.getAgent(agent.id)).toBeNull();
     } finally {
+      releaseClaim?.();
+      await tick;
       await service.stop();
       if (manager.getAgent(agent.id)) await manager.closeAgent(agent.id);
       await manager.flush();
@@ -280,6 +304,289 @@ test.each(["loaded", "stored", "claimed"])(
     }
   },
 );
+
+async function quotaStoppedSessionFixture() {
+  const home = mkdtempSync(join(tmpdir(), "session-quota-intent-"));
+  const logger = pino({ level: "silent" });
+  const storage = new AgentStorage(join(home, "agents"), logger);
+  await storage.initialize();
+  const manager = new AgentManager({
+    logger,
+    registry: storage,
+    clients: createTestAgentClients(),
+  });
+  let now = new Date("2026-01-01T00:00:00Z");
+  const createService = (owner: AgentManager) => {
+    const service = new ScheduleService({
+      paseoHome: home,
+      logger,
+      agentManager: owner,
+      agentStorage: storage,
+      now: () => now,
+      createAgent: vi.fn(),
+      createDirectoryWorkspace: vi.fn(),
+      createPaseoWorktreeWorkspace: vi.fn(),
+      archiveWorkspace: vi.fn(),
+    });
+    owner.setQuotaContinuationHooks({
+      cancel: (id) => service.cancelQuotaContinuation(id),
+      stopped: (id, event, at) => service.handleQuotaStop(id, event, at),
+    });
+    return service;
+  };
+  const service = createService(manager);
+  const agent = await manager.createAgent({ provider: "claude", cwd: home }, undefined, {
+    workspaceId: undefined,
+  });
+  const provider = agent.session! as unknown as {
+    notifySubscribers(event: import("./agent/agent-sdk-types.js").AgentStreamEvent): void;
+  };
+  const emit = provider.notifySubscribers.bind(provider);
+  const limited = vi.spyOn(provider, "notifySubscribers").mockImplementation((event) =>
+    emit(
+      event.type === "turn_failed"
+        ? {
+            ...event,
+            subscriptionLimit: {
+              type: "five_hour",
+              resetsAt: now.getTime() / 1000 + 60,
+            },
+          }
+        : event,
+    ),
+  );
+  await expect(
+    manager.runAgent(agent.id, "Emit a turn failure", {
+      clientMessageId: "limited-user",
+    }),
+  ).rejects.toThrow();
+  limited.mockRestore();
+  await manager.flush();
+  const store = new ScheduleStore(join(home, "schedules"), logger);
+  const job = (await store.list()).find(
+    (record) => record.quotaContinuation && record.status === "active",
+  )!;
+  expect(job).toBeDefined();
+  return {
+    home,
+    logger,
+    manager,
+    storage,
+    service,
+    agent,
+    job,
+    createService,
+    expire: () => {
+      now = new Date(now.getTime() + 120_000);
+    },
+    cleanup: async () => {
+      await service.stop();
+      await manager.closeAgent(agent.id);
+      await manager.flush();
+      await storage.flush();
+      rmSync(home, { recursive: true, force: true });
+    },
+  };
+}
+
+test.each(["WebSocket/CLI", "voice", "MCP", "dispatch", "direct"])(
+  "%s prompt rejects failed durable quota cancellation before acknowledging dispatch",
+  async (transport) => {
+    const fixture = await quotaStoppedSessionFixture();
+    const { manager, storage, service, agent, job, logger, home } = fixture;
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      paseoHome: home,
+      agentStorage: { get: storage.get.bind(storage) },
+      agentManager: {
+        getAgent: manager.getAgent.bind(manager),
+        waitForAgentClose: manager.waitForAgentClose.bind(manager),
+        tryRunOutOfBand: manager.tryRunOutOfBand.bind(manager),
+        cancelQuotaContinuationForIntent: manager.cancelQuotaContinuationForIntent.bind(manager),
+      },
+    });
+    let entered!: () => void;
+    let release!: () => void;
+    const writing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const write = vi.spyOn(ScheduleStore.prototype, "update").mockImplementation(async () => {
+      entered();
+      await blocked;
+      throw new Error("Quota cancellation disk failure");
+    });
+    const submit = vi.spyOn(agent.session!, "startTurn");
+    const acknowledge = vi.fn();
+    let settled = false;
+    try {
+      const dispatch = () => {
+        if (transport === "MCP")
+          return createPaseoToolCatalog({
+            agentManager: manager,
+            agentStorage: storage,
+            providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+            logger,
+          }).executeTool("send_agent_prompt", {
+            agentId: agent.id,
+            prompt: "New task",
+          });
+        if (transport === "voice")
+          return asSessionInternals(session).handleSendAgentMessage(agent.id, "New task");
+        if (transport === "dispatch")
+          return startAgentRun(manager, agent.id, "New task", logger, { onDispatch: acknowledge });
+        if (transport === "direct") return manager.runAgent(agent.id, "New task");
+        return session.handleMessage({
+          type: "send_agent_message_request",
+          agentId: agent.id,
+          text: "New task",
+          requestId: "new-task",
+        });
+      };
+      const attempt = dispatch();
+      const outcome = attempt.then(
+        (value) => {
+          settled = true;
+          return value;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await writing;
+      expect(settled).toBe(false);
+      expect(acknowledge).not.toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
+      release();
+      const result = await outcome;
+      if (transport === "voice")
+        expect(result).toEqual({
+          ok: false,
+          error: "Quota cancellation disk failure",
+        });
+      else if (transport === "WebSocket/CLI")
+        expect(messages).toContainEqual(
+          expect.objectContaining({
+            type: "send_agent_message_response",
+            payload: expect.objectContaining({ accepted: false }),
+          }),
+        );
+      else expect(result).toBeInstanceOf(Error);
+      expect(acknowledge).not.toHaveBeenCalled();
+      write.mockRestore();
+      fixture.expire();
+      await service.tick();
+      expect(submit).not.toHaveBeenCalled();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "completed",
+      });
+    } finally {
+      release();
+      write.mockRestore();
+      await fixture.cleanup();
+    }
+  },
+);
+
+test("production deletion during a cold quota attention write emits no resurrecting error", async () => {
+  const fixture = await quotaStoppedSessionFixture();
+  const { manager, storage, service, agent, logger, home } = fixture;
+  let freshService: ScheduleService | undefined;
+  let release!: () => void;
+  try {
+    await service.stop();
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    const fresh = new AgentManager({
+      logger,
+      registry: storage,
+      clients: createTestAgentClients(),
+    });
+    const attention = vi.fn();
+    fresh.setAgentAttentionCallback(attention);
+    vi.spyOn(fresh, "resumeAgentFromPersistence").mockRejectedValue(
+      new Error("Provider reload failed"),
+    );
+    const attentionStates: AgentManagerEvent[] = [];
+    fresh.subscribe(
+      (event) => {
+        if (event.type === "agent_state" && event.agent.attention.requiresAttention)
+          attentionStates.push(event);
+      },
+      { replayState: false, agentId: agent.id },
+    );
+    freshService = fixture.createService(fresh);
+    await freshService.start();
+    let entered!: () => void;
+    const writing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const upsert = storage.upsert.bind(storage);
+    vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+      await upsert(record);
+      if (record.requiresAttention && record.lastError === "Provider reload failed") {
+        entered();
+        await blocked;
+      }
+    });
+    fixture.expire();
+    const tick = freshService.tick();
+    await writing;
+    let closeEntered!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      closeEntered = resolve;
+    });
+    const close = fresh.closeAgent.bind(fresh);
+    vi.spyOn(fresh, "closeAgent").mockImplementation((id) => {
+      const result = close(id);
+      closeEntered();
+      return result;
+    });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      paseoHome: home,
+      agentStorage: {
+        get: storage.get.bind(storage),
+        beginDelete: storage.beginDelete.bind(storage),
+        remove: storage.remove.bind(storage),
+      },
+      agentManager: {
+        getAgent: fresh.getAgent.bind(fresh),
+        closeAgent: fresh.closeAgent.bind(fresh),
+        flush: fresh.flush.bind(fresh),
+        deleteAgentState: fresh.deleteAgentState.bind(fresh),
+      },
+    });
+    const deletion = session.handleMessage({
+      type: "delete_agent_request",
+      agentId: agent.id,
+      requestId: "delete-quota",
+    });
+    await closing;
+    release();
+    await Promise.all([tick, deletion]);
+    expect(messages).toContainEqual({
+      type: "agent_deleted",
+      payload: { agentId: agent.id, requestId: "delete-quota" },
+    });
+    expect(await storage.get(agent.id)).toBeNull();
+    expect(attention).not.toHaveBeenCalled();
+    expect(attentionStates).toEqual([]);
+    await fresh.flush();
+  } finally {
+    release?.();
+    await freshService?.stop();
+    await fixture.cleanup();
+  }
+});
 
 test("cancel_agent_request reports refusal only through its response", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";

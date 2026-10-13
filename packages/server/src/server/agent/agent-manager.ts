@@ -902,6 +902,11 @@ export class AgentManager {
     this.quotaContinuationHooks = hooks;
   }
 
+  cancelQuotaContinuationForIntent(agentId: string): Promise<boolean> | undefined {
+    this.quotaStoppedByUser.add(agentId);
+    return this.quotaContinuationHooks?.cancel(agentId);
+  }
+
   async reportQuotaReloadFailure(
     agentId: string,
     lastUserMessageAt: string | null,
@@ -916,6 +921,7 @@ export class AgentManager {
         record.internal ||
         record.requiresAttention ||
         this.agents.has(agentId) ||
+        this.inFlightAgentCloses.has(agentId) ||
         this.quotaStoppedByUser.has(agentId) ||
         (record.lastUserMessageAt ?? null) !== lastUserMessageAt
       )
@@ -931,7 +937,11 @@ export class AgentManager {
         attentionTimestamp: updatedAt,
       };
       await registry.upsert(next);
-      if (this.quotaStoppedByUser.has(agentId) || this.agents.has(agentId)) {
+      if (
+        this.quotaStoppedByUser.has(agentId) ||
+        this.agents.has(agentId) ||
+        this.inFlightAgentCloses.has(agentId)
+      ) {
         const current = await registry.get(agentId);
         if (current?.attentionTimestamp === updatedAt)
           await registry.upsert({
@@ -2758,10 +2768,13 @@ export class AgentManager {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
       if (!options || !this.quotaContinuationStarts.has(options)) {
-        if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+        const cancellation = this.cancelQuotaContinuationForIntent(agentId);
+        if (cancellation) await cancellation;
       }
       if (pendingRun.settled)
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
+      if (!options || !this.quotaContinuationStarts.has(options))
+        this.quotaStoppedByUser.delete(agentId);
       const result = await agent.session.startTurn(prompt, options);
       const admitted = options ? this.quotaContinuationAdmissions.get(options) : undefined;
       if (admitted) await this.persistQuotaContinuationAdmission(agentId, result.turnId, admitted);
@@ -2862,7 +2875,7 @@ export class AgentManager {
 
     const agent = existingAgent;
     if (!options || !this.quotaContinuationStarts.has(options))
-      this.quotaStoppedByUser.delete(agentId);
+      this.quotaStoppedByUser.add(agentId);
     const isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
@@ -3151,7 +3164,8 @@ export class AgentManager {
     operation: () => Promise<T>,
   ): Promise<T> {
     return this.runForegroundMutation(agent.id, async () => {
-      if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agent.id);
+      const cancellation = this.cancelQuotaContinuationForIntent(agent.id);
+      if (cancellation) await cancellation;
       await this.drainSessionEvents(agent.id);
       this.agentStreamCoalescer.flushFor(agent.id);
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
@@ -3218,6 +3232,7 @@ export class AgentManager {
     clientMessageId: string | undefined,
     expectedTurnId: string,
   ): Promise<void> {
+    this.quotaStoppedByUser.delete(agent.id);
     if (!clientMessageId) {
       return;
     }
@@ -3382,8 +3397,8 @@ export class AgentManager {
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
     const pendingQuota = hasQuotaContinuationPending(agentId);
-    this.quotaStoppedByUser.add(agentId);
-    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+    const cancellation = this.cancelQuotaContinuationForIntent(agentId);
+    if (cancellation) await cancellation;
     if (pendingQuota && !this.agents.has(agentId)) return { status: "settled" };
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
   }

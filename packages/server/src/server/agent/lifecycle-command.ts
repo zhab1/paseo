@@ -7,6 +7,7 @@ import {
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
+import { hasQuotaContinuationPending } from "./quota-continuation-presentation.js";
 
 export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle" | "internal">;
 
@@ -47,7 +48,7 @@ export interface AgentLifecycleCommandDependencies {
 }
 
 export interface CancelAgentRunResult {
-  agent: LifecycleAgentSnapshot;
+  agent: LifecycleAgentSnapshot | null;
   cancelled: boolean;
 }
 
@@ -61,22 +62,15 @@ async function requestAgentRunCancellation(
 ): Promise<RequestedAgentRunCancellation> {
   const { agentManager, logger } = dependencies;
   const agent = agentManager.getAgent(agentId);
-  if (!agent) {
+  const pendingQuota = hasQuotaContinuationPending(agentId);
+  if (!agent && !pendingQuota) {
     logger.trace({ agentId }, "cancelAgentRunCommand: agent not found");
     throw new Error(`Agent ${agentId} not found`);
   }
 
   const hasInFlightRun = agentManager.hasInFlightRun(agentId);
-  if (!hasInFlightRun) {
-    logger.trace(
-      { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
-      "cancelAgentRunCommand: skipping because agent is not running",
-    );
-    return { agent, cancelled: false, cancellation: { status: "not_running" } };
-  }
-
   logger.debug(
-    { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
+    { agentId, lifecycle: agent?.lifecycle, hasInFlightRun, pendingQuota },
     "cancelAgentRunCommand: interrupting",
   );
   const startedAt = Date.now();
@@ -88,7 +82,7 @@ async function requestAgentRunCancellation(
 
   return {
     agent,
-    cancelled: cancellation.status === "settled",
+    cancelled: pendingQuota || cancellation.status === "settled",
     cancellation,
   };
 }

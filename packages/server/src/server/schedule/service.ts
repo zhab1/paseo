@@ -219,6 +219,7 @@ type ScheduleAgentManager = Pick<
   | "getAgent"
   | "reloadAgentSession"
   | "tryRunOutOfBand"
+  | "cancelQuotaContinuationForIntent"
   | "hasInFlightRun"
   | "replaceAgentRun"
   | "steerOrReplaceActiveTurn"

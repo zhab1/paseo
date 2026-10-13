@@ -1397,10 +1397,43 @@ test.each([
       { type: "assistant", error: "rate_limit", message: { content: [] } },
       query,
     );
-    await internal.routeSdkMessageFromPump(successResult(), query);
+    await internal.routeSdkMessageFromPump(
+      {
+        ...abortedResult(),
+        errors: ["API request throughput limit: retry this request"],
+      },
+      query,
+    );
     expect(events.filter((e) => e.type === "turn_failed")).toEqual([
-      expect.not.objectContaining({ subscriptionLimit: expect.anything() }),
+      expect.objectContaining({
+        error: "API request throughput limit: retry this request",
+      }),
     ]);
+    expect(events.find((e) => e.type === "turn_failed")).not.toHaveProperty("subscriptionLimit");
+    await session.close();
+  },
+);
+
+test.each([successResult(), { ...abortedResult(), errors: [] }])(
+  "an unclassified main API stop without SDK error detail remains a neutral failure: %j",
+  async (result) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const query = createPendingQueryMock();
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    await internal.routeSdkMessageFromPump(
+      { type: "assistant", error: "rate_limit", message: { content: [] } },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(result, query);
+    const failed = events.filter((event) => event.type === "turn_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ error: expect.any(String) });
+    expect(failed[0]).not.toHaveProperty("subscriptionLimit");
+    expect(failed[0].type === "turn_failed" && failed[0].error).not.toMatch(/subscription/i);
+    expect(events.some((event) => event.type === "turn_completed")).toBe(false);
     await session.close();
   },
 );
