@@ -11156,6 +11156,40 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
   }
 });
 
+test.each(["success", "failure"])(
+  "out-of-band command waits for durable quota cancellation: %s",
+  async (outcome) => {
+    const manager = new AgentManager({ clients: { codex: new TestAgentClient() }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+      workspaceId: undefined,
+    });
+    const cancellation = deferred<void>();
+    const run = vi.fn(async () => {});
+    agent.session!.tryHandleOutOfBand = () => ({ run });
+    manager.setQuotaContinuationHooks({
+      cancel: () => cancellation.promise,
+      stopped: async () => {},
+    });
+    const onDispatch = vi.fn();
+    const command = startAgentRun(manager, agent.id, "/handled", logger, { onDispatch });
+    const settled = command.then(
+      () => "accepted",
+      () => "rejected",
+    );
+    await Promise.resolve();
+    expect(run).not.toHaveBeenCalled();
+    expect(onDispatch).not.toHaveBeenCalled();
+    expect(manager.fetchTimeline(agent.id, { direction: "tail", limit: 20 }).rows).toEqual([]);
+    if (outcome === "failure") cancellation.reject(new Error("Durable cancellation failed"));
+    else cancellation.resolve();
+    expect(await settled).toBe(outcome === "failure" ? "rejected" : "accepted");
+    expect(run).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
+    expect(onDispatch).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+  },
+);
+
 test("authoritative timeline records a daemon-handled submitted prompt before its output", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-daemon-handled-prompt-"));
   const storagePath = join(workdir, "agents");

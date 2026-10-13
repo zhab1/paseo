@@ -122,6 +122,7 @@ import {
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent/agent-projections.js";
+import { hasQuotaContinuationPending } from "./agent/quota-continuation-presentation.js";
 import {
   appendTimelineItemIfAgentKnown,
   emitLiveTimelineItemIfAgentKnown,
@@ -4792,13 +4793,20 @@ export class Session {
     this.sessionLogger.info({ agentId }, `Cancel request received for agent ${agentId}`);
 
     try {
-      await cancelAgentRunCommand(
-        { agentManager: this.agentManager, logger: this.sessionLogger },
-        agentId,
-      );
+      if (hasQuotaContinuationPending(agentId) || !this.agentManager.hasInFlightRun(agentId)) {
+        await this.agentManager.cancelAgentRun(agentId);
+      } else {
+        await cancelAgentRunCommand(
+          { agentManager: this.agentManager, logger: this.sessionLogger },
+          agentId,
+        );
+      }
       if (requestId) {
         const agent = this.agentManager.getAgent(agentId);
-        const payload = agent ? await this.buildAgentPayload(agent) : null;
+        const record = agent ? null : await this.agentStorage.get(agentId);
+        let payload: AgentSnapshotPayload | null = null;
+        if (agent) payload = await this.buildAgentPayload(agent);
+        else if (record) payload = this.buildStoredAgentPayload(record);
         this.emit({
           type: "cancel_agent_response",
           payload: {

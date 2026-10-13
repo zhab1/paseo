@@ -2604,19 +2604,18 @@ export class AgentManager {
    * emitted by the handler flow through dispatchStream so they persist and
    * broadcast like normal timeline events.
    */
-  tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
+  async tryRunOutOfBand(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<boolean> {
     const agent = this.requireSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
       return false;
     }
     this.quotaStoppedByUser.add(agentId);
-    void this.quotaContinuationHooks?.cancel(agentId).catch((error) => {
-      this.logger.error(
-        { err: error, agentId },
-        "Failed to cancel quota continuation for a new command",
-      );
-    });
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
       this.emitState(agent);
@@ -3289,8 +3288,14 @@ export class AgentManager {
   }
 
   async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+    const pendingQuota = hasQuotaContinuationPending(agentId);
     this.quotaStoppedByUser.add(agentId);
     if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+    if (pendingQuota && !this.agents.has(agentId)) {
+      const record = await this.registry?.get(agentId);
+      if (record) this.dispatchStoredAgentState(record);
+      return { status: "settled" };
+    }
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
   }
 

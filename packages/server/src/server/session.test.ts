@@ -28,6 +28,10 @@ import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentManagerEvent } from "./agent/agent-manager.js";
+import { AgentManager } from "./agent/agent-manager.js";
+import { AgentStorage } from "./agent/agent-storage.js";
+import { ScheduleService } from "./schedule/service.js";
+import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import { createPersistedProjectRecord } from "./workspace-registry.js";
@@ -126,6 +130,155 @@ test("interruptAgentIfRunning rejects when graceful cancellation is refused", as
     "active run cancellation was not acknowledged",
   );
 });
+
+test.each(["loaded", "stored", "claimed"])(
+  "cancel_agent_request cancels durable quota work: %s",
+  async (mode) => {
+    const storedOnly = mode === "stored";
+    const home = mkdtempSync(join(tmpdir(), "session-quota-stop-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(home, "agents"), logger);
+    await storage.initialize();
+    let manager = new AgentManager({
+      logger,
+      registry: storage,
+      clients: createTestAgentClients(),
+    });
+    let now = new Date("2026-01-01T00:00:00Z");
+    const run = vi.fn(async () => ({ agentId: null, output: "unexpected" }));
+    const makeService = () =>
+      new ScheduleService({
+        paseoHome: home,
+        logger,
+        agentManager: manager,
+        agentStorage: storage,
+        now: () => now,
+        runner: mode === "claimed" ? undefined : run,
+        createAgent: vi.fn(),
+        createDirectoryWorkspace: vi.fn(),
+        createPaseoWorktreeWorkspace: vi.fn(),
+        archiveWorkspace: vi.fn(),
+      });
+    let service = makeService();
+    const agent = await manager.createAgent({ provider: "claude", cwd: home }, undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      const job = await service.armQuotaContinuation({
+        agentId: agent.id,
+        turnId: "limited",
+        lastUserMessageAt: null,
+        resetsAt: now.getTime() / 1000 + 60,
+      });
+      if (storedOnly) {
+        await service.stop();
+        await manager.closeAgent(agent.id);
+        await manager.flush();
+        manager = new AgentManager({
+          logger,
+          registry: storage,
+          clients: createTestAgentClients(),
+        });
+        service = makeService();
+        await service.start();
+        expect(manager.getAgent(agent.id)).toBeNull();
+      }
+      let cancellationDone!: () => void;
+      const cancelled = new Promise<void>((resolve) => {
+        cancellationDone = resolve;
+      });
+      manager.setQuotaContinuationHooks({
+        cancel: async (id) => {
+          await service.cancelQuotaContinuation(id);
+          cancellationDone();
+        },
+        stopped: (id, event, at) => service.handleQuotaStop(id, event, at),
+      });
+      const messages: SessionOutboundMessage[] = [];
+      const session = createSessionForTest({
+        messages,
+        paseoHome: home,
+        agentStorage: { get: storage.get.bind(storage) },
+        agentManager: {
+          getAgent: manager.getAgent.bind(manager),
+          hasInFlightRun: manager.hasInFlightRun.bind(manager),
+          cancelAgentRun: manager.cancelAgentRun.bind(manager),
+        },
+      });
+      let tick: Promise<void> | undefined;
+      let releaseClaim: (() => void) | undefined;
+      const start = manager.getAgent(agent.id)?.session;
+      const submit = start ? vi.spyOn(start, "startTurn") : null;
+      if (mode === "claimed") {
+        let claimReached!: () => void;
+        const claimed = new Promise<void>((resolve) => {
+          claimReached = resolve;
+        });
+        const blocked = new Promise<void>((resolve) => {
+          releaseClaim = resolve;
+        });
+        const admit = manager.continueQuotaStoppedAgent.bind(manager);
+        vi.spyOn(manager, "continueQuotaStoppedAgent").mockImplementation(
+          (id, at, claim, accepted) =>
+            admit(
+              id,
+              at,
+              async () => {
+                const eligible = await claim();
+                claimReached();
+                await blocked;
+                return eligible;
+              },
+              accepted,
+            ),
+        );
+        now = new Date(now.getTime() + 120_000);
+        tick = service.tick();
+        await claimed;
+        expect(manager.hasInFlightRun(agent.id)).toBe(false);
+      }
+      const stop = session.handleMessage({
+        type: "cancel_agent_request",
+        agentId: agent.id,
+        requestId: "quota-stop",
+      });
+      if (releaseClaim) {
+        await cancelled;
+        releaseClaim();
+      }
+      await stop;
+      await tick;
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          type: "cancel_agent_response",
+          payload: expect.objectContaining({ error: null }),
+        }),
+      );
+      const response = messages.find((message) => message.type === "cancel_agent_response");
+      expect(response?.type === "cancel_agent_response" && response.payload.agent?.id).toBe(
+        agent.id,
+      );
+      expect(response?.type === "cancel_agent_response" && response.payload.agent?.status).not.toBe(
+        "running",
+      );
+      expect(await service.inspect(job!.id)).toMatchObject({
+        status: "completed",
+        quotaContinuation: { cancelled: true },
+      });
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      expect(run).not.toHaveBeenCalled();
+      if (submit) expect(submit).not.toHaveBeenCalled();
+      if (storedOnly) expect(manager.getAgent(agent.id)).toBeNull();
+    } finally {
+      await service.stop();
+      if (manager.getAgent(agent.id)) await manager.closeAgent(agent.id);
+      await manager.flush();
+      await storage.flush();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test("cancel_agent_request reports refusal only through its response", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";

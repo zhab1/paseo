@@ -1349,6 +1349,7 @@ test("a main API quota stop retains its five-hour reset even when the SDK result
   session.subscribe((event) => events.push(event));
   const query = createPendingQueryMock();
   await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+  await internal.routeSdkMessageFromPump(helperTaskStarted, query);
   await internal.routeSdkMessageFromPump(
     {
       ...rateLimitEvent,
@@ -1404,34 +1405,44 @@ test.each([
   },
 );
 
-test("rejected account events cannot turn successful work or a subagent error into a quota stop", async () => {
-  const session = await createSession();
-  const internal: SessionStateInternals = asInternals(session);
-  const events: AgentStreamEvent[] = [];
-  session.subscribe((event) => events.push(event));
-  const query = createPendingQueryMock();
-  await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
-  await internal.routeSdkMessageFromPump(
-    {
-      ...rateLimitEvent,
-      rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000 },
-    },
-    query,
-  );
-  await internal.routeSdkMessageFromPump(
-    {
-      type: "assistant",
-      parent_tool_use_id: "child-tool",
-      error: "rate_limit",
-      message: { content: [] },
-    },
-    query,
-  );
-  await internal.routeSdkMessageFromPump(successResult(), query);
-  expect(events.filter((event) => event.type === "turn_failed")).toEqual([]);
-  expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
-  await session.close();
-});
+test.each(["sidechain", "background"])(
+  "rejected account events cannot turn %s quota failure into a main quota stop",
+  async (kind) => {
+    const session = await createSession();
+    const internal: SessionStateInternals = asInternals(session);
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const query = createPendingQueryMock();
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    if (kind === "background") await internal.routeSdkMessageFromPump(helperTaskStarted, query);
+    await internal.routeSdkMessageFromPump(
+      {
+        ...rateLimitEvent,
+        rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000 },
+      },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(
+      kind === "background"
+        ? {
+            ...helperCompleted,
+            status: "failed",
+            summary: "Subagent hit a rate limit",
+          }
+        : {
+            type: "assistant",
+            parent_tool_use_id: "child-tool",
+            error: "rate_limit",
+            message: { content: [] },
+          },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(successResult(), query);
+    expect(events.filter((event) => event.type === "turn_failed")).toEqual([]);
+    expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+    await session.close();
+  },
+);
 
 test.each(["seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"])(
   "weekly block %s cancels even outside a main turn",
