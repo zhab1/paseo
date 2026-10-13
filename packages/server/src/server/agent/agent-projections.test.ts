@@ -9,6 +9,7 @@ import {
   type ManagedAgent,
 } from "./agent-projections.js";
 import type { AgentSession } from "./agent-sdk-types.js";
+import { setQuotaContinuationPending } from "./quota-continuation-presentation.js";
 import type {
   AgentFeature,
   ImportableProviderSession,
@@ -226,6 +227,24 @@ describe("toStoredAgentRecord", () => {
 });
 
 describe("toAgentPayload", () => {
+  it("pending quota work exposes existing Stop without fabricating a provider run in persistence", () => {
+    const agent = createManagedAgent({
+      lifecycle: "idle",
+      activeTurnId: null,
+      activeForegroundTurnId: null,
+    });
+    const record = toStoredAgentRecord(agent);
+    setQuotaContinuationPending(agent.id, true);
+    try {
+      expect(toAgentPayload(agent).status).toBe("running");
+      expect(toAgentPayload(agent).activeTurn).toBeNull();
+      expect(buildStoredAgentPayload(record, ["claude"]).status).toBe("running");
+      expect(toStoredAgentRecord(agent).lastStatus).toBe("idle");
+    } finally {
+      setQuotaContinuationPending(agent.id, false);
+    }
+    expect(toAgentPayload(agent).status).toBe("idle");
+  });
   it("serializes dates, clones arrays, and hides session", () => {
     const permissionA = createPermission({ id: "perm-a" });
     const permissionB = createPermission({

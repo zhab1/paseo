@@ -403,6 +403,7 @@ export type AgentTimelineItem =
   | PluginTimelineItem;
 
 export type AgentStreamEvent =
+  | { type: "subscription_blocked"; provider: AgentProvider }
   | { type: "thread_started"; sessionId: string; provider: AgentProvider }
   | { type: "turn_started"; provider: AgentProvider; turnId?: string }
   | { type: "turn_completed"; provider: AgentProvider; usage?: AgentUsage; turnId?: string }
@@ -426,6 +427,7 @@ export type AgentStreamEvent =
       code?: string;
       diagnostic?: string;
       turnId?: string;
+      subscriptionLimit?: { type: "five_hour"; resetsAt: number } | { type: "weekly" };
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   | {

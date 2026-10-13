@@ -19,6 +19,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { setQuotaContinuationPending } from "./quota-continuation-presentation.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
@@ -1563,6 +1564,124 @@ async function createControlledInterruptFixture(options: {
     },
   };
 }
+
+test("quota-stop hooks run after the matching main run has settled", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "quota-settled",
+    agentId: "00000000-0000-4000-8000-000000000091",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async () => {},
+  });
+  const observed = deferred<void>();
+  const attention = vi.fn();
+  fixture.manager.setAgentAttentionCallback(attention);
+  fixture.manager.setQuotaContinuationHooks({
+    cancel: async () => {},
+    stopped: async () => {
+      expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
+      setQuotaContinuationPending(fixture.agentId, true);
+      observed.resolve();
+    },
+  });
+  await fixture.startForegroundRun();
+  fixture.session.pushEvent({
+    type: "turn_failed",
+    provider: "claude",
+    turnId: "limited-turn",
+    error: "quota",
+    subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
+  });
+  await observed.promise;
+  await fixture.manager.flush();
+  expect(attention).not.toHaveBeenCalled();
+  setQuotaContinuationPending(fixture.agentId, false);
+  await fixture.cleanup();
+});
+
+test("Stop before a queued quota terminal cannot rearm the task", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "quota-stop-race",
+    agentId: "00000000-0000-4000-8000-000000000092",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async (session) => {
+      session.pushEvent({
+        type: "turn_failed",
+        provider: "claude",
+        turnId: "limited-turn",
+        error: "quota",
+        subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
+      });
+    },
+  });
+  const stopped = vi.fn(async () => {});
+  fixture.manager.setQuotaContinuationHooks({ cancel: async () => {}, stopped });
+  await fixture.startForegroundRun();
+  await fixture.manager.cancelAgentRun(fixture.agentId);
+  expect(stopped).not.toHaveBeenCalled();
+  await fixture.cleanup();
+});
+
+test("Stop during quota admission cancels before the provider receives a prompt", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "quota-admission",
+    agentId: "00000000-0000-4000-8000-000000000093",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async () => {},
+  });
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  let cancelled = false;
+  fixture.manager.setQuotaContinuationHooks({
+    cancel: async () => {
+      cancelled = true;
+    },
+    stopped: async () => {},
+  });
+  const start = vi.spyOn(fixture.session, "startTurn");
+  const continuation = fixture.manager.continueQuotaStoppedAgent(
+    fixture.agentId,
+    null,
+    async () => {
+      entered.resolve();
+      await release.promise;
+      return !cancelled;
+    },
+    async () => {},
+  );
+  await entered.promise;
+  const stop = fixture.manager.cancelAgentRun(fixture.agentId);
+  release.resolve();
+  expect(await continuation).toBe(false);
+  await stop;
+  expect(start).not.toHaveBeenCalled();
+  await fixture.cleanup();
+});
+
+test("an idle account weekly block cancels without broadcasting an unknown client event", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "weekly-idle",
+    agentId: "00000000-0000-4000-8000-000000000094",
+    turnId: "limited-turn",
+    provider: "claude",
+    interrupt: async () => {},
+  });
+  const cancelled = deferred<void>();
+  const events: AgentManagerEvent[] = [];
+  fixture.manager.subscribe((event) => events.push(event), { replayState: false });
+  fixture.manager.setQuotaContinuationHooks({
+    cancel: async () => {
+      cancelled.resolve();
+    },
+    stopped: async () => {},
+  });
+  fixture.session.pushEvent({ type: "subscription_blocked", provider: "claude" });
+  await cancelled.promise;
+  expect(events.filter((event) => event.type === "agent_stream")).toEqual([]);
+  await fixture.cleanup();
+});
 
 class HeldRuntimeInfoSession extends TestAgentSession {
   private readonly runtimeInfoRequested = deferred<void>();

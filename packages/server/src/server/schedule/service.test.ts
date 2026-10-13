@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentManager } from "../agent/agent-manager.js";
 import { AgentStorage } from "../agent/agent-storage.js";
+import { startAgentRun } from "../agent/agent-prompt.js";
+import { toAgentPayload, buildStoredAgentPayload } from "../agent/agent-projections.js";
 import { createAgentCommand } from "../agent/create-agent/create.js";
 import type {
   AgentCapabilityFlags,
@@ -374,6 +376,268 @@ describe("ScheduleService", () => {
       output: "ran:Review new PRs",
     });
     expect(inspected.nextRunAt).toBe("2026-01-01T00:02:00.000Z");
+  });
+
+  async function quotaFixture(runner?: ScheduleServiceOptions["runner"]) {
+    const manager = new AgentManager({
+      logger: createTestLogger(),
+      clients: createTestAgentClients(),
+      registry: agentStorage,
+    });
+    const agent = await manager.createAgent(
+      { provider: "claude", cwd: tempDir, modeId: "bypassPermissions" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: manager,
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      ...(runner ? { runner } : {}),
+    });
+    manager.setQuotaContinuationHooks({
+      cancel: (id) => service.cancelQuotaContinuation(id),
+      stopped: (id, event, at) => service.handleQuotaStop(id, event, at),
+    });
+    const input = {
+      agentId: agent.id,
+      turnId: "limited-turn",
+      lastUserMessageAt: null,
+      resetsAt: now.getTime() / 1000 + 60,
+    };
+    return { manager, service, input };
+  }
+
+  test("five-hour jobs deduplicate, stay private, and catch up after an offline reset", async () => {
+    const run = vi.fn(async () => ({ agentId: null, output: "delivered" }));
+    const { service, input } = await quotaFixture(run);
+    const [first, duplicate] = await Promise.all([
+      service.armQuotaContinuation(input),
+      service.armQuotaContinuation(input),
+    ]);
+    expect(first?.id).toBe(duplicate?.id);
+    expect(await service.list()).toEqual([]);
+    await service.tick();
+    expect(run).not.toHaveBeenCalled();
+    now = new Date(now.getTime() + 120_000);
+    await service.start();
+    await service.stop();
+    await Promise.all([service.tick(), service.tick()]);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((await service.inspect(first!.id)).status).toBe("completed");
+    await service.armQuotaContinuation(input);
+    await service.tick();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  test("an interrupted continuation claim is not blindly resent on restart", async () => {
+    const run = vi.fn(async () => ({ agentId: null, output: "delivered" }));
+    const { service, input } = await quotaFixture(run);
+    const job = await service.armQuotaContinuation(input);
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    await store.update(job!.id, (s) => ({
+      ...s,
+      nextRunAt: null,
+      runs: [
+        {
+          id: "claimed-before-crash",
+          scheduledFor: s.nextRunAt!,
+          startedAt: now.toISOString(),
+          endedAt: null,
+          status: "running",
+          agentId: input.agentId,
+          output: null,
+          error: null,
+        },
+      ],
+    }));
+    now = new Date(now.getTime() + 120_000);
+    await service.start();
+    await service.stop();
+    await service.tick();
+    expect(run).not.toHaveBeenCalled();
+    expect((await service.inspect(job!.id)).status).toBe("completed");
+    expect((await service.inspect(job!.id)).runs[0].error).toContain("Daemon restarted");
+  });
+
+  test.each(["Stop", "prompt", "weekly", "archive"])(
+    "%s cancels the pending same-chat continuation",
+    async (action) => {
+      const run = vi.fn(async () => ({ agentId: null, output: "delivered" }));
+      const { service, manager, input } = await quotaFixture(run);
+      const job = await service.armQuotaContinuation(input);
+      if (action === "Stop") await manager.cancelAgentRun(input.agentId);
+      if (action === "prompt") await manager.runAgent(input.agentId, "A new request");
+      if (action === "weekly")
+        await service.handleQuotaStop(
+          input.agentId,
+          {
+            type: "turn_failed",
+            provider: "claude",
+            turnId: "weekly-turn",
+            error: "quota",
+            subscriptionLimit: { type: "weekly" },
+          },
+          null,
+        );
+      if (action === "archive") await manager.archiveAgent(input.agentId);
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      expect(run).not.toHaveBeenCalled();
+      expect((await service.inspect(job!.id)).status).toBe("completed");
+    },
+  );
+
+  test("same-agent continuation starts once and records its accepted turn identity", async () => {
+    const { service, input } = await quotaFixture();
+    const job = await service.armQuotaContinuation(input);
+    now = new Date(now.getTime() + 120_000);
+    await Promise.all([service.tick(), service.tick()]);
+    const stored = await service.inspect(job!.id);
+    expect(stored.runs).toHaveLength(1);
+    expect(stored.runs[0].status).toBe("succeeded");
+    expect(stored.quotaContinuation?.deliveredTurnId).toEqual(expect.any(String));
+    expect(stored.runs[0].output).toBe("Continuation delivered");
+  });
+
+  test("a fresh manager and service recover the persisted job, restore Stop, and deliver to the original agent", async () => {
+    const { service, manager, input } = await quotaFixture();
+    const job = await service.armQuotaContinuation(input);
+    await service.stop();
+    await manager.closeAgent(input.agentId);
+    await manager.flush();
+    const reloaded = new AgentStorage(join(tempDir, "agents"), createTestLogger());
+    await reloaded.initialize();
+    const freshManager = new AgentManager({
+      logger: createTestLogger(),
+      clients: createTestAgentClients(),
+      registry: reloaded,
+    });
+    const freshService = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: freshManager,
+      agentStorage: reloaded,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    freshManager.setQuotaContinuationHooks({
+      cancel: (id) => freshService.cancelQuotaContinuation(id),
+      stopped: (id, event, at) => freshService.handleQuotaStop(id, event, at),
+    });
+    await freshService.start();
+    expect(buildStoredAgentPayload((await reloaded.get(input.agentId))!, ["claude"]).status).toBe(
+      "running",
+    );
+    expect(freshManager.hasInFlightRun(input.agentId)).toBe(false);
+    now = new Date(now.getTime() + 120_000);
+    await Promise.all([freshService.tick(), freshService.tick()]);
+    const stored = await freshService.inspect(job!.id);
+    expect(stored.runs).toHaveLength(1);
+    expect(stored.runs[0]).toMatchObject({
+      agentId: input.agentId,
+      status: "succeeded",
+      output: "Continuation delivered",
+    });
+    expect(freshManager.getAgent(input.agentId)?.id).toBe(input.agentId);
+    await freshManager.waitForAgentEvent(input.agentId, { waitForActive: true });
+    await freshService.stop();
+    await freshManager.closeAgent(input.agentId);
+    await freshManager.flush();
+  });
+
+  test("the existing client's running-status steer path sends a new task and cancels the waiting job", async () => {
+    const { service, manager, input } = await quotaFixture();
+    const job = await service.armQuotaContinuation(input);
+    expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("running");
+    expect(manager.hasInFlightRun(input.agentId)).toBe(false);
+    await startAgentRun(manager, input.agentId, "Replace this task", createTestLogger(), {
+      activeTurnBehavior: "steer",
+      replaceRunning: true,
+    });
+    await manager.waitForAgentRunStart(input.agentId);
+    expect((await service.inspect(job!.id)).quotaContinuation?.cancelled).toBe(true);
+    await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+  });
+
+  test("a changed latest user message fails continuation admission", async () => {
+    const { service, manager, input } = await quotaFixture();
+    const job = await service.armQuotaContinuation(input);
+    // Another source of user history can arrive after the job was stored, including across recovery.
+    await manager.closeAgent(input.agentId);
+    const record = (await agentStorage.get(input.agentId))!;
+    await agentStorage.upsert({
+      ...record,
+      lastUserMessageAt: new Date(now.getTime() + 1000).toISOString(),
+    });
+    now = new Date(now.getTime() + 120_000);
+    await service.tick();
+    expect((await service.inspect(job!.id)).runs[0].output).toBe(
+      "Continuation cancelled or superseded",
+    );
+  });
+
+  test("repeat five-hour quota stops permit only two rearms", async () => {
+    const { service, input } = await quotaFixture();
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    let job = await service.armQuotaContinuation(input);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const nextTurn = `retry-turn-${attempt}`;
+      await store.update(job!.id, (s) => ({
+        ...s,
+        status: "completed",
+        nextRunAt: null,
+        quotaContinuation: { ...s.quotaContinuation!, deliveredTurnId: nextTurn },
+      }));
+      const next = await service.armQuotaContinuation({ ...input, turnId: nextTurn });
+      if (attempt <= 2) {
+        expect(next?.quotaContinuation?.attempt).toBe(attempt);
+        job = next;
+      } else expect(next).toBeNull();
+    }
+  });
+
+  test("equal Claude turn ordinals in different SDK runtimes are distinct persistent quota stops", async () => {
+    const { service, manager, input } = await quotaFixture();
+    const usage = vi.spyOn(manager, "usageSession");
+    usage.mockReturnValue({ provider: "claude", env: {}, sessionKey: "runtime-one" });
+    const event: Extract<AgentStreamEvent, { type: "turn_failed" }> = {
+      type: "turn_failed",
+      provider: "claude",
+      turnId: "foreground-turn-1",
+      error: "quota",
+      subscriptionLimit: { type: "five_hour", resetsAt: input.resetsAt },
+    };
+    await service.handleQuotaStop(input.agentId, event, null);
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    const first = (await store.list())[0];
+    await store.update(first.id, (s) => ({ ...s, status: "completed", nextRunAt: null }));
+    usage.mockReturnValue({ provider: "claude", env: {}, sessionKey: "runtime-two" });
+    await service.handleQuotaStop(input.agentId, event, null);
+    await service.handleQuotaStop(input.agentId, event, null);
+    const jobs = await store.list();
+    expect(jobs).toHaveLength(2);
+    expect(jobs.map((s) => s.quotaContinuation?.turnId)).toEqual([
+      "runtime-one:foreground-turn-1",
+      "runtime-two:foreground-turn-1",
+    ]);
+    expect(jobs.filter((s) => s.status === "active")).toHaveLength(1);
+    const active = jobs.find((s) => s.status === "active")!;
+    await store.update(active.id, (s) => ({
+      ...s,
+      status: "completed",
+      nextRunAt: null,
+      quotaContinuation: {
+        ...s.quotaContinuation!,
+        deliveredTurnId: "runtime-two:foreground-turn-2",
+      },
+    }));
+    await service.handleQuotaStop(input.agentId, { ...event, turnId: "foreground-turn-2" }, null);
+    const rearmed = (await store.list()).find((s) => s.status === "active")!;
+    expect(rearmed.quotaContinuation?.attempt).toBe(1);
   });
 
   test.each(["new-agent", "agent", "maxRuns: 1"] as const)(

@@ -4,7 +4,7 @@ import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
 import type { AgentManager } from "../agent/agent-manager.js";
-import type { AgentSessionConfig } from "../agent/agent-sdk-types.js";
+import type { AgentSessionConfig, AgentStreamEvent } from "../agent/agent-sdk-types.js";
 import type { AgentStorage } from "../agent/agent-storage.js";
 import { curateAgentActivity } from "../agent/activity-curator.js";
 import { ensureAgentLoaded } from "../agent/agent-loading.js";
@@ -14,6 +14,7 @@ import { type BoundCreateAgentCommand, formatProviderModel } from "../agent/crea
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import { ScheduleStore } from "./store.js";
+import { setQuotaContinuationPending } from "../agent/quota-continuation-presentation.js";
 import { computeNextRunAt, validateScheduleCadence } from "./cron.js";
 import type {
   CreateScheduleInput,
@@ -227,6 +228,9 @@ type ScheduleAgentManager = Pick<
     | "runAgent"
     | "waitForAgentEvent"
     | "waitForAgentClose"
+    | "continueQuotaStoppedAgent"
+    | "notifyAgentState"
+    | "usageSession"
   >;
 
 interface ScheduleWorkspaceCreateInput {
@@ -270,6 +274,8 @@ export class ScheduleService {
     runId: string,
   ) => Promise<ScheduleExecutionResult>;
   private readonly runningScheduleIds = new Set<string>();
+  private readonly quotaMutations = new Map<string, Promise<unknown>>();
+  private readonly presentedQuotaAgents = new Set<string>();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: ScheduleServiceOptions) {
@@ -282,12 +288,18 @@ export class ScheduleService {
     this.createPaseoWorktreeWorkspace = options.createPaseoWorktreeWorkspace;
     this.archiveWorkspace = options.archiveWorkspace;
     this.now = options.now ?? (() => new Date());
-    this.runner = options.runner ?? ((schedule, runId) => this.executeSchedule(schedule, runId));
+    this.runner =
+      options.runner ??
+      ((schedule, runId) =>
+        schedule.quotaContinuation
+          ? this.executeQuotaContinuation(schedule)
+          : this.executeSchedule(schedule, runId));
   }
 
   async start(): Promise<void> {
     await this.recoverInterruptedRuns();
     await this.sweepOrphanedSchedules();
+    this.synchronizeQuotaPresentation(await this.store.list());
     if (this.tickTimer) {
       return;
     }
@@ -305,6 +317,8 @@ export class ScheduleService {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
+    for (const id of this.presentedQuotaAgents) setQuotaContinuationPending(id, false);
+    this.presentedQuotaAgents.clear();
   }
 
   async create(input: CreateScheduleInput): Promise<StoredSchedule> {
@@ -387,7 +401,163 @@ export class ScheduleService {
   }
 
   async list(): Promise<StoredSchedule[]> {
-    return this.store.list();
+    return (await this.store.list()).filter((schedule) => !schedule.quotaContinuation);
+  }
+
+  private async mutateQuota<T>(agentId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.quotaMutations.get(agentId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(action);
+    this.quotaMutations.set(agentId, next);
+    try {
+      return await next;
+    } finally {
+      if (this.quotaMutations.get(agentId) === next) this.quotaMutations.delete(agentId);
+    }
+  }
+
+  private synchronizeQuotaPresentation(schedules: StoredSchedule[]): void {
+    const active = new Set(
+      schedules.flatMap((s) =>
+        s.quotaContinuation &&
+        s.target.type === "agent" &&
+        s.status === "active" &&
+        s.nextRunAt !== null
+          ? [s.target.agentId]
+          : [],
+      ),
+    );
+    for (const agentId of new Set([...this.presentedQuotaAgents, ...active])) {
+      this.presentQuotaWork(agentId, active.has(agentId));
+    }
+  }
+
+  private async refreshQuotaPresentation(): Promise<void> {
+    this.synchronizeQuotaPresentation(await this.store.list());
+  }
+
+  private presentQuotaWork(agentId: string, active: boolean): void {
+    if (active === this.presentedQuotaAgents.has(agentId)) return;
+    setQuotaContinuationPending(agentId, active);
+    if (active) this.presentedQuotaAgents.add(agentId);
+    else this.presentedQuotaAgents.delete(agentId);
+    if (this.agentManager.getAgent(agentId)) this.agentManager.notifyAgentState(agentId);
+  }
+
+  async cancelQuotaContinuation(agentId: string): Promise<void> {
+    await this.mutateQuota(agentId, async () => {
+      for (const schedule of await this.store.list()) {
+        if (
+          !schedule.quotaContinuation ||
+          schedule.target.type !== "agent" ||
+          schedule.target.agentId !== agentId ||
+          schedule.quotaContinuation.cancelled
+        )
+          continue;
+        await this.store.update(schedule.id, (current) => ({
+          ...completeSchedule(current, this.now()),
+          quotaContinuation: { ...current.quotaContinuation!, cancelled: true },
+        }));
+      }
+      await this.refreshQuotaPresentation();
+    });
+  }
+
+  async handleQuotaStop(
+    agentId: string,
+    event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
+    lastUserMessageAt: string | null,
+  ): Promise<void> {
+    if (event.provider !== "claude" || !event.turnId) return;
+    if (event.subscriptionLimit?.type === "weekly") {
+      await this.cancelQuotaContinuation(agentId);
+      return;
+    }
+    if (event.subscriptionLimit?.type !== "five_hour") return;
+    await this.armQuotaContinuation({
+      agentId,
+      turnId: this.quotaTurnIdentity(agentId, event.turnId),
+      lastUserMessageAt,
+      resetsAt: event.subscriptionLimit.resetsAt,
+    });
+  }
+
+  private quotaTurnIdentity(agentId: string, turnId: string): string {
+    // Claude's turn ordinal restarts with its SDK runtime. Its existing usage key is unique
+    // per runtime, while a persisted job must distinguish those otherwise equal ordinals.
+    return `${this.agentManager.usageSession(agentId)?.sessionKey ?? agentId}:${turnId}`;
+  }
+
+  async armQuotaContinuation(input: {
+    agentId: string;
+    turnId: string;
+    lastUserMessageAt: string | null;
+    resetsAt: number;
+  }): Promise<StoredSchedule | null> {
+    if (
+      !Number.isFinite(input.resetsAt) ||
+      input.resetsAt <= 0 ||
+      !Number.isFinite(new Date(input.resetsAt * 1000).getTime())
+    )
+      throw new Error("Invalid five-hour reset");
+    return this.mutateQuota(input.agentId, async () => {
+      const record = await this.agentStorage.get(input.agentId);
+      const live = this.agentManager.getAgent(input.agentId);
+      if (
+        !record ||
+        record.archivedAt ||
+        record.provider !== "claude" ||
+        (live?.lastUserMessageAt?.toISOString() ?? record.lastUserMessageAt ?? null) !==
+          input.lastUserMessageAt ||
+        this.agentManager.hasInFlightRun(input.agentId)
+      )
+        return null;
+      const schedules = (await this.store.list()).filter(
+        (s) =>
+          s.quotaContinuation && s.target.type === "agent" && s.target.agentId === input.agentId,
+      );
+      const duplicate = schedules.find((s) => s.quotaContinuation?.turnId === input.turnId);
+      if (duplicate) return duplicate;
+      const previous = schedules.find((s) => s.quotaContinuation?.deliveredTurnId === input.turnId);
+      if (previous?.quotaContinuation?.cancelled) return null;
+      const attempt = previous ? previous.quotaContinuation!.attempt + 1 : 0;
+      if (attempt > 2) {
+        this.logger.warn(
+          { agentId: input.agentId, turnId: input.turnId },
+          "Five-hour continuation retry limit reached; resume manually",
+        );
+        return null;
+      }
+      for (const schedule of schedules.filter((s) => s.status !== "completed")) {
+        await this.store.update(schedule.id, (current) => completeSchedule(current, this.now()));
+      }
+      const created = await this.store.create({
+        ...this.buildScheduleRecord(
+          {
+            prompt: "Resume after five-hour limit",
+            cadence: { type: "every", everyMs: 1000 },
+            target: { type: "agent", agentId: input.agentId },
+            maxRuns: 1,
+          },
+          {
+            name: null,
+            prompt: "Resume after five-hour limit",
+            target: { type: "agent", agentId: input.agentId },
+          },
+        ),
+        nextRunAt: new Date(input.resetsAt * 1000 + 5000).toISOString(),
+        quotaContinuation: {
+          turnId: input.turnId,
+          lastUserMessageAt: input.lastUserMessageAt,
+          attempt,
+        },
+      });
+      this.logger.info(
+        { agentId: input.agentId, scheduleId: created.id, nextRunAt: created.nextRunAt, attempt },
+        "Five-hour task continuation scheduled",
+      );
+      await this.refreshQuotaPresentation();
+      return created;
+    });
   }
 
   async inspect(id: string): Promise<StoredSchedule> {
@@ -558,6 +728,7 @@ export class ScheduleService {
   async tick(): Promise<void> {
     const now = this.now();
     const schedules = await this.store.list();
+    this.synchronizeQuotaPresentation(schedules);
     for (const schedule of schedules) {
       if (schedule.status !== "active" || !schedule.nextRunAt) {
         continue;
@@ -640,6 +811,7 @@ export class ScheduleService {
       }
 
       if (
+        !updated.quotaContinuation &&
         updated.status === "active" &&
         updated.nextRunAt &&
         new Date(updated.nextRunAt).getTime() <= now.getTime()
@@ -757,6 +929,8 @@ export class ScheduleService {
       }
     } finally {
       this.runningScheduleIds.delete(schedule.id);
+      if (schedule.quotaContinuation && schedule.target.type === "agent")
+        await this.refreshQuotaPresentation();
     }
   }
 
@@ -910,6 +1084,53 @@ export class ScheduleService {
       ),
     }));
     requireSchedule(updatedSchedule, params.scheduleId);
+  }
+
+  private async executeQuotaContinuation(
+    schedule: StoredSchedule,
+  ): Promise<ScheduleExecutionResult> {
+    if (!schedule.quotaContinuation || schedule.target.type !== "agent")
+      throw new Error("Invalid quota continuation target");
+    const agentId = schedule.target.agentId;
+    const record = await this.agentStorage.get(agentId);
+    if (!record || record.archivedAt)
+      throw new ScheduleTargetGoneError(`Quota-stopped agent ${agentId} is unavailable`);
+    await ensureAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.logger,
+    });
+    const accepted = await this.agentManager.continueQuotaStoppedAgent(
+      agentId,
+      schedule.quotaContinuation.lastUserMessageAt,
+      async () => {
+        const current = await this.store.get(schedule.id);
+        const stored = await this.agentStorage.get(agentId);
+        return (
+          current?.status === "active" &&
+          !current.quotaContinuation?.cancelled &&
+          !!stored &&
+          !stored.archivedAt
+        );
+      },
+      async (turnId) => {
+        await this.store.update(schedule.id, (current) => ({
+          ...current,
+          quotaContinuation: {
+            ...current.quotaContinuation!,
+            deliveredTurnId: this.quotaTurnIdentity(agentId, turnId),
+          },
+        }));
+      },
+    );
+    this.logger.info(
+      { agentId, scheduleId: schedule.id, accepted },
+      "Five-hour continuation admission completed",
+    );
+    return {
+      agentId,
+      output: accepted ? "Continuation delivered" : "Continuation cancelled or superseded",
+    };
   }
 
   private async executeSchedule(
