@@ -81,7 +81,7 @@ import {
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
 } from "./agent-run-state.js";
-import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import { resolveRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { projectAgentMessage } from "./agent-messages/index.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
@@ -900,6 +900,51 @@ export class AgentManager {
 
   setQuotaContinuationHooks(hooks: NonNullable<AgentManager["quotaContinuationHooks"]>): void {
     this.quotaContinuationHooks = hooks;
+  }
+
+  async reportQuotaReloadFailure(
+    agentId: string,
+    lastUserMessageAt: string | null,
+    error: unknown,
+  ): Promise<void> {
+    await this.runLifecycleMutation(agentId, async () => {
+      const registry = this.requireRegistry();
+      const record = await registry.get(agentId);
+      if (
+        !record ||
+        record.archivedAt ||
+        record.internal ||
+        record.requiresAttention ||
+        this.agents.has(agentId) ||
+        this.quotaStoppedByUser.has(agentId) ||
+        (record.lastUserMessageAt ?? null) !== lastUserMessageAt
+      )
+        return;
+      const updatedAt = this.nextStoredUpdatedAt(record);
+      const next: StoredAgentRecord = {
+        ...record,
+        updatedAt,
+        lastStatus: "error",
+        lastError: error instanceof Error ? error.message : String(error),
+        requiresAttention: true,
+        attentionReason: "error",
+        attentionTimestamp: updatedAt,
+      };
+      await registry.upsert(next);
+      if (this.quotaStoppedByUser.has(agentId) || this.agents.has(agentId)) {
+        const current = await registry.get(agentId);
+        if (current?.attentionTimestamp === updatedAt)
+          await registry.upsert({
+            ...current,
+            requiresAttention: record.requiresAttention,
+            attentionReason: record.attentionReason,
+            attentionTimestamp: record.attentionTimestamp,
+          });
+        return;
+      }
+      this.dispatchStoredAgentState(next);
+      this.broadcastAgentAttention(next, "error");
+    });
   }
 
   async continueQuotaStoppedAgent(
@@ -3480,6 +3525,9 @@ export class AgentManager {
       throw new Error("Cannot rewind before the provider acknowledges the submitted prompt");
     }
     const providerMessageId = submittedRow?.providerMessageId ?? messageId;
+    const rewind = resolveRewindCapability(agent.session, mode);
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
 
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "rewind");
@@ -3491,7 +3539,7 @@ export class AgentManager {
         { agentId, provider: agent.provider, messageId, mode },
         "agent.rewind.start",
       );
-      await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
+      await rewind({ messageId: providerMessageId });
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, {
           force: true,
@@ -4111,6 +4159,11 @@ export class AgentManager {
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
+    if (
+      event.type === "subscription_blocked" ||
+      (event.type === "turn_failed" && event.subscriptionLimit?.type === "weekly")
+    )
+      this.quotaStoppedByUser.add(agentId);
     this.logger.trace(
       {
         agentId,
@@ -4629,7 +4682,6 @@ export class AgentManager {
     fromHistory?: boolean,
   ): Promise<void> | undefined {
     if (!this.quotaContinuationHooks) return undefined;
-    if (event.type === "subscription_blocked") this.quotaStoppedByUser.add(agent.id);
     if (
       event.type === "subscription_blocked" ||
       (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)
@@ -4670,10 +4722,23 @@ export class AgentManager {
     )
       return;
     try {
+      const lastUserMessageAt = agent.lastUserMessageAt;
+      if (event.subscriptionLimit?.type === "five_hour") {
+        // A durable job must never outlive the durable ownership snapshot it references.
+        await this.persistSnapshot(agent);
+        if (
+          this.agents.get(agent.id) !== agent ||
+          agent.lastUserMessageAt !== lastUserMessageAt ||
+          this.quotaStoppedByUser.has(agent.id) ||
+          this.hasInFlightRun(agent.id) ||
+          agent.lifecycle !== "error"
+        )
+          return;
+      }
       await this.quotaContinuationHooks.stopped(
         agent.id,
         event,
-        agent.lastUserMessageAt?.toISOString() ?? null,
+        lastUserMessageAt?.toISOString() ?? null,
       );
     } catch (error) {
       this.logger.error(
@@ -5458,7 +5523,7 @@ export class AgentManager {
   }
 
   private broadcastAgentAttention(
-    agent: ManagedAgent,
+    agent: Pick<ManagedAgent, "id" | "provider" | "labels">,
     reason: "finished" | "error" | "permission",
   ): void {
     if (isDelegatedAgent(agent)) {

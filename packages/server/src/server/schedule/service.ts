@@ -234,6 +234,7 @@ type ScheduleAgentManager = Pick<
     | "waitForAgentEvent"
     | "waitForAgentClose"
     | "continueQuotaStoppedAgent"
+    | "reportQuotaReloadFailure"
     | "notifyAgentState"
     | "usageSession"
   >;
@@ -525,8 +526,8 @@ export class ScheduleService {
         !record ||
         record.archivedAt ||
         record.provider !== "claude" ||
-        (live?.lastUserMessageAt?.toISOString() ?? record.lastUserMessageAt ?? null) !==
-          input.lastUserMessageAt ||
+        (record.lastUserMessageAt ?? null) !== input.lastUserMessageAt ||
+        (live && (live.lastUserMessageAt?.toISOString() ?? null) !== input.lastUserMessageAt) ||
         this.agentManager.hasInFlightRun(input.agentId)
       )
         return null;
@@ -1125,11 +1126,27 @@ export class ScheduleService {
     const record = await this.agentStorage.get(agentId);
     if (!record || record.archivedAt)
       throw new ScheduleTargetGoneError(`Quota-stopped agent ${agentId} is unavailable`);
-    await ensureAgentLoaded(agentId, {
-      agentManager: this.agentManager,
-      agentStorage: this.agentStorage,
-      logger: this.logger,
-    });
+    try {
+      await ensureAgentLoaded(agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.logger,
+      });
+    } catch (error) {
+      try {
+        await this.agentManager.reportQuotaReloadFailure(
+          agentId,
+          schedule.quotaContinuation.lastUserMessageAt,
+          error,
+        );
+      } catch (reportError) {
+        this.logger.error(
+          { err: reportError, agentId },
+          "Failed to persist quota reload attention",
+        );
+      }
+      throw error;
+    }
     const accepted = await this.agentManager.continueQuotaStoppedAgent(
       agentId,
       schedule.quotaContinuation.lastUserMessageAt,

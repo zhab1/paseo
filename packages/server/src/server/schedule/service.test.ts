@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { AgentManager } from "../agent/agent-manager.js";
-import { AgentStorage } from "../agent/agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "../agent/agent-storage.js";
 import { startAgentRun } from "../agent/agent-prompt.js";
 import { toAgentPayload, buildStoredAgentPayload } from "../agent/agent-projections.js";
 import { createAgentCommand } from "../agent/create-agent/create.js";
@@ -412,10 +412,7 @@ describe("ScheduleService", () => {
     return { manager, service, input };
   }
 
-  async function stopForQuota(
-    fixture: Awaited<ReturnType<typeof quotaFixture>>,
-    expectPending = true,
-  ) {
+  async function runToQuota(fixture: Awaited<ReturnType<typeof quotaFixture>>) {
     const { manager, input } = fixture;
     const session = manager.getAgent(input.agentId)!.session! as unknown as {
       notifySubscribers(event: AgentStreamEvent): void;
@@ -430,8 +427,21 @@ describe("ScheduleService", () => {
             : event,
         ),
       );
-    await expect(manager.runAgent(input.agentId, "Emit a turn failure")).rejects.toThrow();
+    await expect(
+      manager.runAgent(input.agentId, "Emit a turn failure", {
+        clientMessageId: "quota-client",
+      }),
+    ).rejects.toThrow();
     quota.mockRestore();
+    return emit;
+  }
+
+  async function stopForQuota(
+    fixture: Awaited<ReturnType<typeof quotaFixture>>,
+    expectPending = true,
+  ) {
+    const { manager, input } = fixture;
+    const emit = await runToQuota(fixture);
     await manager.flush();
     expect(manager.getAgent(input.agentId)?.lifecycle).toBe("error");
     expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(!expectPending);
@@ -767,6 +777,155 @@ describe("ScheduleService", () => {
     expect(attention).toHaveBeenCalledWith(expect.objectContaining({ reason: "error" }));
   });
 
+  test.each(["Stop", "prompt", "weekly"])(
+    "%s during ownership persistence prevents stale quota arming",
+    async (action) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      let entered!: () => void;
+      let release!: () => void;
+      const saving = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const snapshot = agentStorage.applySnapshot.bind(agentStorage);
+      vi.spyOn(agentStorage, "applySnapshot").mockImplementation(async (agent, options) => {
+        if (agent.lifecycle === "error") {
+          entered();
+          await blocked;
+        }
+        return snapshot(agent, options);
+      });
+      const stopped = runToQuota(fixture);
+      await saving;
+      const arm = vi.spyOn(service, "armQuotaContinuation");
+      let mutation: Promise<unknown> | undefined;
+      if (action === "Stop") mutation = manager.cancelAgentRun(input.agentId);
+      if (action === "prompt") mutation = manager.runAgent(input.agentId, "Following user task");
+      if (action === "weekly") {
+        (
+          manager.getAgent(input.agentId)!.session! as unknown as {
+            notifySubscribers(event: AgentStreamEvent): void;
+          }
+        ).notifySubscribers({ type: "subscription_blocked", provider: "claude" });
+      }
+      release();
+      await stopped;
+      await mutation;
+      await manager.flush();
+      expect(arm).not.toHaveBeenCalled();
+      expect(
+        (await new ScheduleStore(join(tempDir, "schedules"), createTestLogger()).list()).filter(
+          (s) => s.status === "active",
+        ),
+      ).toEqual([]);
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).not.toBe("running");
+      await service.stop();
+    },
+  );
+
+  test("failed ownership persistence leaves an actionable error without a quota job", async () => {
+    const fixture = await quotaFixture();
+    const snapshot = agentStorage.applySnapshot.bind(agentStorage);
+    let failed = false;
+    vi.spyOn(agentStorage, "applySnapshot").mockImplementation((agent, options) => {
+      if (agent.lifecycle === "error" && !failed) {
+        failed = true;
+        return Promise.reject(new Error("Snapshot unavailable"));
+      }
+      return snapshot(agent, options);
+    });
+    await stopForQuota(fixture, false);
+    expect((await agentStorage.get(fixture.input.agentId))?.attentionReason).toBe("error");
+  });
+
+  test.each(["conversation", "files", "both"] as const)(
+    "successful %s rewind cancels quota continuation even during its claim",
+    async (mode) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job } = await stopForQuota(fixture);
+      const session = manager.getAgent(input.agentId)!.session!;
+      const revert = vi.fn(async () => {});
+      Object.assign(session, {
+        capabilities: {
+          ...session.capabilities,
+          supportsRewindConversation: true,
+          supportsRewindFiles: true,
+          supportsRewindBoth: true,
+        },
+        revertConversation: revert,
+        revertFiles: revert,
+        revertBoth: revert,
+      });
+      let entered!: () => void;
+      let release!: () => void;
+      const claiming = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const admit = manager.continueQuotaStoppedAgent.bind(manager);
+      async function gatedClaim(claim: () => Promise<boolean>) {
+        entered();
+        await blocked;
+        return claim();
+      }
+      vi.spyOn(manager, "continueQuotaStoppedAgent").mockImplementation((id, at, claim, started) =>
+        admit(id, at, gatedClaim.bind(null, claim), started),
+      );
+      const start = vi.spyOn(session, "startTurn");
+      now = new Date(now.getTime() + 120_000);
+      const tick = service.tick();
+      await claiming;
+      const rewind = manager.rewind(input.agentId, "provider-message", mode);
+      release();
+      await Promise.all([tick, rewind]);
+      await manager.flush();
+      expect(revert).toHaveBeenCalledExactlyOnceWith({ messageId: "provider-message" });
+      expect(start).not.toHaveBeenCalled();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "completed",
+        quotaContinuation: { cancelled: true },
+      });
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).not.toBe("running");
+    },
+  );
+
+  test.each(["unsupported", "failed"])(
+    "%s rewind preserves unsupported work or cancels supported intent without a stranded lock",
+    async (outcome) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job } = await stopForQuota(fixture);
+      const session = manager.getAgent(input.agentId)!.session!;
+      if (outcome === "failed")
+        Object.assign(session, {
+          capabilities: { ...session.capabilities, supportsRewindFiles: true },
+          revertFiles: async () => {
+            throw new Error("Rewind failed");
+          },
+        });
+      await expect(manager.rewind(input.agentId, "provider-message", "files")).rejects.toThrow();
+      expect((await service.inspect(job.id)).status).toBe(
+        outcome === "failed" ? "completed" : "active",
+      );
+      expect((await service.inspect(job.id)).quotaContinuation?.cancelled).toBe(
+        outcome === "failed" ? true : undefined,
+      );
+      expect(manager.hasInFlightRun(input.agentId)).toBe(false);
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      expect((await service.inspect(job.id)).runs.map((run) => run.output)).toEqual(
+        outcome === "failed" ? [] : ["Continuation delivered"],
+      );
+      await manager.flush();
+    },
+  );
+
   test("the repeated-quota ceiling leaves an actionable terminal error without another job", async () => {
     const fixture = await quotaFixture();
     const { manager, service, input } = fixture;
@@ -941,54 +1100,143 @@ describe("ScheduleService", () => {
     expect(start).toHaveBeenCalledTimes(2);
   });
 
-  test("a stored quota job publishes ended presentation when provider reload fails", async () => {
-    const fixture = await quotaFixture();
-    const { manager, service, input } = fixture;
-    const { job } = await stopForQuota(fixture);
-    await service.stop();
-    await manager.closeAgent(input.agentId);
-    await manager.flush();
-    const freshManager = new AgentManager({
-      logger: createTestLogger(),
-      clients: createTestAgentClients(),
-      registry: agentStorage,
-    });
-    vi.spyOn(freshManager, "resumeAgentFromPersistence").mockRejectedValue(
-      new Error("Provider reload failed"),
-    );
-    const states: string[] = [];
-    freshManager.subscribe(
-      (event) => {
-        if (event.type === "agent_state") states.push(toAgentPayload(event.agent).status);
-      },
-      { replayState: false, agentId: input.agentId },
-    );
-    const freshService = createScheduleService({
-      paseoHome: tempDir,
-      logger: createTestLogger(),
-      agentManager: freshManager,
-      agentStorage,
-      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
-      now: () => now,
-    });
-    await freshService.start();
-    await freshManager.flush();
-    expect(states.at(-1)).toBe("running");
-    now = new Date(now.getTime() + 120_000);
-    await freshService.tick();
-    await freshManager.flush();
-    expect(await freshService.inspect(job.id)).toMatchObject({
-      status: "completed",
-      runs: [{ status: "failed" }],
-    });
-    expect(states.at(-1)).not.toBe("running");
-    expect(freshManager.getAgent(input.agentId)).toBeNull();
-    await freshService.stop();
-  });
+  test.each(["failure", "Stop", "archive"])(
+    "a cold reload %s preserves durable attention and cancellation during its write",
+    async (action) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job } = await stopForQuota(fixture);
+      await service.stop();
+      await manager.closeAgent(input.agentId);
+      await manager.flush();
+      const freshManager = new AgentManager({
+        logger: createTestLogger(),
+        clients: createTestAgentClients(),
+        registry: agentStorage,
+      });
+      const attention = vi.fn();
+      freshManager.setAgentAttentionCallback(attention);
+      vi.spyOn(freshManager, "resumeAgentFromPersistence").mockRejectedValue(
+        new Error("Provider reload failed"),
+      );
+      const states: string[] = [];
+      freshManager.subscribe(
+        (event) => {
+          if (event.type === "agent_state") states.push(toAgentPayload(event.agent).status);
+        },
+        { replayState: false, agentId: input.agentId },
+      );
+      const freshService = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: freshManager,
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+      });
+      await freshService.start();
+      await freshManager.flush();
+      expect(states.at(-1)).toBe("running");
+      now = new Date(now.getTime() + 120_000);
+      let entered!: () => void;
+      let release!: () => void;
+      const writing = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const blocked = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const upsert = agentStorage.upsert.bind(agentStorage);
+      vi.spyOn(agentStorage, "upsert").mockImplementation(async (record) => {
+        await upsert(record);
+        if (record.requiresAttention && record.lastError === "Provider reload failed") {
+          entered();
+          await blocked;
+        }
+      });
+      freshManager.setQuotaContinuationHooks({
+        cancel: (id) => freshService.cancelQuotaContinuation(id),
+        stopped: (id, event, at) => freshService.handleQuotaStop(id, event, at),
+      });
+      const tick = freshService.tick();
+      await writing;
+      let cancel: Promise<unknown> | undefined;
+      if (action === "Stop") cancel = freshManager.cancelAgentRun(input.agentId);
+      if (action === "archive")
+        cancel = freshManager.archiveSnapshot(input.agentId, now.toISOString());
+      release();
+      await Promise.all([tick, cancel]);
+      await freshManager.flush();
+      expect(await freshService.inspect(job.id)).toMatchObject({
+        status: "completed",
+        runs: [{ status: "failed" }],
+      });
+      expect(states.at(-1)).not.toBe("running");
+      expect(freshManager.getAgent(input.agentId)).toBeNull();
+      const reloaded = new AgentStorage(join(tempDir, "agents"), createTestLogger());
+      expect(await reloaded.get(input.agentId)).toMatchObject({
+        requiresAttention: action === "failure",
+        attentionReason: action === "failure" ? "error" : null,
+        lastError: "Provider reload failed",
+      });
+      expect(attention.mock.calls).toEqual(
+        action === "failure"
+          ? [
+              [
+                {
+                  agentId: input.agentId,
+                  provider: "claude",
+                  reason: "error",
+                },
+              ],
+            ]
+          : [],
+      );
+      await freshService.stop();
+    },
+  );
 
   test("a fresh manager and service recover the persisted job, restore Stop, and deliver to the original agent", async () => {
-    const { service, manager, input } = await quotaFixture();
-    const job = await service.armQuotaContinuation(input);
+    const fixture = await quotaFixture();
+    const { service, manager, input } = fixture;
+    let release!: () => void;
+    let terminalQueued!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const terminalSnapshot = new Promise<void>((resolve) => {
+      terminalQueued = resolve;
+    });
+    const storageWriter = agentStorage as unknown as {
+      writeRecord(record: StoredAgentRecord): Promise<void>;
+    };
+    const write = storageWriter.writeRecord.bind(agentStorage);
+    const saving = vi.spyOn(storageWriter, "writeRecord").mockImplementation(async (record) => {
+      if (record.lastUserMessageAt) await blocked;
+      await write(record);
+    });
+    const snapshot = agentStorage.applySnapshot.bind(agentStorage);
+    vi.spyOn(agentStorage, "applySnapshot").mockImplementation((agent, options) => {
+      if (agent.lifecycle === "error") terminalQueued();
+      return snapshot(agent, options);
+    });
+    const stopped = runToQuota(fixture);
+    await terminalSnapshot;
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    try {
+      expect(await store.list()).toEqual([]);
+    } finally {
+      release();
+    }
+    await stopped;
+    await manager.flush();
+    saving.mockRestore();
+    const job = (await store.list())[0];
+    expect(job.quotaContinuation?.lastUserMessageAt).toEqual(expect.any(String));
+    expect(job.quotaContinuation?.lastUserMessageAt).toBe(
+      (await new AgentStorage(join(tempDir, "agents"), createTestLogger()).get(input.agentId))
+        ?.lastUserMessageAt,
+    );
     await service.stop();
     await manager.closeAgent(input.agentId);
     await manager.flush();

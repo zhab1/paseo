@@ -81,6 +81,8 @@ Weekly exhaustion cancels a pending continuation, including a block learned whil
 The existing scheduler persists one private, same-agent job for the limited turn and sends five
 seconds after reset. Overdue quota jobs catch up on daemon startup; ordinary cron recovery still
 skips missed occurrences. Stop, a new user prompt or command, archive and deletion cancel the job.
+An accepted, supported rewind also cancels it before provider mutation, even if the provider later
+fails to rewind. An invalid or unsupported request leaves the pending task eligible.
 Admission checks the latest user message and the conversation's current run before submitting.
 The same interruption permits at most two further quota rearms. An interrupted delivery claim is
 retained as failed and is never blindly replayed after a daemon crash; resume that case manually.

@@ -9,28 +9,25 @@ export class RewindCapabilityError extends Error {
   }
 }
 
-export async function invokeRewindCapability(
+export function resolveRewindCapability(
   session: AgentSession,
-  input: { messageId: string; mode: RewindMode },
-): Promise<void> {
-  switch (input.mode) {
+  mode: RewindMode,
+): (input: { messageId: string }) => Promise<void> {
+  switch (mode) {
     case "conversation":
       if (!session.capabilities.supportsRewindConversation || !session.revertConversation) {
-        throw new RewindCapabilityError(input.mode);
+        throw new RewindCapabilityError(mode);
       }
-      await session.revertConversation({ messageId: input.messageId });
-      return;
+      return session.revertConversation.bind(session);
     case "files":
       if (!session.capabilities.supportsRewindFiles || !session.revertFiles) {
-        throw new RewindCapabilityError(input.mode);
+        throw new RewindCapabilityError(mode);
       }
-      await session.revertFiles({ messageId: input.messageId });
-      return;
+      return session.revertFiles.bind(session);
     case "both":
       if (!session.capabilities.supportsRewindBoth || !session.revertBoth) {
-        throw new RewindCapabilityError(input.mode);
+        throw new RewindCapabilityError(mode);
       }
-      await session.revertBoth({ messageId: input.messageId });
-      return;
+      return session.revertBoth.bind(session);
   }
 }
