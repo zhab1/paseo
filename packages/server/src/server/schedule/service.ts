@@ -275,7 +275,8 @@ export class ScheduleService {
   ) => Promise<ScheduleExecutionResult>;
   private readonly runningScheduleIds = new Set<string>();
   private readonly quotaMutations = new Map<string, Promise<unknown>>();
-  private readonly presentedQuotaAgents = new Set<string>();
+  private readonly presentedQuotaAgents = new Map<string, string>();
+  private readonly ownedQuotaAgents = new Set<string>();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: ScheduleServiceOptions) {
@@ -299,7 +300,17 @@ export class ScheduleService {
   async start(): Promise<void> {
     await this.recoverInterruptedRuns();
     await this.sweepOrphanedSchedules();
-    this.synchronizeQuotaPresentation(await this.store.list());
+    const schedules = await this.store.list();
+    for (const schedule of schedules) {
+      this.rememberQuotaOwnership(schedule);
+      if (
+        schedule.quotaContinuation &&
+        schedule.target.type === "agent" &&
+        schedule.status === "active" &&
+        schedule.nextRunAt !== null
+      )
+        this.presentQuotaWork(schedule.target.agentId, schedule.id);
+    }
     if (this.tickTimer) {
       return;
     }
@@ -317,7 +328,7 @@ export class ScheduleService {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
-    for (const id of this.presentedQuotaAgents) setQuotaContinuationPending(id, false);
+    for (const id of this.presentedQuotaAgents.keys()) setQuotaContinuationPending(id, false);
     this.presentedQuotaAgents.clear();
   }
 
@@ -415,35 +426,35 @@ export class ScheduleService {
     }
   }
 
-  private synchronizeQuotaPresentation(schedules: StoredSchedule[]): void {
-    const active = new Set(
-      schedules.flatMap((s) =>
-        s.quotaContinuation &&
-        s.target.type === "agent" &&
-        s.status === "active" &&
-        s.nextRunAt !== null
-          ? [s.target.agentId]
-          : [],
-      ),
-    );
-    for (const agentId of new Set([...this.presentedQuotaAgents, ...active])) {
-      this.presentQuotaWork(agentId, active.has(agentId));
-    }
-  }
-
-  private async refreshQuotaPresentation(): Promise<void> {
-    this.synchronizeQuotaPresentation(await this.store.list());
-  }
-
-  private presentQuotaWork(agentId: string, active: boolean): void {
-    if (active === this.presentedQuotaAgents.has(agentId)) return;
-    setQuotaContinuationPending(agentId, active);
-    if (active) this.presentedQuotaAgents.add(agentId);
+  private presentQuotaWork(agentId: string, scheduleId: string | null): void {
+    const wasPending = this.presentedQuotaAgents.has(agentId);
+    if (scheduleId) this.presentedQuotaAgents.set(agentId, scheduleId);
     else this.presentedQuotaAgents.delete(agentId);
+    if (wasPending === Boolean(scheduleId)) return;
+    setQuotaContinuationPending(agentId, Boolean(scheduleId));
     this.agentManager.notifyAgentState(agentId);
   }
 
+  private clearQuotaPresentation(agentId: string, scheduleId: string): void {
+    if (this.presentedQuotaAgents.get(agentId) === scheduleId) this.presentQuotaWork(agentId, null);
+  }
+
+  private rememberQuotaOwnership(schedule: StoredSchedule): void {
+    if (
+      schedule.quotaContinuation &&
+      !schedule.quotaContinuation.cancelled &&
+      schedule.target.type === "agent"
+    )
+      this.ownedQuotaAgents.add(schedule.target.agentId);
+  }
+
   async cancelQuotaContinuation(agentId: string): Promise<void> {
+    if (
+      !this.ownedQuotaAgents.has(agentId) &&
+      !this.presentedQuotaAgents.has(agentId) &&
+      !this.quotaMutations.has(agentId)
+    )
+      return;
     await this.mutateQuota(agentId, async () => {
       for (const schedule of await this.store.list()) {
         if (
@@ -458,7 +469,8 @@ export class ScheduleService {
           quotaContinuation: { ...current.quotaContinuation!, cancelled: true },
         }));
       }
-      await this.refreshQuotaPresentation();
+      this.ownedQuotaAgents.delete(agentId);
+      this.presentQuotaWork(agentId, null);
     });
   }
 
@@ -516,7 +528,10 @@ export class ScheduleService {
           s.quotaContinuation && s.target.type === "agent" && s.target.agentId === input.agentId,
       );
       const duplicate = schedules.find((s) => s.quotaContinuation?.turnId === input.turnId);
-      if (duplicate) return duplicate;
+      if (duplicate) {
+        this.rememberQuotaOwnership(duplicate);
+        return duplicate;
+      }
       const previous = schedules.find((s) => s.quotaContinuation?.deliveredTurnId === input.turnId);
       if (previous?.quotaContinuation?.cancelled) return null;
       const attempt = previous ? previous.quotaContinuation!.attempt + 1 : 0;
@@ -551,11 +566,12 @@ export class ScheduleService {
           attempt,
         },
       });
+      this.rememberQuotaOwnership(created);
       this.logger.info(
         { agentId: input.agentId, scheduleId: created.id, nextRunAt: created.nextRunAt, attempt },
         "Five-hour task continuation scheduled",
       );
-      await this.refreshQuotaPresentation();
+      this.presentQuotaWork(input.agentId, created.id);
       return created;
     });
   }
@@ -728,7 +744,6 @@ export class ScheduleService {
   async tick(): Promise<void> {
     const now = this.now();
     const schedules = await this.store.list();
-    this.synchronizeQuotaPresentation(schedules);
     for (const schedule of schedules) {
       if (schedule.status !== "active" || !schedule.nextRunAt) {
         continue;
@@ -902,6 +917,7 @@ export class ScheduleService {
         }
         ({ schedule: scheduleWithRun, runId } = claimed);
       }
+      this.rememberQuotaOwnership(scheduleWithRun);
 
       try {
         const result = await this.runner(scheduleWithRun, runId);
@@ -930,7 +946,7 @@ export class ScheduleService {
     } finally {
       this.runningScheduleIds.delete(schedule.id);
       if (schedule.quotaContinuation && schedule.target.type === "agent")
-        await this.refreshQuotaPresentation();
+        this.clearQuotaPresentation(schedule.target.agentId, schedule.id);
     }
   }
 
@@ -1112,7 +1128,7 @@ export class ScheduleService {
           !!stored &&
           !stored.archivedAt;
         // The durable claim has consumed nextRunAt; actual run state now owns attention.
-        if (eligible) await this.refreshQuotaPresentation();
+        if (eligible) this.clearQuotaPresentation(agentId, schedule.id);
         return eligible;
       },
       async (turnId) => {

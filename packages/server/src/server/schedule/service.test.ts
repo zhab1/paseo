@@ -459,6 +459,84 @@ describe("ScheduleService", () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  test.each(["claude", "codex"])(
+    "ordinary %s prompts do not read unrelated quota storage",
+    async (provider) => {
+      const { manager, input } = await quotaFixture();
+      const agentId =
+        provider === "claude"
+          ? input.agentId
+          : (
+              await manager.createAgent({ provider, cwd: tempDir }, undefined, {
+                workspaceId: undefined,
+              })
+            ).id;
+      const reads = vi
+        .spyOn(ScheduleStore.prototype, "list")
+        .mockRejectedValue(new Error("Unrelated schedule read failed"));
+      await startAgentRun(manager, agentId, "Ordinary task", createTestLogger());
+      await manager.waitForAgentEvent(agentId, { waitForActive: true });
+      expect(reads).not.toHaveBeenCalled();
+      reads.mockRestore();
+    },
+  );
+
+  test("Stop queued during arming cancels the newly persisted job", async () => {
+    const run = vi.fn(async () => ({ agentId: null, output: "unexpected" }));
+    const { manager, service, input } = await quotaFixture(run);
+    let entered!: () => void;
+    let release!: () => void;
+    const creating = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const create = ScheduleStore.prototype.create;
+    const write = vi
+      .spyOn(ScheduleStore.prototype, "create")
+      .mockImplementation(async function (record) {
+        entered();
+        await blocked;
+        return create.call(this, record);
+      });
+    const arming = service.armQuotaContinuation(input);
+    await creating;
+    const stop = manager.cancelAgentRun(input.agentId);
+    release();
+    const job = await arming;
+    await stop;
+    write.mockRestore();
+    expect(await service.inspect(job!.id)).toMatchObject({
+      status: "completed",
+      quotaContinuation: { cancelled: true },
+    });
+    now = new Date(now.getTime() + 120_000);
+    await service.tick();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  test("delivered quota ownership remains cancellable before a repeated quota event", async () => {
+    const { manager, service, input } = await quotaFixture();
+    const job = await service.armQuotaContinuation(input);
+    now = new Date(now.getTime() + 120_000);
+    await service.tick();
+    await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+    const delivered = await service.inspect(job!.id);
+    await service.cancelQuotaContinuation(input.agentId);
+    expect(await service.inspect(job!.id)).toMatchObject({
+      quotaContinuation: { cancelled: true },
+    });
+    expect(
+      await service.armQuotaContinuation({
+        ...input,
+        turnId: delivered.quotaContinuation!.deliveredTurnId!,
+        lastUserMessageAt:
+          manager.getAgent(input.agentId)?.lastUserMessageAt?.toISOString() ?? null,
+      }),
+    ).toBeNull();
+  });
+
   test("an interrupted continuation claim is not blindly resent on restart", async () => {
     const run = vi.fn(async () => ({ agentId: null, output: "delivered" }));
     const { service, input } = await quotaFixture(run);
@@ -564,6 +642,61 @@ describe("ScheduleService", () => {
         }),
       );
       expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(true);
+    },
+  );
+
+  test.each(["active", "completed", "cancelled", "rearmed"])(
+    "a stale tick snapshot preserves %s quota presentation",
+    async (phase) => {
+      const fixture = await quotaFixture();
+      const { service, manager, input } = fixture;
+      const { job, emit } = await stopForQuota(fixture);
+      const stale = [await service.inspect(job.id)];
+      const attention = vi.fn();
+      manager.setAgentAttentionCallback(attention);
+      const start = vi
+        .spyOn(manager.getAgent(input.agentId)!.session!, "startTurn")
+        .mockResolvedValueOnce({ turnId: "continued" });
+      now = new Date(now.getTime() + 120_000);
+      if (phase === "cancelled") await service.cancelQuotaContinuation(input.agentId);
+      else {
+        await service.tick();
+        expect(manager.hasInFlightRun(input.agentId)).toBe(true);
+        if (phase === "rearmed")
+          emit({
+            type: "turn_failed",
+            provider: "claude",
+            turnId: "continued",
+            error: "quota",
+            subscriptionLimit: { type: "five_hour", resetsAt: input.resetsAt + 600 },
+          });
+        else if (phase === "completed")
+          emit({ type: "turn_completed", provider: "claude", turnId: "continued" });
+        if (phase !== "active")
+          await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      }
+      const read = vi.spyOn(ScheduleStore.prototype, "list").mockResolvedValueOnce(stale);
+      await service.tick();
+      read.mockRestore();
+      if (phase === "active") {
+        emit({ type: "turn_completed", provider: "claude", turnId: "continued" });
+        await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      }
+      if (phase === "rearmed") {
+        expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("running");
+        const pending = (
+          await new ScheduleStore(join(tempDir, "schedules"), createTestLogger()).list()
+        ).filter((s) => s.status === "active");
+        expect(pending).toHaveLength(1);
+        expect(pending[0].quotaContinuation?.attempt).toBe(1);
+      } else {
+        expect(toAgentPayload(manager.getAgent(input.agentId)!).status).not.toBe("running");
+        if (phase !== "cancelled") {
+          expect(attention).toHaveBeenCalledWith(expect.objectContaining({ reason: "finished" }));
+          expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(true);
+        }
+      }
+      expect(start).toHaveBeenCalledTimes(phase === "cancelled" ? 0 : 1);
     },
   );
 
