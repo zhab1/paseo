@@ -84,6 +84,8 @@ skips missed occurrences. Stop, a new user prompt or command, archive and deleti
 Admission checks the latest user message and the conversation's current run before submitting.
 The same interruption permits at most two further quota rearms. An interrupted delivery claim is
 retained as failed and is never blindly replayed after a daemon crash; resume that case manually.
+If accepted-turn metadata cannot be saved, the SDK run stays tracked and further automatic sends
+are disabled; its already-claimed slot still prevents replay.
 
 These jobs use `$PASEO_HOME/schedules`, the scheduler's atomic storage and existing daemon logging.
 They are hidden from user schedule lists and require no client setting or new cadence variant.

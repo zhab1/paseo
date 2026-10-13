@@ -1623,42 +1623,56 @@ test("Stop before a queued quota terminal cannot rearm the task", async () => {
   await fixture.cleanup();
 });
 
-test("Stop during quota admission cancels before the provider receives a prompt", async () => {
-  const fixture = await createControlledInterruptFixture({
-    name: "quota-admission",
-    agentId: "00000000-0000-4000-8000-000000000093",
-    turnId: "limited-turn",
-    provider: "claude",
-    interrupt: async () => {},
-  });
-  const entered = deferred<void>();
-  const release = deferred<void>();
-  let cancelled = false;
-  fixture.manager.setQuotaContinuationHooks({
-    cancel: async () => {
-      cancelled = true;
-    },
-    stopped: async () => {},
-  });
-  const start = vi.spyOn(fixture.session, "startTurn");
-  const continuation = fixture.manager.continueQuotaStoppedAgent(
-    fixture.agentId,
-    null,
-    async () => {
-      entered.resolve();
-      await release.promise;
-      return !cancelled;
-    },
-    async () => {},
-  );
-  await entered.promise;
-  const stop = fixture.manager.cancelAgentRun(fixture.agentId);
-  release.resolve();
-  expect(await continuation).toBe(false);
-  await stop;
-  expect(start).not.toHaveBeenCalled();
-  await fixture.cleanup();
-});
+test.each(["Stop", "weekly", "archive"])(
+  "%s during quota admission cancels before the provider receives a prompt",
+  async (action) => {
+    const fixture = await createControlledInterruptFixture({
+      name: "quota-admission",
+      agentId: "00000000-0000-4000-8000-000000000093",
+      turnId: "limited-turn",
+      provider: "claude",
+      interrupt: async () => {},
+    });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const cancellationSeen = deferred<void>();
+    let cancelled = false;
+    fixture.manager.setQuotaContinuationHooks({
+      cancel: async () => {
+        cancelled = true;
+        cancellationSeen.resolve();
+        await release.promise;
+      },
+      stopped: async () => {},
+    });
+    const start = vi.spyOn(fixture.session, "startTurn");
+    const continuation = fixture.manager.continueQuotaStoppedAgent(
+      fixture.agentId,
+      null,
+      async () => {
+        const eligible = !cancelled;
+        entered.resolve();
+        await release.promise;
+        return eligible;
+      },
+      async () => {},
+    );
+    await entered.promise;
+    let stop: Promise<unknown>;
+    if (action === "Stop") stop = fixture.manager.cancelAgentRun(fixture.agentId);
+    else if (action === "archive") stop = fixture.manager.archiveAgent(fixture.agentId);
+    else {
+      fixture.session.pushEvent({ type: "subscription_blocked", provider: "claude" });
+      stop = cancellationSeen.promise;
+    }
+    await cancellationSeen.promise;
+    release.resolve();
+    expect(await continuation).toBe(false);
+    await stop;
+    expect(start).not.toHaveBeenCalled();
+    await fixture.cleanup();
+  },
+);
 
 test("an idle account weekly block cancels without broadcasting an unknown client event", async () => {
   const fixture = await createControlledInterruptFixture({

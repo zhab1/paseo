@@ -1968,6 +1968,7 @@ export class AgentManager {
   }
 
   async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    this.quotaStoppedByUser.add(agentId);
     return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId));
   }
 
@@ -2360,7 +2361,20 @@ export class AgentManager {
 
   notifyAgentState(agentId: string): void {
     const agent = this.agents.get(agentId);
-    if (!agent || agent.internal) {
+    if (!agent) {
+      const task = this.registry
+        ?.get(agentId)
+        .then((record) => {
+          if (record && !this.agents.has(agentId)) this.dispatchStoredAgentState(record);
+          return undefined;
+        })
+        .catch((err) => {
+          this.logger.error({ err, agentId }, "Failed to publish stored agent state");
+        });
+      if (task) this.trackBackgroundTask(task);
+      return;
+    }
+    if (agent.internal) {
       return;
     }
     this.touchUpdatedAt(agent);
@@ -2417,6 +2431,7 @@ export class AgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+    this.quotaStoppedByUser.add(agentId);
     return this.runLifecycleMutation(agentId, () =>
       this.archiveSnapshotUnlocked(agentId, archivedAt),
     );
@@ -2701,7 +2716,7 @@ export class AgentManager {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       const result = await agent.session.startTurn(prompt, options);
       const admitted = options ? this.quotaContinuationAdmissions.get(options) : undefined;
-      if (admitted) await admitted(result.turnId);
+      if (admitted) await this.persistQuotaContinuationAdmission(agentId, result.turnId, admitted);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -2734,6 +2749,31 @@ export class AgentManager {
       this.finalizeForegroundTurn(agent);
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       throw error;
+    }
+  }
+
+  private async persistQuotaContinuationAdmission(
+    agentId: string,
+    turnId: string,
+    admitted: (turnId: string) => Promise<void>,
+  ): Promise<void> {
+    try {
+      await admitted(turnId);
+    } catch (err) {
+      // The provider accepted the turn. Keep its run owned, and suppress further automatic sends.
+      this.quotaStoppedByUser.add(agentId);
+      this.logger.error(
+        { err, agentId, turnId },
+        "Accepted quota continuation identity was not saved",
+      );
+      try {
+        if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+      } catch (cancelError) {
+        this.logger.error(
+          { err: cancelError, agentId },
+          "Failed to end claimed quota continuation",
+        );
+      }
     }
   }
 
@@ -2779,6 +2819,11 @@ export class AgentManager {
     agent.lastError = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
+    if (options && this.quotaContinuationStarts.has(options)) {
+      // A real pending run owns this attempt, including a transport rejection before acceptance.
+      agent.lifecycle = "running";
+      this.emitState(agent);
+    }
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -3291,11 +3336,7 @@ export class AgentManager {
     const pendingQuota = hasQuotaContinuationPending(agentId);
     this.quotaStoppedByUser.add(agentId);
     if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
-    if (pendingQuota && !this.agents.has(agentId)) {
-      const record = await this.registry?.get(agentId);
-      if (record) this.dispatchStoredAgentState(record);
-      return { status: "settled" };
-    }
+    if (pendingQuota && !this.agents.has(agentId)) return { status: "settled" };
     return this.runForegroundMutation(agentId, () => this.cancelAgentRunNow(agentId));
   }
 
@@ -3481,6 +3522,7 @@ export class AgentManager {
   }
 
   async deleteAgentState(agentId: string): Promise<void> {
+    this.quotaStoppedByUser.add(agentId);
     if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     this.discardRetainedAgentState(agentId);
     await this.deleteCommittedTimeline(agentId);
@@ -4584,6 +4626,7 @@ export class AgentManager {
     fromHistory?: boolean,
   ): Promise<void> | undefined {
     if (!this.quotaContinuationHooks) return undefined;
+    if (event.type === "subscription_blocked") this.quotaStoppedByUser.add(agent.id);
     if (
       event.type === "subscription_blocked" ||
       (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)

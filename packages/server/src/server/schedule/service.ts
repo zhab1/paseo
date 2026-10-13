@@ -440,7 +440,7 @@ export class ScheduleService {
     setQuotaContinuationPending(agentId, active);
     if (active) this.presentedQuotaAgents.add(agentId);
     else this.presentedQuotaAgents.delete(agentId);
-    if (this.agentManager.getAgent(agentId)) this.agentManager.notifyAgentState(agentId);
+    this.agentManager.notifyAgentState(agentId);
   }
 
   async cancelQuotaContinuation(agentId: string): Promise<void> {
