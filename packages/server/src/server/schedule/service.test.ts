@@ -503,6 +503,43 @@ describe("ScheduleService", () => {
     expect(stored.runs[0].output).toBe("Continuation delivered");
   });
 
+  test.each(["success", "failed", "rejected"])(
+    "a fast %s continuation preserves its finished/error notification",
+    async (outcome) => {
+      const { service, manager, input } = await quotaFixture();
+      const attention = vi.fn();
+      manager.setAgentAttentionCallback(attention);
+      const session = manager.getAgent(input.agentId)!.session!;
+      if (outcome === "failed") {
+        const start = session.startTurn.bind(session);
+        vi.spyOn(session, "startTurn").mockImplementation((_prompt, options) =>
+          start("Emit a turn failure", options),
+        );
+      }
+      if (outcome === "rejected")
+        vi.spyOn(session, "startTurn").mockRejectedValueOnce(
+          new Error("Transport rejected continuation"),
+        );
+      const admit = manager.continueQuotaStoppedAgent.bind(manager);
+      vi.spyOn(manager, "continueQuotaStoppedAgent").mockImplementation(async (...args) => {
+        const accepted = await admit(...args);
+        await manager.waitForAgentEvent(args[0], { waitForActive: true });
+        return accepted;
+      });
+      await service.armQuotaContinuation(input);
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      await manager.flush();
+      expect(attention).toHaveBeenCalledTimes(1);
+      expect(attention).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: outcome === "success" ? "finished" : "error",
+        }),
+      );
+      expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(true);
+    },
+  );
+
   test("a fresh manager and service recover the persisted job, restore Stop, and deliver to the original agent", async () => {
     const { service, manager, input } = await quotaFixture();
     const job = await service.armQuotaContinuation(input);
@@ -620,7 +657,7 @@ describe("ScheduleService", () => {
     await service.handleQuotaStop(input.agentId, event, null);
     const jobs = await store.list();
     expect(jobs).toHaveLength(2);
-    expect(jobs.map((s) => s.quotaContinuation?.turnId)).toEqual([
+    expect(jobs.map((s) => s.quotaContinuation?.turnId).sort()).toEqual([
       "runtime-one:foreground-turn-1",
       "runtime-two:foreground-turn-1",
     ]);

@@ -1106,12 +1106,14 @@ export class ScheduleService {
       async () => {
         const current = await this.store.get(schedule.id);
         const stored = await this.agentStorage.get(agentId);
-        return (
+        const eligible =
           current?.status === "active" &&
           !current.quotaContinuation?.cancelled &&
           !!stored &&
-          !stored.archivedAt
-        );
+          !stored.archivedAt;
+        // The durable claim has consumed nextRunAt; actual run state now owns attention.
+        if (eligible) await this.refreshQuotaPresentation();
+        return eligible;
       },
       async (turnId) => {
         await this.store.update(schedule.id, (current) => ({
