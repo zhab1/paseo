@@ -174,6 +174,11 @@ function completeSchedule(schedule: StoredSchedule, now: Date): StoredSchedule {
   };
 }
 
+function assertPublicSchedule(schedule: StoredSchedule): void {
+  if (schedule.quotaContinuation)
+    throw new Error("Quota continuations are managed automatically; use agent Stop to cancel");
+}
+
 function mergeScheduleCadenceTimezone(
   current: StoredSchedule["cadence"],
   next: StoredSchedule["cadence"],
@@ -448,14 +453,15 @@ export class ScheduleService {
       this.ownedQuotaAgents.add(schedule.target.agentId);
   }
 
-  async cancelQuotaContinuation(agentId: string): Promise<void> {
+  async cancelQuotaContinuation(agentId: string): Promise<boolean> {
     if (
       !this.ownedQuotaAgents.has(agentId) &&
       !this.presentedQuotaAgents.has(agentId) &&
       !this.quotaMutations.has(agentId)
     )
-      return;
-    await this.mutateQuota(agentId, async () => {
+      return false;
+    return this.mutateQuota(agentId, async () => {
+      const wasPending = this.presentedQuotaAgents.has(agentId);
       for (const schedule of await this.store.list()) {
         if (
           !schedule.quotaContinuation ||
@@ -471,6 +477,7 @@ export class ScheduleService {
       }
       this.ownedQuotaAgents.delete(agentId);
       this.presentQuotaWork(agentId, null);
+      return wasPending;
     });
   }
 
@@ -591,6 +598,7 @@ export class ScheduleService {
 
   async pause(id: string): Promise<StoredSchedule> {
     const paused = await this.store.update(id, (schedule) => {
+      assertPublicSchedule(schedule);
       if (schedule.status === "completed") {
         throw new Error(`Schedule ${id} is already completed`);
       }
@@ -611,6 +619,7 @@ export class ScheduleService {
 
   async resume(id: string): Promise<StoredSchedule> {
     const resumed = await this.store.update(id, (schedule) => {
+      assertPublicSchedule(schedule);
       if (schedule.status === "completed") {
         throw new Error(`Schedule ${id} is already completed`);
       }
@@ -631,6 +640,7 @@ export class ScheduleService {
 
   async update(input: UpdateScheduleInput): Promise<StoredSchedule> {
     const next = await this.store.update(input.id, async (schedule) => {
+      assertPublicSchedule(schedule);
       const now = this.now();
       let updated: StoredSchedule = schedule;
 
@@ -675,10 +685,13 @@ export class ScheduleService {
   }
 
   async delete(id: string): Promise<void> {
+    const schedule = await this.store.get(id);
+    if (schedule) assertPublicSchedule(schedule);
     await this.store.delete(id);
   }
 
   async completeForAgent(agentId: string): Promise<number> {
+    await this.cancelQuotaContinuation(agentId);
     const now = this.now();
     const schedules = await this.store.list();
     const matches = schedules.filter(
@@ -731,6 +744,7 @@ export class ScheduleService {
 
   async runOnce(id: string): Promise<StoredSchedule> {
     const schedule = await this.inspect(id);
+    assertPublicSchedule(schedule);
     if (schedule.status === "completed") {
       throw new Error(`Schedule ${id} is already completed`);
     }

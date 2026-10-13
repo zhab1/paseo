@@ -189,8 +189,9 @@ test.each(["loaded", "stored", "claimed"])(
       });
       manager.setQuotaContinuationHooks({
         cancel: async (id) => {
-          await service.cancelQuotaContinuation(id);
+          const endedWait = await service.cancelQuotaContinuation(id);
           cancellationDone();
+          return endedWait;
         },
         stopped: (id, event, at) => service.handleQuotaStop(id, event, at),
       });

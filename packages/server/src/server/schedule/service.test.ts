@@ -2,6 +2,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { AgentManager } from "../agent/agent-manager.js";
 import { AgentStorage } from "../agent/agent-storage.js";
 import { startAgentRun } from "../agent/agent-prompt.js";
@@ -411,7 +412,10 @@ describe("ScheduleService", () => {
     return { manager, service, input };
   }
 
-  async function stopForQuota(fixture: Awaited<ReturnType<typeof quotaFixture>>) {
+  async function stopForQuota(
+    fixture: Awaited<ReturnType<typeof quotaFixture>>,
+    expectPending = true,
+  ) {
     const { manager, input } = fixture;
     const session = manager.getAgent(input.agentId)!.session! as unknown as {
       notifySubscribers(event: AgentStreamEvent): void;
@@ -430,10 +434,11 @@ describe("ScheduleService", () => {
     quota.mockRestore();
     await manager.flush();
     expect(manager.getAgent(input.agentId)?.lifecycle).toBe("error");
-    expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(false);
+    expect(manager.getAgent(input.agentId)?.attention.requiresAttention).toBe(!expectPending);
     const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
     const job = (await store.list()).find((s) => s.quotaContinuation && s.status === "active");
-    expect(job?.target).toEqual({ type: "agent", agentId: input.agentId });
+    if (expectPending) expect(job?.target).toEqual({ type: "agent", agentId: input.agentId });
+    else expect(job).toBeUndefined();
     return { job: job!, emit };
   }
 
@@ -605,6 +610,193 @@ describe("ScheduleService", () => {
     expect(stored.runs[0].status).toBe("succeeded");
     expect(stored.quotaContinuation?.deliveredTurnId).toEqual(expect.any(String));
     expect(stored.runs[0].output).toBe("Continuation delivered");
+  });
+
+  test.each(["pause", "resume", "update", "delete", "runOnce"] as const)(
+    "public %s cannot mutate a private quota job or send before reset",
+    async (action) => {
+      const fixture = await quotaFixture();
+      const { service, manager, input } = fixture;
+      const { job } = await stopForQuota(fixture);
+      const start = vi.spyOn(manager.getAgent(input.agentId)!.session!, "startTurn");
+      const mutation =
+        action === "update"
+          ? service.update({ id: job.id, prompt: "Send early" })
+          : service[action](job.id);
+      await expect(mutation).rejects.toThrow();
+      expect(await service.inspect(job.id)).toEqual(job);
+      expect(await service.logs(job.id)).toEqual([]);
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("running");
+      expect(start).not.toHaveBeenCalled();
+      await manager.cancelAgentRun(input.agentId);
+      await manager.flush();
+    },
+  );
+
+  test.each(["archive", "cascade", "complete", "delete"])(
+    "stored-only %s clears durable quota ownership and restored presentation",
+    async (action) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job } = await stopForQuota(fixture);
+      await service.stop();
+      await manager.closeAgent(input.agentId);
+      await manager.flush();
+      const freshManager = new AgentManager({
+        logger: createTestLogger(),
+        clients: createTestAgentClients(),
+        registry: agentStorage,
+      });
+      const freshService = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: freshManager,
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+      });
+      freshManager.setQuotaContinuationHooks({
+        cancel: (id) => freshService.cancelQuotaContinuation(id),
+        stopped: (id, event, at) => freshService.handleQuotaStop(id, event, at),
+      });
+      freshManager.setAgentArchivedCallback(async (id) => {
+        await freshService.completeForAgent(id);
+      });
+      await freshService.start();
+      expect(freshManager.getAgent(input.agentId)).toBeNull();
+      expect(
+        buildStoredAgentPayload((await agentStorage.get(input.agentId))!, ["claude"]).status,
+      ).toBe("running");
+      if (action === "cascade") {
+        const parent = await freshManager.createAgent(
+          { provider: "codex", cwd: tempDir },
+          undefined,
+          { workspaceId: undefined },
+        );
+        const child = (await agentStorage.get(input.agentId))!;
+        await agentStorage.upsert({
+          ...child,
+          labels: { ...child.labels, [PARENT_AGENT_ID_LABEL]: parent.id },
+        });
+        await freshManager.archiveAgent(parent.id);
+        await freshManager.unarchiveSnapshot(input.agentId);
+      } else if (action === "archive") {
+        await freshManager.archiveSnapshot(input.agentId, now.toISOString());
+        await freshManager.unarchiveSnapshot(input.agentId);
+      } else if (action === "delete") {
+        await agentStorage.remove(input.agentId);
+        await freshManager.deleteAgentState(input.agentId);
+      } else await freshService.completeForAgent(input.agentId);
+      await freshManager.flush();
+      expect(await freshService.inspect(job.id)).toMatchObject({
+        status: "completed",
+        quotaContinuation: { cancelled: true },
+      });
+      const restored = await agentStorage.get(input.agentId);
+      if (action === "delete") expect(restored).toBeNull();
+      else expect(buildStoredAgentPayload(restored!, ["claude"]).status).not.toBe("running");
+      now = new Date(now.getTime() + 120_000);
+      await freshService.tick();
+      expect((await freshService.inspect(job.id)).runs).toEqual([]);
+      await freshService.stop();
+      for (const agent of freshManager.listAgents()) await freshManager.closeAgent(agent.id);
+      await freshManager.flush();
+    },
+  );
+
+  test.each(["weekly", "Stop", "Stop then weekly"])(
+    "%s ending a real quota wait publishes error attention only for the weekly cancellation",
+    async (action) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job, emit } = await stopForQuota(fixture);
+      const attention = vi.fn();
+      manager.setAgentAttentionCallback(attention);
+      let stop: Promise<unknown> | undefined;
+      let release: (() => void) | undefined;
+      let save: ReturnType<typeof vi.spyOn> | undefined;
+      if (action === "Stop then weekly") {
+        let entered!: () => void;
+        const cancelling = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const blocked = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const list = ScheduleStore.prototype.list;
+        save = vi.spyOn(ScheduleStore.prototype, "list").mockImplementationOnce(async function () {
+          entered();
+          await blocked;
+          return list.call(this);
+        });
+        stop = manager.cancelAgentRun(input.agentId);
+        await cancelling;
+      } else if (action === "Stop") await manager.cancelAgentRun(input.agentId);
+      if (action !== "Stop") {
+        emit({ type: "subscription_blocked", provider: "claude" });
+        release?.();
+        await stop;
+        await manager.flush();
+        emit({ type: "subscription_blocked", provider: "claude" });
+      }
+      await manager.flush();
+      save?.mockRestore();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "completed",
+        quotaContinuation: { cancelled: true },
+      });
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("error");
+      expect(attention).toHaveBeenCalledTimes(action === "weekly" ? 1 : 0);
+      if (action === "weekly") {
+        expect(attention).toHaveBeenCalledWith(expect.objectContaining({ reason: "error" }));
+        expect((await agentStorage.get(input.agentId))?.requiresAttention).toBe(true);
+      }
+    },
+  );
+
+  test("failed quota arming retains actionable terminal error attention", async () => {
+    const fixture = await quotaFixture();
+    const attention = vi.fn();
+    fixture.manager.setAgentAttentionCallback(attention);
+    vi.spyOn(fixture.service, "armQuotaContinuation").mockRejectedValueOnce(
+      new Error("Store failed"),
+    );
+    await stopForQuota(fixture, false);
+    expect(toAgentPayload(fixture.manager.getAgent(fixture.input.agentId)!).status).toBe("error");
+    expect(attention).toHaveBeenCalledTimes(1);
+    expect(attention).toHaveBeenCalledWith(expect.objectContaining({ reason: "error" }));
+  });
+
+  test("the repeated-quota ceiling leaves an actionable terminal error without another job", async () => {
+    const fixture = await quotaFixture();
+    const { manager, service, input } = fixture;
+    const { emit } = await stopForQuota(fixture);
+    const attention = vi.fn();
+    manager.setAgentAttentionCallback(attention);
+    const start = vi.spyOn(manager.getAgent(input.agentId)!.session!, "startTurn");
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const turnId = `continued-${attempt}`;
+      start.mockResolvedValueOnce({ turnId });
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      emit({
+        type: "turn_failed",
+        provider: "claude",
+        turnId,
+        error: "quota",
+        subscriptionLimit: { type: "five_hour", resetsAt: now.getTime() / 1000 + 60 },
+      });
+      await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      await manager.flush();
+      expect(attention).toHaveBeenCalledTimes(attempt === 3 ? 1 : 0);
+    }
+    expect(start).toHaveBeenCalledTimes(3);
+    expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("error");
+    expect(
+      (await new ScheduleStore(join(tempDir, "schedules"), createTestLogger()).list()).filter(
+        (schedule) => schedule.status === "active",
+      ),
+    ).toEqual([]);
   });
 
   test.each(["success", "failed", "rejected"])(

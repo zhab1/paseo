@@ -786,7 +786,7 @@ export class AgentManager {
   private onAgentAttention?: AgentAttentionCallback;
   private onAgentArchived?: AgentArchivedCallback;
   private quotaContinuationHooks?: {
-    cancel: (agentId: string) => Promise<void>;
+    cancel: (agentId: string) => Promise<boolean>;
     stopped: (
       agentId: string,
       event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
@@ -1976,6 +1976,7 @@ export class AgentManager {
     agentId: string,
     requestedArchivedAt?: string,
   ): Promise<{ archivedAt: string }> {
+    this.quotaStoppedByUser.add(agentId);
     const agent = this.requireAgent(agentId);
     if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     if (agent.internal) {
@@ -2451,6 +2452,8 @@ export class AgentManager {
       return archivedRecord;
     }
 
+    this.quotaStoppedByUser.add(agentId);
+    if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
     const record = await registry.get(agentId);
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
@@ -4631,7 +4634,25 @@ export class AgentManager {
       event.type === "subscription_blocked" ||
       (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)
     ) {
-      return this.quotaContinuationHooks.cancel(agent.id);
+      return this.quotaContinuationHooks.cancel(agent.id).then((endedQuotaWait) => {
+        if (
+          event.type === "subscription_blocked" &&
+          endedQuotaWait &&
+          !hasQuotaContinuationPending(agent.id) &&
+          agent.lifecycle === "error" &&
+          !agent.internal &&
+          !agent.attention.requiresAttention
+        ) {
+          agent.attention = {
+            requiresAttention: true,
+            attentionReason: "error",
+            attentionTimestamp: new Date(),
+          };
+          this.broadcastAgentAttention(agent, "error");
+          this.emitState(agent);
+        }
+        return undefined;
+      });
     }
     return undefined;
   }

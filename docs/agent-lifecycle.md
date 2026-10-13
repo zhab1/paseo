@@ -89,8 +89,9 @@ are disabled; its already-claimed slot still prevents replay.
 
 These jobs use `$PASEO_HOME/schedules`, the scheduler's atomic storage and existing daemon logging.
 They are hidden from user schedule lists and require no client setting or new cadence variant.
-Preserve their records with the durable Paseo home through upgrades; normal schedule deletion owns
-their cleanup. Look for `Five-hour task continuation scheduled`, admission, retry-limit and failed
+Preserve their records with the durable Paseo home through upgrades for durable duplicate
+suppression. Use agent Stop to cancel; public schedule mutations cannot change or delete these
+private records. Look for `Five-hour task continuation scheduled`, admission, retry-limit and failed
 persistence messages in daemon logs when diagnosing a task that did not resume.
 
 ## Relationships

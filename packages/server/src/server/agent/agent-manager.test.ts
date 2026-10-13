@@ -1577,7 +1577,7 @@ test("quota-stop hooks run after the matching main run has settled", async () =>
   const attention = vi.fn();
   fixture.manager.setAgentAttentionCallback(attention);
   fixture.manager.setQuotaContinuationHooks({
-    cancel: async () => {},
+    cancel: async () => false,
     stopped: async () => {
       expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
       setQuotaContinuationPending(fixture.agentId, true);
@@ -1616,7 +1616,7 @@ test("Stop before a queued quota terminal cannot rearm the task", async () => {
     },
   });
   const stopped = vi.fn(async () => {});
-  fixture.manager.setQuotaContinuationHooks({ cancel: async () => {}, stopped });
+  fixture.manager.setQuotaContinuationHooks({ cancel: async () => false, stopped });
   await fixture.startForegroundRun();
   await fixture.manager.cancelAgentRun(fixture.agentId);
   expect(stopped).not.toHaveBeenCalled();
@@ -1642,6 +1642,7 @@ test.each(["Stop", "weekly", "archive"])(
         cancelled = true;
         cancellationSeen.resolve();
         await release.promise;
+        return false;
       },
       stopped: async () => {},
     });
@@ -1688,6 +1689,7 @@ test("an idle account weekly block cancels without broadcasting an unknown clien
   fixture.manager.setQuotaContinuationHooks({
     cancel: async () => {
       cancelled.resolve();
+      return false;
     },
     stopped: async () => {},
   });
@@ -11177,7 +11179,7 @@ test.each(["success", "failure"])(
     const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
       workspaceId: undefined,
     });
-    const cancellation = deferred<void>();
+    const cancellation = deferred<boolean>();
     const run = vi.fn(async () => {});
     agent.session!.tryHandleOutOfBand = () => ({ run });
     manager.setQuotaContinuationHooks({
@@ -11195,7 +11197,7 @@ test.each(["success", "failure"])(
     expect(onDispatch).not.toHaveBeenCalled();
     expect(manager.fetchTimeline(agent.id, { direction: "tail", limit: 20 }).rows).toEqual([]);
     if (outcome === "failure") cancellation.reject(new Error("Durable cancellation failed"));
-    else cancellation.resolve();
+    else cancellation.resolve(false);
     expect(await settled).toBe(outcome === "failure" ? "rejected" : "accepted");
     expect(run).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
     expect(onDispatch).toHaveBeenCalledTimes(outcome === "failure" ? 0 : 1);
