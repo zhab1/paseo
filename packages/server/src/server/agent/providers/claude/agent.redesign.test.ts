@@ -1374,6 +1374,36 @@ test("a main API quota stop retains its five-hour reset even when the SDK result
   await session.close();
 });
 
+test("successive main quota stops use their own reset when account notifications are not repeated", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  const query = createPendingQueryMock();
+  const info = { status: "rejected", rateLimitType: "five_hour", resetsAt: 1780000000 };
+  await internal.routeSdkMessageFromPump({ ...rateLimitEvent, rate_limit_info: info }, query);
+  for (const resetsAt of [1780000000, 1780018000]) {
+    await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
+    await internal.routeSdkMessageFromPump(
+      {
+        type: "assistant",
+        error: "rate_limit",
+        api_error: "usage_limit_reached",
+        api_error_params: { rate_limit_info: { ...info, resetsAt } },
+        message: { content: [] },
+      },
+      query,
+    );
+    await internal.routeSdkMessageFromPump(successResult(), query);
+  }
+  expect(events.filter((event) => event.type === "turn_failed")).toEqual(
+    [1780000000, 1780018000].map((resetsAt) =>
+      expect.objectContaining({ subscriptionLimit: { type: "five_hour", resetsAt } }),
+    ),
+  );
+  await session.close();
+});
+
 test.each([
   { status: "allowed", rateLimitType: "five_hour", resetsAt: 1780000000 },
   { status: "allowed_warning", rateLimitType: "five_hour", resetsAt: 1780000000 },
@@ -1394,7 +1424,12 @@ test.each([
     await internal.routeSdkMessageFromPump(claudeTurnInit(), query);
     await internal.routeSdkMessageFromPump({ ...rateLimitEvent, rate_limit_info: info }, query);
     await internal.routeSdkMessageFromPump(
-      { type: "assistant", error: "rate_limit", message: { content: [] } },
+      {
+        type: "assistant",
+        error: "rate_limit",
+        api_error_params: { rate_limit_info: info },
+        message: { content: [] },
+      },
       query,
     );
     await internal.routeSdkMessageFromPump(
@@ -1466,6 +1501,13 @@ test.each(["sidechain", "background"])(
             type: "assistant",
             parent_tool_use_id: "child-tool",
             error: "rate_limit",
+            api_error_params: {
+              rate_limit_info: {
+                status: "rejected",
+                rateLimitType: "five_hour",
+                resetsAt: 1780000000,
+              },
+            },
             message: { content: [] },
           },
       query,
