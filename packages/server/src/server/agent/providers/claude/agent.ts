@@ -14,7 +14,6 @@ import {
   type Query,
   type SDKMessage,
   type SDKPartialAssistantMessage,
-  type SDKRateLimitInfo,
   type SDKResultMessage,
   type SDKSystemMessage,
   type SDKUserMessage,
@@ -4068,8 +4067,11 @@ class ClaudeAgentSession implements AgentSession {
     return isClaudeTurnInit(message) && !this.activeForegroundTurnId;
   }
 
-  private readSubscriptionLimit(info: SDKRateLimitInfo): typeof this.mainSubscriptionLimit {
-    if (info.rateLimitType?.startsWith("seven_day")) return { type: "weekly" };
+  private readSubscriptionLimit(value: unknown): typeof this.mainSubscriptionLimit {
+    const info = toObjectRecord(value);
+    if (info?.status !== "rejected") return undefined;
+    if (typeof info.rateLimitType === "string" && info.rateLimitType.startsWith("seven_day"))
+      return { type: "weekly" };
     if (
       info.rateLimitType !== "five_hour" ||
       info.isUsingOverage ||
@@ -4097,6 +4099,11 @@ class ClaudeAgentSession implements AgentSession {
     if (this.mainTurnInFlight && !readClaudeParentToolUseId(message)) {
       if (message.type === "assistant" && message.error === "rate_limit") {
         this.mainQuotaStop = true;
+        // Account events are change-only; a child may have emitted the latest one before
+        // this main turn. The refusal itself carries the classification for this request.
+        const info = toObjectRecord(toObjectRecord(message)?.api_error_params)?.rate_limit_info;
+        if (info !== undefined && this.mainSubscriptionLimit?.type !== "weekly")
+          this.mainSubscriptionLimit = this.readSubscriptionLimit(info);
       }
       if (message.type === "rate_limit_event" && message.rate_limit_info.status === "rejected") {
         const info = message.rate_limit_info;

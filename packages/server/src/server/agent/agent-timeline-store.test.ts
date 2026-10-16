@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { TimelineCache } from "./timeline-cache.js";
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryAgentTimelineStore, PAGED_HISTORY_ORIGIN } from "./agent-timeline-store.js";
 
 describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
@@ -493,6 +493,36 @@ it("recreates an interrupted disposable cache before restoring provider history"
     ]);
   } finally {
     cache?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+it("reads only the candidate window when paging a long cached timeline", () => {
+  const directory = path.join(process.cwd(), ".dev", "timeline-cache-tests", randomUUID());
+  const cache = new TimelineCache(path.join(directory, "timeline.sqlite"));
+  try {
+    const store = new InMemoryAgentTimelineStore(cache);
+    store.initialize("a", { epoch: "epoch" });
+    for (let i = 0; i < 500; i++) store.append("a", { type: "user_message", text: String(i) });
+    const prepare = cache.db.prepare.bind(cache.db);
+    let largestRead = 0;
+    vi.spyOn(cache.db, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      const all = statement.all.bind(statement);
+      vi.spyOn(statement, "all").mockImplementation((...args) => {
+        const rows = all(...args);
+        largestRead = Math.max(largestRead, rows.length);
+        return rows;
+      });
+      return statement;
+    });
+    for (const direction of ["tail", "before", "after"] as const) {
+      const page = store.fetch("a", { direction, limit: 20, cursor: { epoch: "epoch", seq: 480 } });
+      expect(page.rows).toHaveLength(20);
+    }
+    expect(largestRead).toBeLessThanOrEqual(21);
+  } finally {
+    cache.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

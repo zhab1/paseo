@@ -42,7 +42,7 @@ export class TimelineCache {
       CREATE INDEX timeline_client_message ON timeline_rows(timeline, client_message_id);
       CREATE INDEX timeline_assistant_message ON timeline_rows(timeline, assistant_message_id, start);
       CREATE INDEX timeline_item_type ON timeline_rows(timeline, item_type, start);
-      CREATE INDEX timeline_end ON timeline_rows(timeline, end);
+      CREATE INDEX timeline_end ON timeline_rows(timeline, end, start);
     `);
   }
 
@@ -191,15 +191,36 @@ export class CachedTimelineProjection {
     cursorSeq?: number;
     limit: number;
   }) {
+    const backwards = options.direction !== "after";
+    const limit = Math.max(0, Math.floor(options.limit));
+    let boundary = options.bounds.maxSeq;
+    if (options.direction === "before")
+      boundary = Math.min(boundary, (options.cursorSeq ?? boundary + 1) - 1);
+    else if (options.direction === "after")
+      boundary = options.cursorSeq ?? options.bounds.minSeq - 1;
+    // Backward pages need only one extra anchor to establish hasOlder. Forward
+    // catch-up must also consider old cards whose later lifecycle updates cross the cursor.
     const metadata = this.cache.db
-      .prepare("SELECT start, end, ranges FROM timeline_rows WHERE timeline = ? ORDER BY start")
-      .all(this.key)
+      .prepare(
+        `SELECT start, end, ranges FROM timeline_rows WHERE timeline = ? AND
+         ${backwards ? "start <=" : "end >"} ? ORDER BY start ${backwards ? "DESC" : "ASC"}
+         ${backwards && limit > 0 ? "LIMIT ?" : ""}`,
+      )
+      .all(this.key, boundary, ...(backwards && limit > 0 ? [limit + 1] : []))
       .map((row) => ({
         seqStart: Number(row.start),
         seqEnd: Number(row.end),
         sourceSeqRanges: JSON.parse(String(row.ranges)) as TimelineSeqRange[],
       }));
+    if (backwards) metadata.reverse();
     const selected = selectProjectedEntriesPage({ ...options, entries: metadata });
+    if (options.direction === "tail" && selected.startSeq !== null) {
+      selected.reset = !!this.cache.db
+        .prepare(
+          "SELECT 1 FROM timeline_rows WHERE timeline = ? AND end >= ? AND start < ? LIMIT 1",
+        )
+        .get(this.key, selected.startSeq, selected.startSeq);
+    }
     const entries = selected.entries.map(
       (row) =>
         this.read(

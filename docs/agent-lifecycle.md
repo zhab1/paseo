@@ -74,8 +74,9 @@ Accepting new work after an ambiguous interruption would create a split-brain se
 
 Ordinary Claude chats automatically resume after a five-hour subscription quota stops their main
 task. The phone can be disconnected. Eligibility requires both a main-session API `rate_limit`
-error and Claude's structured rejected `five_hour` event with a valid reset time. Account warnings,
-successful work, background-child errors, overage and unknown limits never arm a continuation.
+error and Claude's structured rejected `five_hour` classification with a valid reset time, from
+that refusal or the account event. Account events report changes and may precede the main turn.
+Account warnings, successful work, background-child errors, overage and unknown limits never arm a continuation.
 Weekly exhaustion cancels a pending continuation, including a block learned while the task is idle.
 
 The existing scheduler persists one private, same-agent job for the limited turn and sends five
