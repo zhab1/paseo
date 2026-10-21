@@ -245,6 +245,8 @@ interface ScheduleWorkspaceCreateInput {
   firstAgentContext: FirstAgentContext;
 }
 
+type ScheduleRunnerResult = ScheduleExecutionResult | { quotaDeferred: true };
+
 export interface ScheduleServiceOptions {
   paseoHome: string;
   logger: Logger;
@@ -259,7 +261,7 @@ export interface ScheduleServiceOptions {
   ) => Promise<CreatePaseoWorktreeWorkflowResult>;
   archiveWorkspace: (workspaceId: string) => Promise<void>;
   now?: () => Date;
-  runner?: (schedule: StoredSchedule, runId: string) => Promise<ScheduleExecutionResult>;
+  runner?: (schedule: StoredSchedule, runId: string) => Promise<ScheduleRunnerResult>;
 }
 
 export class ScheduleService {
@@ -279,7 +281,7 @@ export class ScheduleService {
   private readonly runner: (
     schedule: StoredSchedule,
     runId: string,
-  ) => Promise<ScheduleExecutionResult>;
+  ) => Promise<ScheduleRunnerResult>;
   private readonly runningScheduleIds = new Set<string>();
   private readonly quotaMutations = new Map<string, Promise<unknown>>();
   private readonly presentedQuotaAgents = new Map<string, string>();
@@ -908,6 +910,7 @@ export class ScheduleService {
     options?: { manual?: boolean },
   ): Promise<void> {
     const manual = options?.manual === true;
+    let deferred = false;
     // Reserve before store I/O; persisted history cannot prove a run is still alive.
     this.runningScheduleIds.add(schedule.id);
     try {
@@ -937,6 +940,10 @@ export class ScheduleService {
 
       try {
         const result = await this.runner(scheduleWithRun, runId);
+        if ("quotaDeferred" in result) {
+          deferred = await this.releaseBusyQuotaClaim({ schedule: scheduleWithRun, runId });
+          return;
+        }
         await this.finishRun({
           scheduleId: schedule.id,
           runId,
@@ -961,9 +968,37 @@ export class ScheduleService {
       }
     } finally {
       this.runningScheduleIds.delete(schedule.id);
-      if (schedule.quotaContinuation && schedule.target.type === "agent")
+      if (!deferred && schedule.quotaContinuation && schedule.target.type === "agent")
         this.clearQuotaPresentation(schedule.target.agentId, schedule.id);
     }
+  }
+
+  private async releaseBusyQuotaClaim({
+    schedule,
+    runId,
+  }: {
+    schedule: StoredSchedule;
+    runId: string;
+  }): Promise<boolean> {
+    if (!schedule.quotaContinuation || schedule.target.type !== "agent")
+      throw new Error("Only quota continuation admission can be deferred");
+    const agentId = schedule.target.agentId;
+    return this.mutateQuota(agentId, async () => {
+      const updated = await this.store.update(schedule.id, (current) => {
+        const run = current.runs.find((entry) => entry.id === runId)!;
+        // Admission proved that no prompt was sent. Release this reservation, not an
+        // uncertain delivery claim recovered after a crash, and preserve concurrent Stop.
+        return {
+          ...current,
+          nextRunAt: current.status === "active" ? run.scheduledFor : current.nextRunAt,
+          runs: current.runs.filter((entry) => entry.id !== runId),
+          updatedAt: this.now().toISOString(),
+        };
+      });
+      if (updated?.status !== "active") return false;
+      this.presentQuotaWork(agentId, schedule.id);
+      return true;
+    });
   }
 
   private async claimDueRun(
@@ -1118,9 +1153,7 @@ export class ScheduleService {
     requireSchedule(updatedSchedule, params.scheduleId);
   }
 
-  private async executeQuotaContinuation(
-    schedule: StoredSchedule,
-  ): Promise<ScheduleExecutionResult> {
+  private async executeQuotaContinuation(schedule: StoredSchedule): Promise<ScheduleRunnerResult> {
     if (!schedule.quotaContinuation || schedule.target.type !== "agent")
       throw new Error("Invalid quota continuation target");
     const agentId = schedule.target.agentId;
@@ -1173,6 +1206,7 @@ export class ScheduleService {
         }));
       },
     );
+    if (accepted === "busy") return { quotaDeferred: true };
     this.logger.info(
       { agentId, scheduleId: schedule.id, accepted },
       "Five-hour continuation admission completed",

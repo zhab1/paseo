@@ -434,6 +434,7 @@ interface ManagedAgentBase {
   lastUserMessageAt: Date | null;
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
+  activeTurnHasOutput?: boolean;
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -962,24 +963,24 @@ export class AgentManager {
     lastUserMessageAt: string | null,
     claim: () => Promise<boolean>,
     onStarted: (turnId: string) => Promise<void>,
-  ): Promise<boolean> {
+  ): Promise<boolean | "busy"> {
     return this.runForegroundMutation(agentId, async () => {
       await this.drainSessionEvents(agentId);
       const agent = this.requireSessionAgent(agentId);
       if (
-        this.hasInFlightRun(agentId) ||
         this.quotaStoppedByUser.has(agentId) ||
         (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
       )
         return false;
+      if (this.hasInFlightRun(agentId)) return "busy";
       if (
         !(await claim()) ||
-        this.hasInFlightRun(agentId) ||
         this.quotaStoppedByUser.has(agentId) ||
         this.agents.get(agentId) !== agent ||
         (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
       )
         return false;
+      if (this.hasInFlightRun(agentId)) return "busy";
       const options: AgentRunOptions = {};
       this.quotaContinuationStarts.add(options);
       this.quotaContinuationAdmissions.set(options, onStarted);
@@ -3031,6 +3032,7 @@ export class AgentManager {
   private openActiveTurn(agent: ActiveManagedAgent, turnId: string, startedAt: Date): void {
     agent.activeTurnId = turnId;
     agent.activeTurnStartedAt = startedAt;
+    agent.activeTurnHasOutput = false;
   }
 
   private applyActiveTurnTerminal(
@@ -3043,6 +3045,7 @@ export class AgentManager {
     if (turnId && agent.activeTurnId !== turnId) return "stale";
     agent.activeTurnId = null;
     agent.activeTurnStartedAt = null;
+    delete agent.activeTurnHasOutput;
     return "closed_current";
   }
 
@@ -4601,12 +4604,12 @@ export class AgentManager {
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
     event = limitAgentStreamEventContent(event);
-    const cancellation = this.quotaLifecycleCancellation(agent, event, options?.fromHistory);
-    if (cancellation) await cancellation;
-    if (event.type === "subscription_blocked") return false;
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
     event = identified.event;
     const eventTurnId = identified.turnId;
+    const cancellation = this.quotaLifecycleCancellation(agent, event, options?.fromHistory);
+    if (cancellation) await cancellation;
+    if (event.type === "subscription_blocked") return false;
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
     this.traceHandleStreamEventStart(agent, event, eventTurnId, isForegroundEvent);
     if (
@@ -4697,9 +4700,24 @@ export class AgentManager {
     fromHistory?: boolean,
   ): Promise<void> | undefined {
     if (!this.quotaContinuationHooks) return undefined;
+    // Claude can open a no-op main turn just to record a background notification.
+    // A successful turn supersedes the reset job only if it actually produced output.
+    const autonomous =
+      !fromHistory &&
+      !agent.activeForegroundTurnId &&
+      agent.activeTurnId !== null &&
+      getAgentStreamEventTurnId(event) === agent.activeTurnId;
+    if (autonomous && event.type === "timeline") {
+      const item = event.item;
+      if (
+        ((item.type === "assistant_message" || item.type === "reasoning") && item.text.trim()) ||
+        (item.type === "tool_call" && item.status === "running")
+      )
+        agent.activeTurnHasOutput = true;
+    }
     if (
       event.type === "subscription_blocked" ||
-      (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)
+      (autonomous && event.type === "turn_completed" && agent.activeTurnHasOutput)
     ) {
       return this.quotaContinuationHooks.cancel(agent.id).then((endedQuotaWait) => {
         if (
