@@ -963,24 +963,24 @@ export class AgentManager {
     lastUserMessageAt: string | null,
     claim: () => Promise<boolean>,
     onStarted: (turnId: string) => Promise<void>,
-  ): Promise<boolean> {
+  ): Promise<boolean | "busy"> {
     return this.runForegroundMutation(agentId, async () => {
       await this.drainSessionEvents(agentId);
       const agent = this.requireSessionAgent(agentId);
       if (
-        this.hasInFlightRun(agentId) ||
         this.quotaStoppedByUser.has(agentId) ||
         (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
       )
         return false;
+      if (this.hasInFlightRun(agentId)) return "busy";
       if (
         !(await claim()) ||
-        this.hasInFlightRun(agentId) ||
         this.quotaStoppedByUser.has(agentId) ||
         this.agents.get(agentId) !== agent ||
         (agent.lastUserMessageAt?.toISOString() ?? null) !== lastUserMessageAt
       )
         return false;
+      if (this.hasInFlightRun(agentId)) return "busy";
       const options: AgentRunOptions = {};
       this.quotaContinuationStarts.add(options);
       this.quotaContinuationAdmissions.set(options, onStarted);

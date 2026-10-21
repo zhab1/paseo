@@ -718,6 +718,96 @@ describe("ScheduleService", () => {
     },
   );
 
+  test.each([
+    { outcome: "notification", expectedRuns: 1 },
+    { outcome: "failure", expectedRuns: 1 },
+    { outcome: "success", expectedRuns: 0 },
+  ])(
+    "a due quota job survives overlapping autonomous $outcome",
+    async ({ outcome, expectedRuns }) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job, emit } = await stopForQuota(fixture);
+      const turnId = "overlapping-autonomous-turn";
+      emit({ type: "turn_started", provider: "claude", turnId });
+      if (outcome !== "notification")
+        emit({
+          type: "timeline",
+          provider: "claude",
+          turnId,
+          item: { type: "assistant_message", text: "Working on the interrupted task." },
+        });
+      await manager.flush();
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      await service.tick();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "active",
+        nextRunAt: job.nextRunAt,
+        runs: [],
+      });
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("running");
+      if (outcome === "failure")
+        emit({ type: "turn_failed", provider: "claude", turnId, error: "Still quota limited" });
+      else emit({ type: "turn_completed", provider: "claude", turnId });
+      await manager.flush();
+      await service.tick();
+      await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      expect((await service.inspect(job.id)).runs).toHaveLength(expectedRuns);
+    },
+  );
+
+  test.each([false, true])(
+    "busy admission restores its slot without undoing cancellation=%s",
+    async (cancel) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job, emit } = await stopForQuota(fixture);
+      const turnId = "started-during-admission";
+      const admit = manager.continueQuotaStoppedAgent.bind(manager);
+      const admitDuringAutonomousTurn: typeof manager.continueQuotaStoppedAgent = async (
+        agentId,
+        latestUser,
+        claim,
+        onStarted,
+      ) => {
+        const result = await admit(
+          agentId,
+          latestUser,
+          async () => {
+            const eligible = await claim();
+            emit({ type: "turn_started", provider: "claude", turnId });
+            await manager.flush();
+            return eligible;
+          },
+          onStarted,
+        );
+        expect(result).toBe("busy");
+        if (cancel) await service.cancelQuotaContinuation(agentId);
+        return result;
+      };
+      const admission = vi
+        .spyOn(manager, "continueQuotaStoppedAgent")
+        .mockImplementationOnce(admitDuringAutonomousTurn);
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      admission.mockRestore();
+      emit({ type: "turn_completed", provider: "claude", turnId });
+      await manager.flush();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: cancel ? "completed" : "active",
+        nextRunAt: cancel ? null : job.nextRunAt,
+        runs: [],
+      });
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe(
+        cancel ? "idle" : "running",
+      );
+      await service.tick();
+      await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      expect((await service.inspect(job.id)).runs).toHaveLength(cancel ? 0 : 1);
+    },
+  );
+
   test.each(["pause", "resume", "update", "delete", "runOnce"] as const)(
     "public %s cannot mutate a private quota job or send before reset",
     async (action) => {
