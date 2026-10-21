@@ -22,6 +22,7 @@ import type {
   AgentSession,
   AgentSessionConfig,
   AgentStreamEvent,
+  AgentTimelineItem,
 } from "../agent/agent-sdk-types.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -627,8 +628,36 @@ describe("ScheduleService", () => {
     const { manager, service, input } = fixture;
     const { job, emit } = await stopForQuota(fixture);
     const lastUserMessageAt = manager.getAgent(input.agentId)!.lastUserMessageAt;
+    emit({ type: "turn_started", provider: "claude", turnId: "another-refusal" });
+    emit({
+      type: "timeline",
+      provider: "claude",
+      turnId: "another-refusal",
+      item: { type: "assistant_message", text: "Session limit reached." },
+    });
+    emit({
+      type: "turn_failed",
+      provider: "claude",
+      turnId: "another-refusal",
+      error: "Session limit reached",
+    });
+    await manager.flush();
     for (const turnId of ["worker-notification-1", "worker-notification-2"]) {
       emit({ type: "turn_started", provider: "claude", turnId });
+      emit({
+        type: "timeline",
+        provider: "claude",
+        turnId,
+        item: {
+          type: "tool_call",
+          callId: turnId,
+          name: "task_notification",
+          status: "failed",
+          error: { message: "Background worker stopped." },
+          detail: { type: "plain_text", text: "Background worker stopped." },
+          metadata: { synthetic: true, source: "claude_task_notification" },
+        },
+      });
       emit({ type: "turn_completed", provider: "claude", turnId });
       await manager.flush();
       expect(await service.inspect(job.id)).toMatchObject({
@@ -649,6 +678,45 @@ describe("ScheduleService", () => {
     await service.tick();
     expect((await service.inspect(job.id)).runs).toHaveLength(1);
   });
+
+  test.each([
+    { type: "assistant_message", text: "Completed the interrupted task." },
+    { type: "reasoning", text: "The requested work is complete." },
+    {
+      type: "tool_call",
+      callId: "main-tool",
+      name: "Bash",
+      status: "running",
+      error: null,
+      detail: { type: "shell", command: "finish-task" },
+    },
+  ] satisfies AgentTimelineItem[])(
+    "successful autonomous $type output supersedes the quota continuation",
+    async (item) => {
+      const fixture = await quotaFixture();
+      const { manager, service, input } = fixture;
+      const { job, emit } = await stopForQuota(fixture);
+      const turnId = "autonomous-resumed-work";
+      emit({ type: "turn_started", provider: "claude", turnId });
+      emit({
+        type: "timeline",
+        provider: "claude",
+        turnId,
+        item,
+      });
+      emit({ type: "turn_completed", provider: "claude", turnId });
+      await manager.flush();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "completed",
+        quotaContinuation: { cancelled: true },
+        runs: [],
+      });
+      now = new Date(now.getTime() + 120_000);
+      await service.tick();
+      expect((await service.inspect(job.id)).runs).toEqual([]);
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("idle");
+    },
+  );
 
   test.each(["pause", "resume", "update", "delete", "runOnce"] as const)(
     "public %s cannot mutate a private quota job or send before reset",
