@@ -622,6 +622,34 @@ describe("ScheduleService", () => {
     expect(stored.runs[0].output).toBe("Continuation delivered");
   });
 
+  test("transcript-only autonomous turns preserve the pending quota continuation", async () => {
+    const fixture = await quotaFixture();
+    const { manager, service, input } = fixture;
+    const { job, emit } = await stopForQuota(fixture);
+    const lastUserMessageAt = manager.getAgent(input.agentId)!.lastUserMessageAt;
+    for (const turnId of ["worker-notification-1", "worker-notification-2"]) {
+      emit({ type: "turn_started", provider: "claude", turnId });
+      emit({ type: "turn_completed", provider: "claude", turnId });
+      await manager.flush();
+      expect(await service.inspect(job.id)).toMatchObject({
+        status: "active",
+        nextRunAt: job.nextRunAt,
+        runs: [],
+      });
+      expect(manager.getAgent(input.agentId)!.lastUserMessageAt).toEqual(lastUserMessageAt);
+      expect(toAgentPayload(manager.getAgent(input.agentId)!).status).toBe("running");
+    }
+    now = new Date(now.getTime() + 120_000);
+    await service.tick();
+    await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+    const stored = await service.inspect(job.id);
+    expect(stored.runs).toHaveLength(1);
+    expect(stored.runs[0].output).toBe("Continuation delivered");
+    expect(stored.quotaContinuation?.deliveredTurnId).toEqual(expect.any(String));
+    await service.tick();
+    expect((await service.inspect(job.id)).runs).toHaveLength(1);
+  });
+
   test.each(["pause", "resume", "update", "delete", "runOnce"] as const)(
     "public %s cannot mutate a private quota job or send before reset",
     async (action) => {

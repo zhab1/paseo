@@ -4601,7 +4601,7 @@ export class AgentManager {
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
     event = limitAgentStreamEventContent(event);
-    const cancellation = this.quotaLifecycleCancellation(agent, event, options?.fromHistory);
+    const cancellation = this.quotaLifecycleCancellation(agent, event);
     if (cancellation) await cancellation;
     if (event.type === "subscription_blocked") return false;
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
@@ -4694,16 +4694,13 @@ export class AgentManager {
   private quotaLifecycleCancellation(
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
-    fromHistory?: boolean,
   ): Promise<void> | undefined {
     if (!this.quotaContinuationHooks) return undefined;
-    if (
-      event.type === "subscription_blocked" ||
-      (event.type === "turn_started" && !agent.activeForegroundTurnId && !fromHistory)
-    ) {
+    // Claude can open a no-op main turn just to record a background notification.
+    // Only explicit task changes and account blocks revoke the pending reset job.
+    if (event.type === "subscription_blocked") {
       return this.quotaContinuationHooks.cancel(agent.id).then((endedQuotaWait) => {
         if (
-          event.type === "subscription_blocked" &&
           endedQuotaWait &&
           !hasQuotaContinuationPending(agent.id) &&
           agent.lifecycle === "error" &&
