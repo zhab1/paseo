@@ -289,7 +289,6 @@ type ProviderSubagentManagerEvent = Extract<
 // the entire session message if they encounter an unknown provider.
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
-const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -313,12 +312,6 @@ function isAppVersionAtLeast(appVersion: string | null, minVersion: string): boo
 
 function clientSupportsAllProviders(appVersion: string | null): boolean {
   return isAppVersionAtLeast(appVersion, MIN_VERSION_ALL_PROVIDERS);
-}
-
-function clientUsesLegacyWorkspaceRestore(appVersion: string | null): boolean {
-  return (
-    appVersion !== null && !isAppVersionAtLeast(appVersion, MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY)
-  );
 }
 
 type DeleteFencedAgentStorage = AgentStorage & {
@@ -4716,9 +4709,13 @@ export class Session {
     const { agentId, requestId } = msg;
     this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
 
+    let archivedAtToRestore: string | null = null;
     try {
-      await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
-      await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
+      await this.restoreOwningWorkspaceForAgentRefresh(agentId);
+      const stored = await this.agentStorage.get(agentId);
+      if (await unarchiveAgentState(this.agentStorage, this.agentManager, agentId)) {
+        archivedAtToRestore = stored?.archivedAt ?? null;
+      }
       let snapshot: ManagedAgent;
       const existing = this.agentManager.getAgent(agentId);
       if (existing) {
@@ -4748,6 +4745,7 @@ export class Session {
           logger: this.sessionLogger,
         });
       }
+      archivedAtToRestore = null;
       await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimelineItemCount(agentId);
@@ -4763,6 +4761,10 @@ export class Session {
         });
       }
     } catch (error) {
+      // Match send/resume: a failed load must not leave an archived agent active.
+      if (archivedAtToRestore) {
+        await this.agentManager.archiveSnapshot(agentId, archivedAtToRestore);
+      }
       const message = getErrorMessage(error);
       this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
       if (requestId) {
@@ -6018,18 +6020,19 @@ export class Session {
     await this.refreshRecoveredWorkspaceForExternalMutation(workspace);
   }
 
-  private async restoreOwningWorkspaceForLegacyAgentRefresh(agentId: string): Promise<void> {
-    // COMPAT(worktreeRestore): clients older than v0.1.105 used refresh_agent_request
-    // as their explicit recovery RPC. Remove after 2027-01-11.
-    if (!clientUsesLegacyWorkspaceRestore(this.appVersion)) {
-      return;
-    }
+  private async restoreOwningWorkspaceForAgentRefresh(agentId: string): Promise<void> {
     const record = await this.agentStorage.get(agentId);
     if (!record?.workspaceId) {
       return;
     }
     const recovery = await this.workspaceRecovery.inspect(record.workspaceId);
     if (recovery.kind !== "recoverable") {
+      if (
+        recovery.reason !== "workspace_not_archived" &&
+        recovery.reason !== "workspace_not_found"
+      ) {
+        throw new Error(recovery.message);
+      }
       return;
     }
     await this.restoreWorkspaceAndEmit(record.workspaceId);
