@@ -180,17 +180,19 @@ Workspace archive is a separate lifecycle. Archiving or removing a worktree can 
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state.
-Its explicit Restore action recovers the workspace alone. The agent's explicit Unarchive action
-also recovers its owning workspace before resuming that selected agent.
+Its explicit Restore action also unarchives an archived chat focused by the requesting client
+when that chat belongs to the restored workspace. Without a matching focused archived chat,
+Restore recovers the workspace alone. The agent's explicit Unarchive action also recovers its
+owning workspace before resuming that selected agent.
 
 History navigation opens the selected agent without changing either archive state. Workspace
-**Restore** recovers only the workspace; the selected archived agent stays open with its callout.
+**Restore** uses the existing client heartbeat's focused chat to complete both recovery steps.
 The agent's **Unarchive** restores a missing managed worktree when possible, publishes the recovered
 workspace through the existing update channel, then runs the provider's native unarchive hook before
 interactive resume and history hydration. Failed recovery leaves the agent archived; failed provider
 loading restores its original archive state. Other archived agents stay archived. This uses the existing
-refresh RPC, so clients do not need a new button or message schema. Clients that show workspace Restore
-before the agent's Unarchive can still use that two-step flow.
+refresh and workspace recovery RPCs, so clients do not need a new button or message schema.
+Another client's focus and other archived chats do not change the selected recovery target.
 
 Opening an agent is a navigation choice, independent of whether its details are cached. The
 layout retains that choice across reload while the panel fetches the agent from the daemon.

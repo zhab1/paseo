@@ -942,37 +942,57 @@ test("refresh_agent rebuilds a live agent even when it has no persistence handle
   }
 });
 
-test("refresh_agent rejects when persisted session resume fails", async () => {
-  const cwd = tmpCwd();
-  const client = new FailingResumeClient();
-  const localCtx = await createDaemonTestContext({
-    agentClients: {
-      claude: client,
-    },
-  });
-
-  try {
-    const created = await localCtx.client.createAgent({
-      config: {
-        provider: "claude",
-        cwd,
+test.each(["refresh_agent", "focused restore"])(
+  "%s rejects when persisted session resume fails",
+  async (action) => {
+    const cwd = tmpCwd();
+    const client = new FailingResumeClient();
+    const localCtx = await createDaemonTestContext({
+      agentClients: {
+        claude: client,
       },
     });
-    const archived = await localCtx.client.archiveAgent(created.id);
 
-    await expect(localCtx.client.refreshAgent(created.id)).rejects.toMatchObject({
-      name: "DaemonRpcError",
-      code: "agent_refresh_failed",
-      requestType: "refresh_agent_request",
-    });
-    expect(client.resumeSessionCalls).toBe(1);
-    const afterFailure = await localCtx.client.fetchAgent({ agentId: created.id });
-    expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
-  } finally {
-    await localCtx.cleanup();
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
+    try {
+      const workspace = await localCtx.client.createWorkspace({
+        source: { kind: "directory", path: cwd },
+      });
+      expect(workspace.error).toBeNull();
+      const created = await localCtx.client.createAgent({
+        config: {
+          provider: "claude",
+          cwd,
+        },
+        workspaceId: workspace.workspace!.id,
+      });
+      const archived = await localCtx.client.archiveAgent(created.id);
+
+      if (action === "focused restore") {
+        localCtx.client.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: created.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await expect(localCtx.client.restoreWorkspace(workspace.workspace!.id)).rejects.toThrow(
+          "resume exploded",
+        );
+      } else {
+        await expect(localCtx.client.refreshAgent(created.id)).rejects.toMatchObject({
+          name: "DaemonRpcError",
+          code: "agent_refresh_failed",
+          requestType: "refresh_agent_request",
+        });
+      }
+      expect(client.resumeSessionCalls).toBe(1);
+      const afterFailure = await localCtx.client.fetchAgent({ agentId: created.id });
+      expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
+    } finally {
+      await localCtx.cleanup();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test("resume_agent auto-unarchives archived agents", async () => {
   const cwd = tmpCwd();

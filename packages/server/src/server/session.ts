@@ -3940,7 +3940,13 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.restore.request" }>,
   ): Promise<void> {
     try {
-      await this.restoreWorkspaceAndEmit(request.workspaceId);
+      const focusedAgentId = this.getClientActivity()?.focusedAgentId;
+      const focusedAgent = focusedAgentId ? await this.agentStorage.get(focusedAgentId) : null;
+      if (focusedAgent?.workspaceId === request.workspaceId && focusedAgent.archivedAt) {
+        await this.refreshAgentFromPersistence(focusedAgent.id);
+      } else {
+        await this.restoreWorkspaceAndEmit(request.workspaceId);
+      }
       this.emit({
         type: "workspace.recovery.restore.response",
         payload: {
@@ -4709,6 +4715,46 @@ export class Session {
     const { agentId, requestId } = msg;
     this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
 
+    try {
+      const timelineSize = await this.refreshAgentFromPersistence(agentId);
+      if (requestId) {
+        this.emit({
+          type: "status",
+          payload: {
+            status: "agent_refreshed",
+            agentId,
+            requestId,
+            timelineSize,
+          },
+        });
+      }
+    } catch (error) {
+      const message = getErrorMessage(error);
+      this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
+      if (requestId) {
+        this.emit({
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: msg.type,
+            error: message,
+            code: error instanceof WorktreeRequestError ? error.code : "agent_refresh_failed",
+          },
+        });
+      }
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to refresh agent: ${message}`,
+        },
+      });
+    }
+  }
+
+  private async refreshAgentFromPersistence(agentId: string): Promise<number> {
     let archivedAtToRestore: string | null = null;
     try {
       await this.restoreOwningWorkspaceForAgentRefresh(agentId);
@@ -4748,45 +4794,13 @@ export class Session {
       archivedAtToRestore = null;
       await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimelineItemCount(agentId);
-      if (requestId) {
-        this.emit({
-          type: "status",
-          payload: {
-            status: "agent_refreshed",
-            agentId,
-            requestId,
-            timelineSize,
-          },
-        });
-      }
+      return this.agentManager.getTimelineItemCount(agentId);
     } catch (error) {
       // Match send/resume: a failed load must not leave an archived agent active.
       if (archivedAtToRestore) {
         await this.agentManager.archiveSnapshot(agentId, archivedAtToRestore);
       }
-      const message = getErrorMessage(error);
-      this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
-      if (requestId) {
-        this.emit({
-          type: "rpc_error",
-          payload: {
-            requestId,
-            requestType: msg.type,
-            error: message,
-            code: error instanceof WorktreeRequestError ? error.code : "agent_refresh_failed",
-          },
-        });
-      }
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to refresh agent: ${message}`,
-        },
-      });
+      throw error;
     }
   }
 
