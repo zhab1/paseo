@@ -82,12 +82,6 @@ test.each(["refresh", "focused restore"])(
 
     const updates: DaemonEvent[] = [];
     client.subscribe((event) => updates.push(event));
-    otherClient.sendHeartbeat({
-      deviceType: "mobile",
-      focusedAgentId: sibling.id,
-      lastActivityAt: new Date().toISOString(),
-      appVisible: true,
-    });
     if (action === "focused restore") {
       client.sendHeartbeat({
         deviceType: "mobile",
@@ -95,6 +89,15 @@ test.each(["refresh", "focused restore"])(
         lastActivityAt: new Date().toISOString(),
         appVisible: true,
       });
+      await client.fetchAgent({ agentId: selected.id });
+      // Another client's newer focus must not select the chat restored here.
+      otherClient.sendHeartbeat({
+        deviceType: "mobile",
+        focusedAgentId: sibling.id,
+        lastActivityAt: new Date().toISOString(),
+        appVisible: true,
+      });
+      await otherClient.fetchAgent({ agentId: sibling.id });
       await client.restoreWorkspace(workspace.id);
     } else {
       await client.refreshAgent(selected.id);
