@@ -854,6 +854,42 @@ test("send_agent_message leaves an archived agent archived when its directory is
   }
 }, 30000);
 
+test.each([1, 2])(
+  "refresh_agent preserves archival after %i missing-directory failures and can retry after restore",
+  async (requests) => {
+    const cwd = tmpCwd();
+    try {
+      const created = await ctx.client.createAgent({
+        config: { ...getFullAccessConfig("codex"), cwd },
+      });
+      const archived = await ctx.client.archiveAgent(created.id);
+      rmSync(cwd, { recursive: true, force: true });
+
+      await Promise.all(
+        Array.from({ length: requests }, () =>
+          expect(ctx.client.refreshAgent(created.id)).rejects.toThrow(
+            "Working directory does not exist",
+          ),
+        ),
+      );
+
+      const afterFailure = await ctx.client.fetchAgent({ agentId: created.id });
+      expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
+      const active = await ctx.client.fetchAgents();
+      expect(active.entries.some((entry) => entry.agent.id === created.id)).toBe(false);
+
+      mkdirSync(cwd);
+      await ctx.client.refreshAgent(created.id);
+      const restored = await ctx.client.fetchAgent({ agentId: created.id });
+      expect(restored?.agent.archivedAt).toBeNull();
+      expect(restored?.agent.cwd).toBe(cwd);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  30000,
+);
+
 test("refresh_agent auto-unarchives archived agents", async () => {
   const cwd = tmpCwd();
   try {
@@ -922,7 +958,7 @@ test("refresh_agent rejects when persisted session resume fails", async () => {
         cwd,
       },
     });
-    await localCtx.client.archiveAgent(created.id);
+    const archived = await localCtx.client.archiveAgent(created.id);
 
     await expect(localCtx.client.refreshAgent(created.id)).rejects.toMatchObject({
       name: "DaemonRpcError",
@@ -930,6 +966,8 @@ test("refresh_agent rejects when persisted session resume fails", async () => {
       requestType: "refresh_agent_request",
     });
     expect(client.resumeSessionCalls).toBe(1);
+    const afterFailure = await localCtx.client.fetchAgent({ agentId: created.id });
+    expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
   } finally {
     await localCtx.cleanup();
     rmSync(cwd, { recursive: true, force: true });
