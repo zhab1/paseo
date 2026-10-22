@@ -942,7 +942,7 @@ test("refresh_agent rebuilds a live agent even when it has no persistence handle
   }
 });
 
-test.each(["refresh_agent", "focused restore"])(
+test.each(["refresh_agent", "focused restore", "restore before focus"])(
   "%s rejects when persisted session resume fails",
   async (action) => {
     const cwd = tmpCwd();
@@ -966,8 +966,30 @@ test.each(["refresh_agent", "focused restore"])(
         workspaceId: workspace.workspace!.id,
       });
       const archived = await localCtx.client.archiveAgent(created.id);
+      let archivedAt = archived.archivedAt;
 
-      if (action === "focused restore") {
+      if (action === "restore before focus") {
+        const failures: string[] = [];
+        await localCtx.client.observeEvents(["activity_log"]).ready;
+        localCtx.client.on("activity_log", (event) => {
+          if (event.type === "activity_log" && event.payload.type === "error")
+            failures.push(event.payload.content);
+        });
+        expect((await localCtx.client.archiveWorkspace(workspace.workspace!.id)).error).toBeNull();
+        archivedAt = (await localCtx.client.fetchAgent({ agentId: created.id }))!.agent.archivedAt;
+        await localCtx.client.restoreWorkspace(workspace.workspace!.id);
+        localCtx.client.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: created.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await expect
+          .poll(() => failures.some((message) => message.includes("resume exploded")), {
+            timeout: 10_000,
+          })
+          .toBe(true);
+      } else if (action === "focused restore") {
         localCtx.client.sendHeartbeat({
           deviceType: "mobile",
           focusedAgentId: created.id,
@@ -986,7 +1008,7 @@ test.each(["refresh_agent", "focused restore"])(
       }
       expect(client.resumeSessionCalls).toBe(1);
       const afterFailure = await localCtx.client.fetchAgent({ agentId: created.id });
-      expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
+      expect(afterFailure?.agent.archivedAt).toBe(archivedAt);
     } finally {
       await localCtx.cleanup();
       rmSync(cwd, { recursive: true, force: true });

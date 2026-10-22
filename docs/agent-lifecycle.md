@@ -181,9 +181,11 @@ agent record without setting the agent's `archivedAt`, while its `workspaceId` s
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state.
 Its explicit Restore action also unarchives an archived chat focused by the requesting client
-when that chat belongs to the restored workspace. Without a matching focused archived chat,
-Restore recovers the workspace alone. The agent's explicit Unarchive action also recovers its
-owning workspace before resuming that selected agent.
+when that chat belongs to the restored workspace. Archived routes may reveal their selected chat
+only after the workspace is restored. In that case the daemon accepts the same connection's next
+focused chat within 30 seconds. Leaving for another workspace, a terminal, the background, or a
+disconnection ends that intent. Without a matching selection, Restore recovers the workspace alone.
+The agent's explicit Unarchive action also recovers its owning workspace before resuming that chat.
 
 History navigation opens the selected agent without changing either archive state. Workspace
 **Restore** uses the existing client heartbeat's focused chat to complete both recovery steps.

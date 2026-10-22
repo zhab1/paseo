@@ -32,7 +32,7 @@ function createGitRepoWithBranch(): { repoDir: string; tempRoot: string } {
   return { repoDir, tempRoot };
 }
 
-test.each(["refresh", "focused restore"])(
+test.each(["refresh", "focused restore", "restore before focus"])(
   "%s restores an archived worktree and publishes selected-agent recovery to current clients",
   async (action) => {
     const daemon = await createTestPaseoDaemon();
@@ -82,10 +82,10 @@ test.each(["refresh", "focused restore"])(
 
     const updates: DaemonEvent[] = [];
     client.subscribe((event) => updates.push(event));
-    if (action === "focused restore") {
+    if (action !== "refresh") {
       client.sendHeartbeat({
         deviceType: "mobile",
-        focusedAgentId: selected.id,
+        focusedAgentId: action === "focused restore" ? selected.id : null,
         lastActivityAt: new Date().toISOString(),
         appVisible: true,
       });
@@ -99,6 +99,28 @@ test.each(["refresh", "focused restore"])(
       });
       await otherClient.fetchAgent({ agentId: sibling.id });
       await client.restoreWorkspace(workspace.id);
+      if (action === "restore before focus") {
+        // The archived route cannot select its chat until the workspace exists.
+        expect(
+          (await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt,
+        ).not.toBeNull();
+        otherClient.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: sibling.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await otherClient.fetchAgent({ agentId: sibling.id });
+        client.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: selected.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await expect
+          .poll(async () => (await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt)
+          .toBeNull();
+      }
     } else {
       await client.refreshAgent(selected.id);
     }
