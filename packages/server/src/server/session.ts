@@ -289,6 +289,7 @@ type ProviderSubagentManagerEvent = Extract<
 // the entire session message if they encounter an unknown provider.
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
+const WORKSPACE_RESTORE_FOCUS_WINDOW_MS = 30_000;
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -790,6 +791,7 @@ export class Session {
       appVersion: string | null;
       activity: ClientActivity | null;
       pushToken: string | null;
+      pendingWorkspaceRestore?: { workspaceId: string; expiresAt: number };
     }
   >();
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
@@ -1285,6 +1287,7 @@ export class Session {
         appVersion,
         activity: this.clientSources.get(source)?.activity ?? null,
         pushToken: this.clientSources.get(source)?.pushToken ?? null,
+        pendingWorkspaceRestore: this.clientSources.get(source)?.pendingWorkspaceRestore,
       });
       this.refreshObservationProducers();
       // COMPAT(ownedSubscriptions): added in v0.8.0, remove capability-driven legacy host registration after 2027-03-09.
@@ -2710,8 +2713,7 @@ export class Session {
       case "shutdown_server_request":
         return this.handleShutdownServerRequest(msg.requestId);
       case "client_heartbeat":
-        this.handleClientHeartbeat(msg);
-        return undefined;
+        return this.handleClientHeartbeat(msg);
       case "ping": {
         const now = Date.now();
         this.emit({
@@ -2875,7 +2877,7 @@ export class Session {
       case "import_agent_request":
         return this.handleImportAgentRequest(msg);
       case "refresh_agent_request":
-        return this.handleRefreshAgentRequest(msg);
+        return this.refreshAgentAndReport(msg.agentId, msg.requestId);
       case "cancel_agent_request":
         return this.handleCancelAgentRequest(msg.agentId, msg.requestId);
       case "agent_permission_response":
@@ -3939,8 +3941,29 @@ export class Session {
   private async handleWorkspaceRecoveryRestoreRequest(
     request: Extract<SessionInboundMessage, { type: "workspace.recovery.restore.request" }>,
   ): Promise<void> {
+    delete this.currentClientMetadata().pendingWorkspaceRestore;
     try {
-      await this.restoreWorkspaceAndEmit(request.workspaceId);
+      const canRefreshAgent = this.authorization.allowsPermission("workspace.write");
+      const focusedAgentId = canRefreshAgent ? this.getClientActivity()?.focusedAgentId : null;
+      const focusedAgent = focusedAgentId ? await this.agentStorage.get(focusedAgentId) : null;
+      if (focusedAgent?.workspaceId === request.workspaceId && focusedAgent.archivedAt) {
+        await this.refreshAgentFromPersistence(focusedAgent.id);
+      } else {
+        await this.restoreWorkspaceAndEmit(request.workspaceId);
+        if (this.authorization.allowsPermission("workspace.write")) {
+          // Archived routes select their chat only after the workspace update arrives.
+          const revealedId = this.getClientActivity()?.focusedAgentId;
+          const revealed = revealedId ? await this.agentStorage.get(revealedId) : null;
+          if (revealed?.workspaceId === request.workspaceId && revealed.archivedAt) {
+            await this.refreshAgentFromPersistence(revealed.id);
+          } else if (revealed?.workspaceId !== request.workspaceId) {
+            this.currentClientMetadata().pendingWorkspaceRestore = {
+              workspaceId: request.workspaceId,
+              expiresAt: Date.now() + WORKSPACE_RESTORE_FOCUS_WINDOW_MS,
+            };
+          }
+        }
+      }
       this.emit({
         type: "workspace.recovery.restore.response",
         payload: {
@@ -4703,12 +4726,49 @@ export class Session {
     }
   }
 
-  private async handleRefreshAgentRequest(
-    msg: Extract<SessionInboundMessage, { type: "refresh_agent_request" }>,
-  ): Promise<void> {
-    const { agentId, requestId } = msg;
+  private async refreshAgentAndReport(agentId: string, requestId?: string): Promise<void> {
     this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
 
+    try {
+      const timelineSize = await this.refreshAgentFromPersistence(agentId);
+      if (requestId) {
+        this.emit({
+          type: "status",
+          payload: {
+            status: "agent_refreshed",
+            agentId,
+            requestId,
+            timelineSize,
+          },
+        });
+      }
+    } catch (error) {
+      const message = getErrorMessage(error);
+      this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
+      if (requestId) {
+        this.emit({
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: "refresh_agent_request",
+            error: message,
+            code: error instanceof WorktreeRequestError ? error.code : "agent_refresh_failed",
+          },
+        });
+      }
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to refresh agent: ${message}`,
+        },
+      });
+    }
+  }
+
+  private async refreshAgentFromPersistence(agentId: string): Promise<number> {
     let archivedAtToRestore: string | null = null;
     try {
       await this.restoreOwningWorkspaceForAgentRefresh(agentId);
@@ -4748,45 +4808,13 @@ export class Session {
       archivedAtToRestore = null;
       await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
       await this.agentUpdates.forwardLiveAgent(snapshot);
-      const timelineSize = this.agentManager.getTimelineItemCount(agentId);
-      if (requestId) {
-        this.emit({
-          type: "status",
-          payload: {
-            status: "agent_refreshed",
-            agentId,
-            requestId,
-            timelineSize,
-          },
-        });
-      }
+      return this.agentManager.getTimelineItemCount(agentId);
     } catch (error) {
       // Match send/resume: a failed load must not leave an archived agent active.
       if (archivedAtToRestore) {
         await this.agentManager.archiveSnapshot(agentId, archivedAtToRestore);
       }
-      const message = getErrorMessage(error);
-      this.sessionLogger.error({ err: error, agentId }, `Failed to refresh agent ${agentId}`);
-      if (requestId) {
-        this.emit({
-          type: "rpc_error",
-          payload: {
-            requestId,
-            requestType: msg.type,
-            error: message,
-            code: error instanceof WorktreeRequestError ? error.code : "agent_refresh_failed",
-          },
-        });
-      }
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to refresh agent: ${message}`,
-        },
-      });
+      throw error;
     }
   }
 
@@ -5060,14 +5088,14 @@ export class Session {
   /**
    * Handle client heartbeat for activity tracking
    */
-  private handleClientHeartbeat(msg: {
+  private async handleClientHeartbeat(msg: {
     deviceType: "web" | "mobile";
     focusedAgentId: string | null;
     focusedTerminalId?: string | null;
     lastActivityAt: string;
     appVisible: boolean;
     appVisibilityChangedAt?: string;
-  }): void {
+  }): Promise<void> {
     const focusedTerminalId = msg.focusedTerminalId?.trim() || null;
     const appVisibilityChangedAt = msg.appVisibilityChangedAt
       ? new Date(msg.appVisibilityChangedAt)
@@ -5086,6 +5114,25 @@ export class Session {
     }
     if (metadata.pushToken) {
       this.pushNotifications.renew(metadata.pushToken);
+    }
+    const pending = metadata.pendingWorkspaceRestore;
+    if (!pending) return;
+    if (
+      !this.authorization.allowsPermission("workspace.write") ||
+      Date.now() >= pending.expiresAt ||
+      !msg.appVisible ||
+      focusedTerminalId
+    ) {
+      delete metadata.pendingWorkspaceRestore;
+      return;
+    }
+    if (!msg.focusedAgentId) return;
+    delete metadata.pendingWorkspaceRestore;
+    const workspace = await this.workspaceRegistry.get(pending.workspaceId);
+    if (!workspace || workspace.archivedAt) return;
+    const agent = await this.agentStorage.get(msg.focusedAgentId);
+    if (agent?.workspaceId === pending.workspaceId && agent.archivedAt) {
+      await this.refreshAgentAndReport(agent.id);
     }
   }
 

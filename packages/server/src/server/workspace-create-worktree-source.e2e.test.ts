@@ -32,88 +32,139 @@ function createGitRepoWithBranch(): { repoDir: string; tempRoot: string } {
   return { repoDir, tempRoot };
 }
 
-test("refresh restores an archived worktree and publishes selected-agent recovery to current clients", async () => {
-  const daemon = await createTestPaseoDaemon();
-  const { repoDir, tempRoot } = createGitRepoWithBranch();
-  let client = new DaemonClient({
-    url: `ws://127.0.0.1:${daemon.port}/ws`,
-    appVersion: "0.11.2",
-  });
-  onTestFinished(async () => {
+test.each(["refresh", "focused restore", "restore before focus"])(
+  "%s restores an archived worktree and publishes selected-agent recovery to current clients",
+  async (action) => {
+    const daemon = await createTestPaseoDaemon();
+    const { repoDir, tempRoot } = createGitRepoWithBranch();
+    let client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      appVersion: "0.11.2",
+    });
+    const otherClient = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      appVersion: "0.11.2",
+    });
+    onTestFinished(async () => {
+      await client.close();
+      await otherClient.close();
+      await daemon.close();
+      rmSync(tempRoot, { recursive: true, force: true });
+    });
+    await client.connect();
+    await otherClient.connect();
+    const created = await client.createWorkspace({
+      source: {
+        kind: "worktree",
+        cwd: repoDir,
+        action: "checkout",
+        refName: "feature/existing-branch",
+      },
+    });
+    expect(created.error).toBeNull();
+    const workspace = created.workspace!;
+    const cwd = workspace.workspaceDirectory;
+    const head = runGit(cwd, "rev-parse", "HEAD");
+    const selected = await client.createAgent({
+      config: { provider: "codex", cwd },
+      workspaceId: workspace.id,
+    });
+    const sibling = await client.createAgent({
+      config: { provider: "codex", cwd },
+      workspaceId: workspace.id,
+    });
+    await client.fetchWorkspaces({ subscribe: {} });
+    await client.fetchAgents({ subscribe: {} });
+    expect((await client.archiveWorkspace(workspace.id)).error).toBeNull();
+    expect(existsSync(cwd)).toBe(false);
+    const archivedSibling = await client.fetchAgent({ agentId: sibling.id });
+    expect(archivedSibling?.agent.archivedAt).toEqual(expect.any(String));
+
+    const updates: DaemonEvent[] = [];
+    client.subscribe((event) => updates.push(event));
+    if (action !== "refresh") {
+      client.sendHeartbeat({
+        deviceType: "mobile",
+        focusedAgentId: action === "focused restore" ? selected.id : null,
+        lastActivityAt: new Date().toISOString(),
+        appVisible: true,
+      });
+      await client.fetchAgent({ agentId: selected.id });
+      // Another client's newer focus must not select the chat restored here.
+      otherClient.sendHeartbeat({
+        deviceType: "mobile",
+        focusedAgentId: sibling.id,
+        lastActivityAt: new Date().toISOString(),
+        appVisible: true,
+      });
+      await otherClient.fetchAgent({ agentId: sibling.id });
+      await client.restoreWorkspace(workspace.id);
+      if (action === "restore before focus") {
+        // The archived route cannot select its chat until the workspace exists.
+        expect(
+          (await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt,
+        ).not.toBeNull();
+        otherClient.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: sibling.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await otherClient.fetchAgent({ agentId: sibling.id });
+        client.sendHeartbeat({
+          deviceType: "mobile",
+          focusedAgentId: selected.id,
+          lastActivityAt: new Date().toISOString(),
+          appVisible: true,
+        });
+        await expect
+          .poll(async () => (await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt)
+          .toBeNull();
+      }
+    } else {
+      await client.refreshAgent(selected.id);
+    }
+
+    expect(existsSync(cwd)).toBe(true);
+    expect(runGit(cwd, "rev-parse", "HEAD")).toBe(head);
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        type: "workspace_update",
+        payload: expect.objectContaining({
+          kind: "upsert",
+          workspace: expect.objectContaining({ id: workspace.id }),
+        }),
+      }),
+    );
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        type: "agent_update",
+        payload: expect.objectContaining({
+          kind: "upsert",
+          agent: expect.objectContaining({ id: selected.id, archivedAt: null }),
+        }),
+      }),
+    );
+    expect((await client.fetchAgent({ agentId: sibling.id }))?.agent.archivedAt).toBe(
+      archivedSibling?.agent.archivedAt,
+    );
+
+    // A disconnected client can retry the same action without restoring another worktree.
     await client.close();
-    await daemon.close();
-    rmSync(tempRoot, { recursive: true, force: true });
-  });
-  await client.connect();
-  const created = await client.createWorkspace({
-    source: {
-      kind: "worktree",
-      cwd: repoDir,
-      action: "checkout",
-      refName: "feature/existing-branch",
-    },
-  });
-  expect(created.error).toBeNull();
-  const workspace = created.workspace!;
-  const cwd = workspace.workspaceDirectory;
-  const head = runGit(cwd, "rev-parse", "HEAD");
-  const selected = await client.createAgent({
-    config: { provider: "codex", cwd },
-    workspaceId: workspace.id,
-  });
-  const sibling = await client.createAgent({
-    config: { provider: "codex", cwd },
-    workspaceId: workspace.id,
-  });
-  await client.fetchWorkspaces({ subscribe: {} });
-  await client.fetchAgents({ subscribe: {} });
-  expect((await client.archiveWorkspace(workspace.id)).error).toBeNull();
-  expect(existsSync(cwd)).toBe(false);
-  const archivedSibling = await client.fetchAgent({ agentId: sibling.id });
-  expect(archivedSibling?.agent.archivedAt).toEqual(expect.any(String));
-
-  const updates: DaemonEvent[] = [];
-  client.subscribe((event) => updates.push(event));
-  await client.refreshAgent(selected.id);
-
-  expect(existsSync(cwd)).toBe(true);
-  expect(runGit(cwd, "rev-parse", "HEAD")).toBe(head);
-  expect(updates).toContainEqual(
-    expect.objectContaining({
-      type: "workspace_update",
-      payload: expect.objectContaining({
-        kind: "upsert",
-        workspace: expect.objectContaining({ id: workspace.id }),
-      }),
-    }),
-  );
-  expect(updates).toContainEqual(
-    expect.objectContaining({
-      type: "agent_update",
-      payload: expect.objectContaining({
-        kind: "upsert",
-        agent: expect.objectContaining({ id: selected.id, archivedAt: null }),
-      }),
-    }),
-  );
-  expect((await client.fetchAgent({ agentId: sibling.id }))?.agent.archivedAt).toBe(
-    archivedSibling?.agent.archivedAt,
-  );
-
-  // A disconnected client can retry the same action without restoring another worktree.
-  await client.close();
-  client = new DaemonClient({
-    url: `ws://127.0.0.1:${daemon.port}/ws`,
-    appVersion: "0.11.2",
-  });
-  await client.connect();
-  await client.refreshAgent(selected.id);
-  const restored = await client.fetchAgent({ agentId: selected.id });
-  expect(restored?.agent.archivedAt).toBeNull();
-  expect(restored?.agent.workspaceId).toBe(workspace.id);
-  expect(restored?.agent.cwd).toBe(cwd);
-  expect(runGit(cwd, "rev-parse", "HEAD")).toBe(head);
-}, 60000);
+    client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      appVersion: "0.11.2",
+    });
+    await client.connect();
+    await client.refreshAgent(selected.id);
+    const restored = await client.fetchAgent({ agentId: selected.id });
+    expect(restored?.agent.archivedAt).toBeNull();
+    expect(restored?.agent.workspaceId).toBe(workspace.id);
+    expect(restored?.agent.cwd).toBe(cwd);
+    expect(runGit(cwd, "rev-parse", "HEAD")).toBe(head);
+  },
+  60000,
+);
 
 test("workspace.create worktree source forwards action=checkout + refName into the real worktree", async () => {
   const daemon = await createTestPaseoDaemon();
