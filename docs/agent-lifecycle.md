@@ -195,6 +195,9 @@ interactive resume and history hydration. Failed recovery leaves the agent archi
 loading restores its original archive state. Other archived agents stay archived. This uses the existing
 refresh and workspace recovery RPCs, so clients do not need a new button or message schema.
 Another client's focus and other archived chats do not change the selected recovery target.
+Chat recovery retains the refresh RPC's `workspace.write` requirement; workspace management alone
+restores only the workspace. Pending chat recovery rechecks write access and an active workspace
+when focus is reported.
 
 Opening an agent is a navigation choice, independent of whether its details are cached. The
 layout retains that choice across reload while the panel fetches the agent from the daemon.

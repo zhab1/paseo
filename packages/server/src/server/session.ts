@@ -3943,22 +3943,25 @@ export class Session {
   ): Promise<void> {
     delete this.currentClientMetadata().pendingWorkspaceRestore;
     try {
-      const focusedAgentId = this.getClientActivity()?.focusedAgentId;
+      const canRefreshAgent = this.authorization.allowsPermission("workspace.write");
+      const focusedAgentId = canRefreshAgent ? this.getClientActivity()?.focusedAgentId : null;
       const focusedAgent = focusedAgentId ? await this.agentStorage.get(focusedAgentId) : null;
       if (focusedAgent?.workspaceId === request.workspaceId && focusedAgent.archivedAt) {
         await this.refreshAgentFromPersistence(focusedAgent.id);
       } else {
         await this.restoreWorkspaceAndEmit(request.workspaceId);
-        // Archived routes select their chat only after the workspace update arrives.
-        const revealedId = this.getClientActivity()?.focusedAgentId;
-        const revealed = revealedId ? await this.agentStorage.get(revealedId) : null;
-        if (revealed?.workspaceId === request.workspaceId) {
-          if (revealed.archivedAt) await this.refreshAgentFromPersistence(revealed.id);
-        } else {
-          this.currentClientMetadata().pendingWorkspaceRestore = {
-            workspaceId: request.workspaceId,
-            expiresAt: Date.now() + WORKSPACE_RESTORE_FOCUS_WINDOW_MS,
-          };
+        if (this.authorization.allowsPermission("workspace.write")) {
+          // Archived routes select their chat only after the workspace update arrives.
+          const revealedId = this.getClientActivity()?.focusedAgentId;
+          const revealed = revealedId ? await this.agentStorage.get(revealedId) : null;
+          if (revealed?.workspaceId === request.workspaceId && revealed.archivedAt) {
+            await this.refreshAgentFromPersistence(revealed.id);
+          } else if (revealed?.workspaceId !== request.workspaceId) {
+            this.currentClientMetadata().pendingWorkspaceRestore = {
+              workspaceId: request.workspaceId,
+              expiresAt: Date.now() + WORKSPACE_RESTORE_FOCUS_WINDOW_MS,
+            };
+          }
         }
       }
       this.emit({
@@ -5114,12 +5117,19 @@ export class Session {
     }
     const pending = metadata.pendingWorkspaceRestore;
     if (!pending) return;
-    if (Date.now() >= pending.expiresAt || !msg.appVisible || focusedTerminalId) {
+    if (
+      !this.authorization.allowsPermission("workspace.write") ||
+      Date.now() >= pending.expiresAt ||
+      !msg.appVisible ||
+      focusedTerminalId
+    ) {
       delete metadata.pendingWorkspaceRestore;
       return;
     }
     if (!msg.focusedAgentId) return;
     delete metadata.pendingWorkspaceRestore;
+    const workspace = await this.workspaceRegistry.get(pending.workspaceId);
+    if (!workspace || workspace.archivedAt) return;
     const agent = await this.agentStorage.get(msg.focusedAgentId);
     if (agent?.workspaceId === pending.workspaceId && agent.archivedAt) {
       await this.refreshAgentAndReport(agent.id);

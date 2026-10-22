@@ -22,7 +22,7 @@ import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
-import { OWNER_PERMISSIONS } from "./authorization/index.js";
+import { OWNER_PERMISSIONS, type DaemonPermission } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
@@ -176,6 +176,7 @@ interface SessionTestAccess {
   emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void>;
   updateClientCapabilities(capabilities: Record<string, unknown> | null, source?: object): void;
   clearAgentTimelineSubscription(source: object): void;
+  setPermissions(permissions: readonly DaemonPermission[]): void;
   emit(message: unknown): void;
   onMessage(message: unknown): void;
   paseoHome: string;
@@ -5302,103 +5303,122 @@ test("workspace recovery stays accepted when git observer warming fails", async 
   });
 });
 
-test.each(["selected", "other workspace", "background", "terminal", "expired", "disconnect"])(
-  "Restore before focus limits its unarchive to the next selection: %s",
-  async (selection) => {
-    const emitted: SessionOutboundMessage[] = [];
-    const workspaceId = "ws-repo-running";
-    const agent = {
-      ...makeStoredAgent({ id: "restored-chat", cwd: REPO_CWD, updatedAt: "2026-03-10T00:00:00Z" }),
+test.each([
+  "selected",
+  "other workspace",
+  "background",
+  "terminal",
+  "expired",
+  "disconnect",
+  "manage only",
+  "manage only focused",
+  "write revoked",
+  "workspace archived again",
+])("Restore before focus limits its unarchive to the next selection: %s", async (selection) => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceId = "ws-repo-running";
+  const agent = {
+    ...makeStoredAgent({ id: "restored-chat", cwd: REPO_CWD, updatedAt: "2026-03-10T00:00:00Z" }),
+    workspaceId,
+    archivedAt: "2026-03-10T00:00:00Z",
+  };
+  const unarchiveSnapshot = vi.fn(async () => true);
+  const managed = makeManagedAgent({
+    id: agent.id,
+    cwd: REPO_CWD,
+    workspaceId,
+    lifecycle: "idle",
+    updatedAt: agent.updatedAt,
+  });
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    agentStorage: {
+      get: async (id: string) =>
+        id === agent.id ? agent : { ...agent, id, workspaceId: "ws-other" },
+    },
+    agentManager: {
+      unarchiveSnapshot,
+      getAgent: () => managed,
+      reloadAgentSession: async () => managed,
+      hydrateTimelineFromProvider: async () => undefined,
+      getTimelineItemCount: () => 0,
+    },
+  });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-repo-running",
+    rootPath: REPO_CWD,
+    kind: "non_git",
+    displayName: "repo",
+    createdAt: "2026-03-01T00:00:00Z",
+    updatedAt: "2026-03-10T00:00:00Z",
+  });
+  let workspace = createPersistedWorkspaceRecord({
+    workspaceId,
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-01T00:00:00Z",
+    updatedAt: agent.archivedAt,
+    archivedAt: agent.archivedAt,
+  });
+  session.projectRegistry.get = async () => project;
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.upsert = async (record: PersistedWorkspaceRecord) => {
+    workspace = record;
+  };
+  session.interruptAgentIfRunning = async () => undefined;
+  session.agentUpdates.forwardLiveAgent = async () => undefined;
+  const source = {};
+  session.updateClientCapabilities({}, source);
+  const heartbeat = {
+    type: "client_heartbeat",
+    deviceType: "mobile",
+    focusedAgentId: null,
+    appVisible: true,
+    lastActivityAt: new Date().toISOString(),
+  };
+  if (selection.startsWith("manage only"))
+    session.setPermissions(["workspace.read", "workspace.manage"]);
+  if (selection === "manage only focused")
+    await session.handleMessage({ ...heartbeat, focusedAgentId: agent.id }, source);
+  await session.handleMessage(
+    {
+      type: "workspace.recovery.restore.request",
+      requestId: "restore",
       workspaceId,
-      archivedAt: "2026-03-10T00:00:00Z",
-    };
-    const unarchiveSnapshot = vi.fn(async () => true);
-    const managed = makeManagedAgent({
-      id: agent.id,
-      cwd: REPO_CWD,
-      workspaceId,
-      lifecycle: "idle",
-      updatedAt: agent.updatedAt,
-    });
-    const session = createSessionForWorkspaceTests({
-      onMessage: (message) => emitted.push(message),
-      agentStorage: {
-        get: async (id: string) =>
-          id === agent.id ? agent : { ...agent, id, workspaceId: "ws-other" },
-      },
-      agentManager: {
-        unarchiveSnapshot,
-        getAgent: () => managed,
-        reloadAgentSession: async () => managed,
-        hydrateTimelineFromProvider: async () => undefined,
-        getTimelineItemCount: () => 0,
-      },
-    });
-    const project = createPersistedProjectRecord({
-      projectId: "proj-repo-running",
-      rootPath: REPO_CWD,
-      kind: "non_git",
-      displayName: "repo",
-      createdAt: "2026-03-01T00:00:00Z",
-      updatedAt: "2026-03-10T00:00:00Z",
-    });
-    let workspace = createPersistedWorkspaceRecord({
-      workspaceId,
-      projectId: project.projectId,
-      cwd: REPO_CWD,
-      kind: "directory",
-      displayName: "repo",
-      createdAt: "2026-03-01T00:00:00Z",
-      updatedAt: agent.archivedAt,
-      archivedAt: agent.archivedAt,
-    });
-    session.projectRegistry.get = async () => project;
-    session.workspaceRegistry.get = async () => workspace;
-    session.workspaceRegistry.list = async () => [workspace];
-    session.workspaceRegistry.upsert = async (record: PersistedWorkspaceRecord) => {
-      workspace = record;
-    };
-    session.interruptAgentIfRunning = async () => undefined;
-    session.agentUpdates.forwardLiveAgent = async () => undefined;
-    const source = {};
-    session.updateClientCapabilities({}, source);
-    const heartbeat = {
-      type: "client_heartbeat",
-      deviceType: "mobile",
-      focusedAgentId: null,
-      appVisible: true,
-      lastActivityAt: new Date().toISOString(),
-    };
+    },
+    source,
+  );
+  expect(findByType(emitted, "workspace.recovery.restore.response")?.payload.accepted).toBe(true);
+  expect(unarchiveSnapshot).not.toHaveBeenCalled();
+  try {
+    if (selection === "workspace archived again") {
+      expect(workspace.archivedAt).toBeNull();
+      workspace = { ...workspace, archivedAt: new Date().toISOString() };
+    }
+    if (selection === "write revoked")
+      session.setPermissions(["workspace.read", "workspace.manage"]);
+    if (selection === "expired") vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60_000);
+    if (selection === "disconnect") session.clearAgentTimelineSubscription(source);
     await session.handleMessage(
       {
-        type: "workspace.recovery.restore.request",
-        requestId: "restore",
-        workspaceId,
+        ...heartbeat,
+        focusedAgentId: selection === "other workspace" ? "other-chat" : null,
+        focusedTerminalId: selection === "terminal" ? "terminal-away" : null,
+        appVisible: selection !== "background",
       },
       source,
     );
-    expect(findByType(emitted, "workspace.recovery.restore.response")?.payload.accepted).toBe(true);
-    expect(unarchiveSnapshot).not.toHaveBeenCalled();
-    try {
-      if (selection === "expired") vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60_000);
-      if (selection === "disconnect") session.clearAgentTimelineSubscription(source);
-      await session.handleMessage(
-        {
-          ...heartbeat,
-          focusedAgentId: selection === "other workspace" ? "other-chat" : null,
-          focusedTerminalId: selection === "terminal" ? "terminal-away" : null,
-          appVisible: selection !== "background",
-        },
-        source,
-      );
-      await session.handleMessage({ ...heartbeat, focusedAgentId: agent.id }, source);
-      expect(findByType(emitted, "activity_log")?.payload).toBeUndefined();
-      expect(unarchiveSnapshot).toHaveBeenCalledTimes(selection === "selected" ? 1 : 0);
-    } finally {
-      vi.restoreAllMocks();
-    }
-  },
-);
+    await session.handleMessage({ ...heartbeat, focusedAgentId: agent.id }, source);
+    expect(findByType(emitted, "activity_log")?.payload).toBeUndefined();
+    expect(unarchiveSnapshot).toHaveBeenCalledTimes(selection === "selected" ? 1 : 0);
+    if (selection === "workspace archived again") expect(workspace.archivedAt).not.toBeNull();
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
 
 test("refresh_agent_request unarchives its workspace when its directory exists", async () => {
   const emitted: SessionOutboundMessage[] = [];
