@@ -285,9 +285,7 @@ test.describe("Worktree restore", () => {
         page.getByTestId(`workspace-tab-agent_${agent.id}`).filter({ visible: true }).first(),
       ).toBeVisible({ timeout: 30_000 });
       await expect(page.getByTestId("workspace-recovery-action")).toHaveCount(0);
-      await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).toBeNull();
-      await expect(page.getByRole("button", { name: "Unarchive", exact: true })).toHaveCount(0);
-      await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
+      expect(await fetchAgentArchivedAt(client, agent.id)).not.toBeNull();
     } finally {
       unsubscribeSecondaryWorkspaceUpdate();
       if (updateTimeout) {
@@ -312,7 +310,7 @@ test.describe("Worktree restore", () => {
     ).toHaveText(switchedBranch, { timeout: 30_000 });
   });
 
-  test("Restore also unarchives the focused chat while other chats stay archived", async ({
+  test("restores the workspace before explicitly unarchiving each selected agent", async ({
     page,
   }) => {
     const { agents, worktree } = await createArchivedMissingWorktree("restore-agents", {
@@ -341,6 +339,9 @@ test.describe("Worktree restore", () => {
     await expect(
       page.getByTestId(`workspace-tab-agent_${firstAgent.id}`).filter({ visible: true }).first(),
     ).toHaveAttribute("aria-selected", "true");
+    expect(await fetchAgentArchivedAt(client, firstAgent.id)).not.toBeNull();
+    expect(await fetchAgentArchivedAt(client, secondAgent.id)).not.toBeNull();
+    await page.getByRole("button", { name: "Unarchive", exact: true }).click();
     await expect
       .poll(() => fetchAgentArchivedAt(client, firstAgent.id), { timeout: 30_000 })
       .toBeNull();
@@ -348,10 +349,6 @@ test.describe("Worktree restore", () => {
     await expect(page.getByRole("button", { name: "Unarchive" })).toHaveCount(0, {
       timeout: 30_000,
     });
-    await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
-    await page.reload();
-    await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
-    await expect(page.getByRole("button", { name: "Unarchive" })).toHaveCount(0);
 
     await openSessions(page);
     await page.getByTestId(`agent-row-${getServerId()}-${secondAgent.id}`).click();
@@ -422,10 +419,15 @@ test.describe("Worktree restore", () => {
     await expect
       .poll(() => existsSync(backingWorktree.workspaceDirectory), { timeout: 30_000 })
       .toBe(true);
+    await expect(page.getByRole("button", { name: "Unarchive", exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    await captureBranchlessRestoreStep(page, "02-unarchive-agent.png");
+
+    await page.getByRole("button", { name: "Unarchive", exact: true }).click();
     await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).toBeNull();
-    await expect(page.getByRole("button", { name: "Unarchive", exact: true })).toHaveCount(0);
     await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
-    await captureBranchlessRestoreStep(page, "02-agent-ready.png");
+    await captureBranchlessRestoreStep(page, "03-agent-ready.png");
 
     const restoredHead = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: backingWorktree.workspaceDirectory,

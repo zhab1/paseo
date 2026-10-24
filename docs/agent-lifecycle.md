@@ -180,24 +180,17 @@ Workspace archive is a separate lifecycle. Archiving or removing a worktree can 
 agent record without setting the agent's `archivedAt`, while its `workspaceId` still points at the
 archived workspace. History navigation must not infer workspace lifecycle from `agent.archivedAt`
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state.
-Its explicit Restore action also unarchives an archived chat focused by the requesting client
-when that chat belongs to the restored workspace. Archived routes may reveal their selected chat
-only after the workspace is restored. In that case the daemon accepts the same connection's next
-focused chat within 30 seconds. Leaving for another workspace, a terminal, the background, or a
-disconnection ends that intent. Without a matching selection, Restore recovers the workspace alone.
-The agent's explicit Unarchive action also recovers its owning workspace before resuming that chat.
+Its explicit Restore action recovers the workspace alone. The agent's explicit Unarchive action
+also recovers its owning workspace before resuming that selected agent.
 
 History navigation opens the selected agent without changing either archive state. Workspace
-**Restore** uses the existing client heartbeat's focused chat to complete both recovery steps.
+**Restore** recovers only the workspace; the selected archived agent stays open with its callout.
 The agent's **Unarchive** restores a missing managed worktree when possible, publishes the recovered
 workspace through the existing update channel, then runs the provider's native unarchive hook before
 interactive resume and history hydration. Failed recovery leaves the agent archived; failed provider
 loading restores its original archive state. Other archived agents stay archived. This uses the existing
-refresh and workspace recovery RPCs, so clients do not need a new button or message schema.
-Another client's focus and other archived chats do not change the selected recovery target.
-Chat recovery retains the refresh RPC's `workspace.write` requirement; workspace management alone
-restores only the workspace. Pending chat recovery rechecks write access and an active workspace
-when focus is reported.
+refresh RPC, so clients do not need a new button or message schema. Clients that show workspace Restore
+before the agent's Unarchive can still use that two-step flow.
 
 Opening an agent is a navigation choice, independent of whether its details are cached. The
 layout retains that choice across reload while the panel fetches the agent from the daemon.
