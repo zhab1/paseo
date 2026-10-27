@@ -53,10 +53,10 @@ export async function expectAcpMarkdown(page: Page, count: number): Promise<void
   await expect(messages).toHaveCount(count);
   for (let index = 0; index < count; index++) {
     const message = messages.nth(index);
-    await expect(message.locator(".enrm-text > p")).toHaveText([
-      timestamp,
+    await expect(message.locator(".enrm-text > p")).toHaveText(timestamp);
+    await expect(message.getByRole("listitem")).toHaveText(
       "Current temperature: 25°C. Read Paseo docs.",
-    ]);
+    );
     await expect(
       message.getByRole("link", { name: "Paseo docs" }).and(message.locator("a")),
     ).toHaveAttribute("href", "https://example.com/docs");

@@ -28,7 +28,7 @@ test("caps a newline-heavy assistant message on web before rendering markdown", 
     await expect(timestampParagraph).toHaveText(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:$/);
     const timestamp = await timestampParagraph.textContent();
     await expect(notice).toHaveText(
-      `This message was capped (${getUtf8ByteLength(`${timestamp}\n\n${response}`)} bytes).`,
+      `This message was capped (${getUtf8ByteLength(`\n\n${timestamp}\n\n${response}`)} bytes).`,
     );
     await expect(notice).toHaveCSS("font-style", "italic");
   } finally {
