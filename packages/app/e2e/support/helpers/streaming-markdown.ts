@@ -87,7 +87,10 @@ async function captureMarkdown(page: Page, testInfo: TestInfo, name: string): Pr
 
 async function expectCompletedMarkdown(page: Page): Promise<void> {
   const message = page.getByTestId("assistant-message").last();
-  await expect(message).toHaveText("Bold text stays bold and Paseo docs. Done.");
+  await expect(message.locator(".enrm-text > p")).toHaveText([
+    /^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:$/,
+    "Bold text stays bold and Paseo docs. Done.",
+  ]);
   await expect(
     message.getByRole("link", { name: "Paseo docs" }).and(message.locator("a")),
   ).toHaveAttribute("href", "https://example.com/documentation");

@@ -1093,7 +1093,7 @@ function probeWebSocketConnection(
   });
 }
 
-test("startup closes stale active records before serving status without resuming sessions", async () => {
+test("startup closes stale non-Codex active records before serving status without resuming sessions", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paseo-stale-status-"));
   const logger = pino({ level: "silent" });
   const storagePath = path.join(root, ".paseo", "agents");
@@ -1121,11 +1121,13 @@ test("startup closes stale active records before serving status without resuming
       updatedAt: timestamp,
     }),
   );
+  // Interrupted Codex runs deliberately recover without a GUI; that exception is
+  // covered by bootstrap-crash-recovery.test.ts. Other providers remain lazy.
   const records: StoredAgentRecord[] = ["running", "initializing", "idle", "error", "closed"].map(
     (status, index) => ({
       id: randomUUID(),
       workspaceId: "existing-workspace",
-      provider: "codex",
+      provider: "claude",
       cwd: root,
       createdAt: "2025-01-01T00:00:00.000Z",
       updatedAt: "2025-01-02T00:00:00.000Z",
@@ -1133,8 +1135,8 @@ test("startup closes stale active records before serving status without resuming
       lastStatus: status as StoredAgentRecord["lastStatus"],
       title: `Keep ${status}`,
       labels: { "paseo.parent-agent-id": "parent", custom: "keep" },
-      persistence: { provider: "codex", sessionId: `session-${index}` },
-      config: { modeId: "full-access" },
+      persistence: { provider: "claude", sessionId: `session-${index}` },
+      config: { modeId: "bypassPermissions" },
       requiresAttention: true,
       attentionReason: "permission",
       attentionTimestamp: "2025-01-02T00:00:00.000Z",

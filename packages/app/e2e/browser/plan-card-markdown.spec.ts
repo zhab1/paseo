@@ -37,8 +37,11 @@ test("chat and file preview share the library renderer and resolve file links", 
   await withSharedMarkdownFiles(page, async () => {
     const message = page.getByTestId("assistant-message");
     await expect(message).toHaveCount(1);
-    await expect(message.locator(".enrm-text > p").first()).toContainText("First paragraph.");
-    await expect(message.locator(".enrm-text > p").nth(1)).toContainText("Second paragraph.");
+    await expect(message.locator(".enrm-text > p").first()).toHaveText(
+      /^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:$/,
+    );
+    await expect(message.locator(".enrm-text > p").nth(1)).toContainText("First paragraph.");
+    await expect(message.locator(".enrm-text > p").nth(2)).toContainText("Second paragraph.");
     await expect(message.locator("blockquote")).toContainText("A quote");
     await expect(message.getByRole("table")).toContainText("42");
     await expect(message.getByRole("cell").nth(0)).toHaveText("Answer");
@@ -164,7 +167,7 @@ test("linked inline code keeps code typography and wraps long paths", async ({
 async function measureInlineCode(message: Locator) {
   return message.evaluate((element) => {
     // Constrain the paragraph to exercise an inline path at a line boundary.
-    const paragraph = element.querySelector("p")!;
+    const paragraph = element.querySelector<HTMLParagraphElement>("p:has(code)")!;
     paragraph.style.width = "300px";
     const codes = Array.from(paragraph.querySelectorAll("code"), (code) => {
       const style = getComputedStyle(code);

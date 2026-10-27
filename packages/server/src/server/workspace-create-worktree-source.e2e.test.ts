@@ -51,7 +51,7 @@ test("refresh restores an archived worktree and publishes selected-agent recover
   onTestFinished(async () => {
     await client.close();
     await daemon.close();
-    rmSync(tempRoot, { recursive: true, force: true });
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   await client.connect();
   const created = await client.createWorkspace({
