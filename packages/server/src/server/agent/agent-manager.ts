@@ -1,4 +1,6 @@
 import type { TimelineCache } from "./timeline-cache.js";
+import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
+import { ensureAgentLoaded } from "./agent-loading.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
@@ -82,7 +84,7 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { resolveRewindCapability, type RewindMode } from "./rewind/rewind.js";
-import { projectAgentMessage } from "./agent-messages/index.js";
+import { parseAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
@@ -330,6 +332,7 @@ export interface AgentManagerOptions {
   registry?: AgentStorage;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
+  timelineStore?: InMemoryAgentTimelineStore;
   durableTimelineStore?: AgentTimelineStore;
   timelineCache?: TimelineCache;
   terminalManager?: TerminalManager | null;
@@ -673,13 +676,13 @@ function buildImportedTimelineRows(
 ): AgentTimelineRow[] {
   const rows: AgentTimelineRow[] = [];
   for (const entry of entries) {
-    const item = projectAgentMessage(entry.item);
-    if (!item) continue;
-    rows.push({
-      seq: startSeq + rows.length,
-      timestamp: entry.timestamp ?? new Date().toISOString(),
-      item: limitAgentTimelineItemContent(item),
-    });
+    for (const item of projectAgentMessages(entry.item)) {
+      rows.push({
+        seq: startSeq + rows.length,
+        timestamp: entry.timestamp ?? new Date().toISOString(),
+        item: limitAgentTimelineItemContent(item),
+      });
+    }
   }
   return rows;
 }
@@ -773,6 +776,8 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
+  private readonly runtimeCleanupIdentities = new WeakMap<AgentSession, object>();
+  private readonly collectingRuntimes = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -813,7 +818,8 @@ export class AgentManager {
     this.timelineStore = new InMemoryAgentTimelineStore(options.timelineCache);
     this.providerSubagents = new ProviderSubagentStore(options.timelineCache);
     this.pluginLifecycle = options.pluginLifecycle;
-    this.idFactory = options?.idFactory ?? (() => randomUUID());
+    this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
+    this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
@@ -1387,8 +1393,9 @@ export class AgentManager {
         hasOlder: () => agent.session?.hasOlderHistory?.() ?? false,
         loadOlder: async () =>
           ((await agent.session?.loadOlderHistory?.()) ?? []).flatMap((entry) => {
-            const item = projectAgentMessage(entry.item);
-            return item ? [{ ...entry, item }] : [];
+            return projectAgentMessages(entry.item).map((item) =>
+              Object.assign({}, entry, { item }),
+            );
           }),
       });
     });
@@ -1947,6 +1954,64 @@ export class AgentManager {
     });
   }
 
+  /** Capture runtime capabilities without handing lifecycle ownership to the collector. */
+  getRuntimeCleanupCandidates(): RuntimeCleanupCandidate[] {
+    if (!this.registry) return [];
+    const candidates: RuntimeCleanupCandidate[] = [];
+    for (const agent of this.agents.values()) {
+      const updatedAt = agent.updatedAt;
+      let identity = this.runtimeCleanupIdentities.get(agent.session);
+      if (!identity) {
+        identity = Object.freeze({});
+        this.runtimeCleanupIdentities.set(agent.session, identity);
+      }
+      const isEligible = () =>
+        this.agents.get(agent.id) === agent &&
+        agent.updatedAt === updatedAt &&
+        this.runtimeHasNoPendingWork(agent);
+      candidates.push({
+        identity,
+        agentId: agent.id,
+        parentAgentId: getParentAgentIdFromLabels(agent.labels) ?? undefined,
+        provider: agent.provider,
+        sessionId: agent.persistence?.sessionId ?? null,
+        lastActivityAt: updatedAt.getTime(),
+        isEligible,
+        canStopRuntime: agent.session.canStopRuntime?.bind(agent.session),
+        closeIfEligible: async (revalidate) => {
+          if (!agent.persistence?.sessionId) return false;
+          // Block prompt admission before entering the close lane. A skipped close also
+          // releases this barrier, so the waiting prompt keeps the existing runtime.
+          this.collectingRuntimes.add(agent.id);
+          try {
+            return await this.runLifecycleMutation(agent.id, () =>
+              this.closeAgentRuntime(agent.id, () => isEligible() && revalidate()),
+            );
+          } finally {
+            this.collectingRuntimes.delete(agent.id);
+          }
+        },
+      });
+    }
+    return candidates;
+  }
+
+  private runtimeHasNoPendingWork(agent: LiveManagedAgent): boolean {
+    return (
+      agent.lifecycle === "idle" &&
+      !agent.internal &&
+      agent.activeForegroundTurnId === null &&
+      !this.runs.hasRun(agent.id) &&
+      !agent.pendingReplacement &&
+      agent.pendingPermissions.size === 0 &&
+      agent.inFlightPermissionResponses.size === 0 &&
+      (this.collectingRuntimes.has(agent.id) || !this.lifecycleMutationTails.has(agent.id)) &&
+      !this.foregroundMutationTails.has(agent.id) &&
+      !this.sessionEventTails.has(agent.id) &&
+      !this.providerSubagents.list(agent.id).some((child) => child.status === "running")
+    );
+  }
+
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
@@ -1967,7 +2032,7 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private async closeAgentRuntime(agentId: string, canClose?: () => boolean): Promise<boolean> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1982,6 +2047,7 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     await this.drainSessionEvents(agentId);
+    if (canClose && !canClose()) return false;
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
     await agent.session.close();
@@ -2007,6 +2073,7 @@ export class AgentManager {
     if (persistError !== undefined) {
       throw persistError;
     }
+    return true;
   }
 
   private cancelRunningProviderSubagents(parentAgentId: string): void {
@@ -2683,13 +2750,27 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<boolean> {
+    if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
+      await this.waitForAgentClose(agentId);
+      await ensureAgentLoaded(agentId, {
+        agentManager: this,
+        agentStorage: this.requireRegistry(),
+        logger: this.logger,
+      });
+    }
     const agent = this.requireSessionAgent(agentId);
-    const handler = agent.session.tryHandleOutOfBand?.(prompt);
+    // Providers parse slash commands from the raw text, so a command another agent sent
+    // must reach them without its sender envelope.
+    const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
+    const handler = agent.session.tryHandleOutOfBand?.(
+      agentMessage?.source ? agentMessage.text : prompt,
+    );
     if (!handler) {
       return false;
     }
     this.quotaStoppedByUser.add(agentId);
     if (this.quotaContinuationHooks) await this.quotaContinuationHooks.cancel(agentId);
+    this.touchUpdatedAt(agent);
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
       this.emitState(agent);
@@ -2709,7 +2790,7 @@ export class AgentManager {
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
-    void (async () => {
+    void this.runForegroundMutation(agentId, async () => {
       try {
         await handler.run({ emit: dispatch });
       } catch (error) {
@@ -2720,7 +2801,7 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
-    })();
+    });
     return true;
   }
 
@@ -2839,11 +2920,27 @@ export class AgentManager {
     }
   }
 
+  private async *streamAfterRuntimeCollection(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): AsyncGenerator<AgentStreamEvent> {
+    await this.waitForAgentClose(agentId);
+    await ensureAgentLoaded(agentId, {
+      agentManager: this,
+      agentStorage: this.requireRegistry(),
+      logger: this.logger,
+    });
+    yield* this.streamAgent(agentId, prompt, options);
+  }
+
   streamAgent(
     agentId: string,
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
+    if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
+      return this.streamAfterRuntimeCollection(agentId, prompt, options);
     const existingAgent = this.requireSessionAgent(agentId);
     this.logger.trace(
       {
@@ -3602,11 +3699,9 @@ export class AgentManager {
   }
 
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
-    const agent = this.agents.get(agentId);
-    if (!agent) {
-      return null;
+    if (!this.timelineStore.has(agentId)) {
+      return (await this.durableTimelineStore?.getLastAssistantMessage(agentId)) ?? null;
     }
-
     return await this.getLastAssistantMessageFromStores(agentId);
   }
 
@@ -3913,7 +4008,6 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
-      this.subscribeToSession(managed);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       if (session.initialTimeline?.length) {
@@ -3949,6 +4043,9 @@ export class AgentManager {
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
+      this.subscribeToSession(managed);
+      await this.drainSessionEvents(managed.id);
+      this.assertAgentRegistrationActive(managed);
       return { ...managed };
     } catch (error) {
       if (!registered) {
@@ -4444,9 +4541,9 @@ export class AgentManager {
     for await (const rawEvent of agent.session.streamHistory()) {
       const event = limitAgentStreamEventContent(rawEvent);
       if (event.type === "timeline") {
-        const item = projectAgentMessage(event.item);
-        if (!item) continue;
-        historyEvents.push({ ...event, item });
+        for (const item of projectAgentMessages(event.item)) {
+          historyEvents.push({ ...event, item });
+        }
       } else if (event.type === "provider_subagent") {
         providerSubagentEvents.push(event);
       }
@@ -4514,9 +4611,9 @@ export class AgentManager {
         if (event.type !== "timeline") {
           continue;
         }
-        const item = projectAgentMessage(event.item);
-        if (!item) continue;
-        historyEvents.push({ ...event, item });
+        for (const item of projectAgentMessages(event.item)) {
+          historyEvents.push({ ...event, item });
+        }
       }
     } catch (error) {
       this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
@@ -4960,42 +5057,32 @@ export class AgentManager {
   }): Promise<void> {
     const { agent, event, options, flags } = params;
 
-    const item = projectAgentMessage(event.item);
-    if (!item) {
-      flags.shouldDispatchEvent = false;
-      flags.shouldNotifyWaiters = false;
-      return;
-    }
-
-    event.item = item;
-    if (
-      event.item.type === "user_message" &&
-      event.item.clientMessageId &&
-      this.reconcileSubmittedPromptEcho(agent, event.item, event.turnId)
-    ) {
-      flags.shouldDispatchEvent = false;
-      flags.shouldNotifyWaiters = false;
-      return;
-    }
-
-    if (options?.fromHistory) {
-      this.recordTimeline(
-        agent.id,
-        event.item,
-        event.timestamp ? { timestamp: event.timestamp } : undefined,
-      );
-      flags.shouldDispatchEvent = false;
-      flags.shouldNotifyWaiters = false;
-      return;
-    }
-
-    this.recordAndDispatchTimelineItem(agent.id, event.item, event.provider, event.turnId);
-    if (event.item.type === "user_message") {
-      agent.lastUserMessageAt = new Date();
-      this.emitState(agent);
-    }
     flags.shouldDispatchEvent = false;
-    flags.shouldNotifyWaiters = true;
+    flags.shouldNotifyWaiters = false;
+    for (const item of projectAgentMessages(event.item)) {
+      if (
+        item.type === "user_message" &&
+        item.clientMessageId &&
+        this.reconcileSubmittedPromptEcho(agent, item, event.turnId)
+      )
+        continue;
+
+      if (options?.fromHistory) {
+        this.recordTimeline(
+          agent.id,
+          item,
+          event.timestamp ? { timestamp: event.timestamp } : undefined,
+        );
+        continue;
+      }
+
+      this.recordAndDispatchTimelineItem(agent.id, item, event.provider, event.turnId);
+      if (item.type === "user_message") {
+        agent.lastUserMessageAt = new Date();
+        this.emitState(agent);
+      }
+      flags.shouldNotifyWaiters = true;
+    }
   }
 
   private onStreamTurnCompleted(params: {
@@ -5253,16 +5340,17 @@ export class AgentManager {
     outcome: "accepted" | "rejected",
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
-    const item = projectAgentMessage({
+    const items = projectAgentMessages({
       type: "user_message",
       text: submittedPromptText(prompt),
       clientMessageId,
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     });
-    if (!item) return;
-    // Human attempts stay in history on rejection; delivery notifications require acceptance.
-    if (outcome === "rejected" && item.type !== "user_message") return;
-    this.recordSubmittedPromptItem(agent, item, options);
+    for (const item of items) {
+      // Human attempts stay in history on rejection; delivery notifications require acceptance.
+      if (outcome === "rejected" && item.type !== "user_message") continue;
+      this.recordSubmittedPromptItem(agent, item, options);
+    }
   }
 
   private recordSubmittedPromptItem(
@@ -5603,16 +5691,6 @@ export class AgentManager {
         this.pluginLifecycle,
         describeHookAgent({ ...agent, title: agent.config.title }),
         event,
-        () => {
-          const current = this.timelineStore.fetch(agentId, { limit: 1 });
-          return this.timelineStore.getSnapshot(agentId, () =>
-            this.fetchTimelinePage(agentId, {
-              direction: "before",
-              cursor: { epoch: current.epoch, seq: current.window.nextSeq },
-              limit: 0,
-            }),
-          );
-        },
       );
     }
   }

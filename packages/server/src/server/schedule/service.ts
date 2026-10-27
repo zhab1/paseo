@@ -39,6 +39,20 @@ export class ScheduleTargetGoneError extends Error {
   }
 }
 
+export class ScheduleNotFoundError extends Error {
+  constructor(id: string) {
+    super(`Schedule not found: ${id}`);
+    this.name = "ScheduleNotFoundError";
+  }
+}
+
+export class ScheduleStateConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduleStateConflictError";
+  }
+}
+
 function advanceNextRunAtPast(
   cadence: StoredSchedule["cadence"],
   nextRunAt: Date,
@@ -159,7 +173,7 @@ function shouldCompleteSchedule(schedule: StoredSchedule, now: Date): boolean {
 
 function requireSchedule(schedule: StoredSchedule | null, id: string): StoredSchedule {
   if (!schedule) {
-    throw new Error(`Schedule not found: ${id}`);
+    throw new ScheduleNotFoundError(id);
   }
   return schedule;
 }
@@ -589,10 +603,7 @@ export class ScheduleService {
 
   async inspect(id: string): Promise<StoredSchedule> {
     const schedule = await this.store.get(id);
-    if (!schedule) {
-      throw new Error(`Schedule not found: ${id}`);
-    }
-    return schedule;
+    return requireSchedule(schedule, id);
   }
 
   async logs(id: string): Promise<ScheduleRun[]> {
@@ -604,7 +615,7 @@ export class ScheduleService {
     const paused = await this.store.update(id, (schedule) => {
       assertPublicSchedule(schedule);
       if (schedule.status === "completed") {
-        throw new Error(`Schedule ${id} is already completed`);
+        throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
       }
       if (schedule.status === "paused") {
         return schedule;
@@ -625,7 +636,7 @@ export class ScheduleService {
     const resumed = await this.store.update(id, (schedule) => {
       assertPublicSchedule(schedule);
       if (schedule.status === "completed") {
-        throw new Error(`Schedule ${id} is already completed`);
+        throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
       }
       if (schedule.status === "active") {
         return schedule;
@@ -750,10 +761,10 @@ export class ScheduleService {
     const schedule = await this.inspect(id);
     assertPublicSchedule(schedule);
     if (schedule.status === "completed") {
-      throw new Error(`Schedule ${id} is already completed`);
+      throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
     }
     if (this.runningScheduleIds.has(id)) {
-      throw new Error(`Schedule ${id} is already running`);
+      throw new ScheduleStateConflictError(`Schedule ${id} is already running`);
     }
     await this.runSchedule(schedule, this.now(), { manual: true });
     return this.inspect(id);

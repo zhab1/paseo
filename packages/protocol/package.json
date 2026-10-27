@@ -1,6 +1,6 @@
 {
   "name": "@getpaseo/protocol",
-  "version": "0.11.2",
+  "version": "0.13.2",
   "description": "Paseo shared protocol schemas and wire types",
   "files": [
     "dist",
@@ -11,12 +11,15 @@
   "exports": {
     "./validation/ws-outbound": {
       "types": "./dist/validation/ws-outbound.d.ts",
-      "node": "./dist/validation/ws-outbound.node.js",
       "default": "./dist/validation/ws-outbound.js"
     },
     "./*": {
       "types": "./dist/*.d.ts",
       "default": "./dist/*.js"
+    },
+    "./addresses": {
+      "types": "./dist/addresses.d.ts",
+      "default": "./dist/addresses.js"
     }
   },
   "publishConfig": {

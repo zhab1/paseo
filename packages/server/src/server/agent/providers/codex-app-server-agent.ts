@@ -3628,6 +3628,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private client: CodexAppServerClient | null = null;
   private threadRollbackAvailable = true;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
+  private startupEvents: AgentStreamEvent[] | null = null;
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
@@ -3640,9 +3641,6 @@ export class CodexAppServerAgentSession implements AgentSession {
   private loadingPersistedHistory = false;
   private historyRestored = false;
   private readonly olderHistoryCursors = new Map<string, CodexHistoryCursor>();
-  private idleReleaseTimer: ReturnType<typeof setTimeout> | null = null;
-  private idleReleasePromise: Promise<void> | null = null;
-  private idleReleaseError: unknown;
   private persistedProviderSubagentEvents: AgentStreamEvent[] = [];
   private readonly deferredSubagentTurns: Map<string, string>;
   private pendingPermissions = new Map<string, AgentPermissionRequest>();
@@ -3759,14 +3757,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.planModeEnabled = true;
     }
 
+    this.restoreResumeState();
+  }
+
+  private restoreResumeState(): void {
     if (this.resumeHandle?.sessionId) {
       this.currentThreadId = this.resumeHandle.sessionId;
       this.historyPending = this.loadHistoryOnResume;
+      // Resuming can start a goal before the caller receives the session.
+      if (this.initialResumePurpose === "interactive") this.startupEvents = [];
     }
-    this.restoreHistoryState();
-  }
-
-  private restoreHistoryState(): void {
     // Config-only reloads keep the existing timeline and must continue at its cursor.
     // A fresh history load deliberately ignores this state and starts at the latest page.
     if (!this.loadHistoryOnResume) {
@@ -3801,11 +3801,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.closed) {
       throw this.createClosedError();
     }
-    if (this.idleReleasePromise) await this.idleReleasePromise;
-    if (this.closed) throw this.createClosedError();
-    if (this.idleReleaseError) throw this.idleReleaseError;
     if (this.connectionState !== "disconnected") {
-      this.armIdleRelease();
       return;
     }
     if (this.connectionPromise) {
@@ -3824,7 +3820,6 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (this.connectionPromise === connectionPromise) {
         this.connectionPromise = null;
       }
-      this.armIdleRelease();
     }
     if (this.closed) {
       throw this.createClosedError();
@@ -3848,11 +3843,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.handleUnexpectedTermination(error);
     });
     client.setNotificationHandler((method, params) => {
-      try {
-        this.handleNotification(method, params);
-      } finally {
-        this.armIdleRelease();
-      }
+      this.handleNotification(method, params);
     });
     this.registerRequestHandlers();
 
@@ -4263,9 +4254,6 @@ export class CodexAppServerAgentSession implements AgentSession {
     read: (client: CodexAppServerClientLike) => Promise<T>,
   ): Promise<T> {
     if (this.closed) throw this.createClosedError();
-    if (this.idleReleasePromise) await this.idleReleasePromise;
-    if (this.closed) throw this.createClosedError();
-    if (this.idleReleaseError) throw this.idleReleaseError;
     if (this.client && this.connectionState === "connected") return read(this.client);
     const child = await this.spawnAppServer();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
@@ -5060,6 +5048,9 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);
+    const startupEvents = this.startupEvents;
+    this.startupEvents = null;
+    for (const event of startupEvents ?? []) this.notifySubscribers(event);
     return () => {
       this.subscribers.delete(callback);
     };
@@ -5091,7 +5082,6 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
-    if (this.idleReleasePromise) await this.idleReleasePromise;
     // Settings are local after initialization; metadata reads must not wake an idle runtime.
     if (
       this.connectionState === "disconnected" &&
@@ -5681,15 +5671,21 @@ export class CodexAppServerAgentSession implements AgentSession {
     return actualTurnId;
   }
 
+  async canStopRuntime(): Promise<boolean> {
+    const client = this.client;
+    if (!client || !this.currentThreadId || !this.canReleaseIdleRuntime()) return false;
+    if (!(await this.nativeRuntimeIsIdle(client))) return false;
+    // A prompt, permission or notification can arrive during the asynchronous checks.
+    return this.client === client && this.canReleaseIdleRuntime();
+  }
+
   async close(): Promise<void> {
     this.closed = true;
-    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
-    this.idleReleaseTimer = null;
-    await this.idleReleasePromise;
     this.pendingInterruptRollover?.(null);
     this.clearPendingPermissions();
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.subscribers.clear();
+    this.startupEvents = null;
     this.activeForegroundTurnId = null;
     this.activeClientMessageId = null;
     this.pendingForegroundTurnIdentification?.resolve(null);
@@ -5734,75 +5730,36 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.closed ||
       this.pendingPermissions.size ||
       this.asyncQuestions.pending().length ||
-      this.client?.hasPendingRequests ||
+      this.client?.hasPendingRequests() ||
+      this.pendingPermissionHandlers.size ||
+      this.pendingSubAgentNotificationsByThreadId.size ||
       [...this.subAgentCallsByCallId.values()].some((call) => call.toolCall.status === "running")
     );
   }
 
   private async nativeRuntimeIsIdle(client: CodexAppServerClient): Promise<boolean> {
-    try {
-      // Children outside the display window can still be doing native work.
-      const loaded = toObjectRecord(await client.request("thread/loaded/list", {}, 5_000));
-      if (!Array.isArray(loaded?.data)) return false;
-      for (const threadId of loaded.data) {
-        const response = toObjectRecord(
-          await client.request("thread/read", { threadId, includeTurns: false }, 5_000),
-        );
-        const thread = toObjectRecord(response?.thread);
-        if (toObjectRecord(thread?.status)?.type !== "idle") return false;
-        const terminals = toObjectRecord(
+    // Children outside the display window can still be doing native work.
+    const loaded = z
+      .object({ data: z.array(z.string()) })
+      .parse(await client.request("thread/loaded/list", {}, 5_000));
+    for (const threadId of new Set([this.currentThreadId, ...loaded.data])) {
+      const response = toObjectRecord(
+        await client.request("thread/read", { threadId, includeTurns: false }, 5_000),
+      );
+      const thread = toObjectRecord(response?.thread);
+      if (toObjectRecord(thread?.status)?.type !== "idle") return false;
+      const terminals = z
+        .object({ data: z.array(z.unknown()), nextCursor: z.string().nullable() })
+        .parse(
           await client.request("thread/backgroundTerminals/list", { threadId, limit: 1 }, 5_000),
         );
-        if (!Array.isArray(terminals?.data) || terminals.data.length || terminals.nextCursor)
-          return false;
-        if (this.goalsEnabled) {
-          const goal = toObjectRecord(await client.request("thread/goal/get", { threadId }, 5_000));
-          if (toObjectRecord(goal?.goal)?.status === "active") return false;
-        }
+      if (terminals.data.length || terminals.nextCursor !== null) return false;
+      if (this.goalsEnabled) {
+        const goal = toObjectRecord(await client.request("thread/goal/get", { threadId }, 5_000));
+        if (toObjectRecord(goal?.goal)?.status === "active") return false;
       }
-    } catch (error) {
-      this.logger.warn({ err: error }, "Could not confirm native runtime is idle");
-      return false;
     }
     return true;
-  }
-
-  private async releaseIdleRuntime(): Promise<void> {
-    const client = this.client;
-    if (!client || !this.canReleaseIdleRuntime()) return;
-    if (!(await this.nativeRuntimeIsIdle(client))) return;
-    // A prompt or permission can arrive during the native checks.
-    if (!this.canReleaseIdleRuntime()) return;
-    try {
-      await this.disposeClient();
-    } catch (error) {
-      // A failed shutdown may still own the native writer. Do not spawn another.
-      this.idleReleaseError = error;
-      throw error;
-    }
-    this.logger.info({ threadId: this.currentThreadId }, "Released idle Codex runtime");
-    for (const call of this.subAgentCallsByCallId.values()) {
-      call.childItems.clear();
-      call.childItemOrder = [];
-      call.pendingCommandOutputDeltas.clear();
-      call.pendingFileChangeOutputDeltas.clear();
-    }
-  }
-
-  private armIdleRelease(): void {
-    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
-    this.idleReleaseTimer = null;
-    if (this.closed || this.connectionState !== "connected") return;
-    this.idleReleaseTimer = setTimeout(() => {
-      this.idleReleaseTimer = null;
-      this.idleReleasePromise = this.releaseIdleRuntime()
-        .catch((error) => this.logger.warn({ err: error }, "Failed to release idle Codex runtime"))
-        .finally(() => {
-          this.idleReleasePromise = null;
-          this.armIdleRelease();
-        });
-    }, 60_000);
-    this.idleReleaseTimer.unref();
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {
@@ -6117,6 +6074,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   private notifySubscribers(event: AgentStreamEvent): void {
     const turnId = getAgentStreamEventTurnId(event) ?? this.activeForegroundTurnId;
     const tagged = turnId ? { ...event, turnId } : event;
+    if (this.startupEvents) {
+      this.startupEvents.push(tagged);
+      return;
+    }
     this.logger.trace(
       {
         agentId: this.agentId,

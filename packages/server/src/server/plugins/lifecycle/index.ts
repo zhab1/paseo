@@ -1,4 +1,4 @@
-import type { AgentStreamEvent, AgentTimelineItem } from "../../agent/agent-sdk-types.js";
+import type { AgentStreamEvent } from "../../agent/agent-sdk-types.js";
 import { z } from "zod";
 import { CreateAgentRequestMessageSchema } from "@getpaseo/protocol/messages";
 import type {
@@ -47,7 +47,7 @@ const beforeSchemas = {
 export interface PluginLifecycle {
   emit<Name extends keyof PluginLifecycleEvents>(
     name: Name,
-    event: PluginLifecycleEvents[Name] | (() => Promise<PluginLifecycleEvents[Name]>),
+    event: PluginLifecycleEvents[Name],
   ): void;
   before<Name extends keyof PluginBeforeRequests>(
     name: Name,
@@ -94,31 +94,30 @@ export function publishAgentStream(
   lifecycle: PluginLifecycle,
   agent: PluginHookAgent,
   event: AgentStreamEvent,
-  getTimeline: () => Promise<readonly AgentTimelineItem[]>,
 ): void {
   if (event.type === "turn_started") {
     lifecycle.emit("agent.turn_started", { agent, turnId: event.turnId ?? null });
   } else if (event.type === "turn_completed") {
-    lifecycle.emit("agent.turn_ended", async () => ({
+    lifecycle.emit("agent.turn_ended", {
       agent,
       turnId: event.turnId ?? null,
-      timeline: await getTimeline(),
+      timeline: [],
       outcome: { kind: "completed" },
-    }));
+    });
   } else if (event.type === "turn_failed") {
-    lifecycle.emit("agent.turn_ended", async () => ({
+    lifecycle.emit("agent.turn_ended", {
       agent,
       turnId: event.turnId ?? null,
-      timeline: await getTimeline(),
+      timeline: [],
       outcome: { kind: "failed", error: { message: event.error, code: event.code } },
-    }));
+    });
   } else if (event.type === "turn_canceled") {
-    lifecycle.emit("agent.turn_ended", async () => ({
+    lifecycle.emit("agent.turn_ended", {
       agent,
       turnId: event.turnId ?? null,
-      timeline: await getTimeline(),
+      timeline: [],
       outcome: { kind: "canceled", reason: event.reason },
-    }));
+    });
   } else if (event.type === "permission_requested") {
     lifecycle.emit("agent.permission_requested", { agent, request: event.request });
   } else if (event.type === "permission_resolved") {

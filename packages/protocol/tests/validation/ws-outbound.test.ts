@@ -4,8 +4,10 @@ import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
+import type { z } from "zod";
 import { describe, expect, it } from "vitest";
-import { WSOutboundMessageSchema as GeneratedWSOutboundMessageSchema } from "../../src/generated/validation/ws-outbound.aot.js";
+import { WSOutboundMessageSchema } from "../../src/messages.js";
+import { validateWSOutboundMessage } from "../../src/validation/ws-outbound.js";
 
 interface GeneratedSchema {
   safeParse(input: unknown): { success: boolean; data?: unknown };
@@ -64,18 +66,16 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 
 describe("WS outbound zod-aot validation", () => {
   it.runIf(process.platform === "linux")(
-    "bounds Node validation memory for repeated small messages",
+    "bounds shipped Node validation memory for repeated small messages",
     () => {
       const result = execFileSync(
         process.execPath,
         [
           "--expose-gc",
-          "--import",
-          "tsx",
           "--input-type=module",
           "--eval",
           `
-        import { validateWSOutboundMessage } from './src/validation/ws-outbound.node.ts';
+        const { validateWSOutboundMessage } = await import('@getpaseo/protocol/validation/ws-outbound');
         for (let i = 0; i < 1000; i++) {
           if (!validateWSOutboundMessage({ type: 'pong' }).success) throw new Error('valid frame rejected');
         }
@@ -86,7 +86,7 @@ describe("WS outbound zod-aot validation", () => {
         ],
         { cwd: protocolRoot, encoding: "utf8", timeout: 30_000 },
       );
-      expect(JSON.parse(result).peakMiB).toBeLessThan(256);
+      expect(JSON.parse(result).peakMiB, result).toBeLessThan(256);
     },
   );
 
@@ -160,10 +160,8 @@ const SourceSchema = z.object({
   });
 
   it("accepts a minimal valid envelope and rejects a corrupted envelope", () => {
-    expect(GeneratedWSOutboundMessageSchema.safeParse({ type: "pong" }).success).toBe(true);
-    expect(GeneratedWSOutboundMessageSchema.safeParse({ type: "not_a_message" }).success).toBe(
-      false,
-    );
+    expect(validateWSOutboundMessage({ type: "pong" }).success).toBe(true);
+    expect(validateWSOutboundMessage({ type: "not_a_message" }).success).toBe(false);
   });
 
   it("accepts project config responses with and without setup commit status", () => {
@@ -186,11 +184,10 @@ const SourceSchema = z.object({
       },
     });
 
-    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope(payload)).success).toBe(true);
+    expect(validateWSOutboundMessage(envelope(payload)).success).toBe(true);
     expect(
-      GeneratedWSOutboundMessageSchema.safeParse(
-        envelope({ ...payload, hasUncommittedWorktreeSetupChanges: true }),
-      ).success,
+      validateWSOutboundMessage(envelope({ ...payload, hasUncommittedWorktreeSetupChanges: true }))
+        .success,
     ).toBe(true);
   });
 
@@ -224,7 +221,7 @@ const SourceSchema = z.object({
       },
     };
 
-    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+    expect(validateWSOutboundMessage(envelope)).toEqual({
       success: true,
       data: envelope,
     });
@@ -283,7 +280,7 @@ const SourceSchema = z.object({
   ])("preserves workspaceId in a $name", ({ message }) => {
     const envelope = { type: "session", message };
 
-    expect(GeneratedWSOutboundMessageSchema.safeParse(envelope)).toEqual({
+    expect(validateWSOutboundMessage(envelope)).toEqual({
       success: true,
       data: envelope,
     });
@@ -291,11 +288,11 @@ const SourceSchema = z.object({
 
   it("emits runtime imports with .js extensions", async () => {
     const generated = await readFile(generatedWSOutboundPath, "utf8");
-    expect(generated).toContain('from "../../validation/ws-outbound-schema-metadata.js"');
+    expect(generated).toContain('from "./ws-outbound-schema-metadata.js"');
   });
 
   it("accepts a forge.search.response envelope", () => {
-    const result = GeneratedWSOutboundMessageSchema.safeParse({
+    const result = validateWSOutboundMessage({
       type: "session",
       message: {
         type: "forge.search.response",
@@ -321,7 +318,7 @@ const SourceSchema = z.object({
   });
 
   it("accepts a legacy github_search_response envelope", () => {
-    const result = GeneratedWSOutboundMessageSchema.safeParse({
+    const result = validateWSOutboundMessage({
       type: "session",
       message: {
         type: "github_search_response",
@@ -346,5 +343,87 @@ const SourceSchema = z.object({
       },
     });
     expect(result.success).toBe(true);
+  });
+
+  it("keeps each generated validator function small", async () => {
+    // A single function for the whole protocol made V8's Maglev tier spend ~800 MB and seconds compiling it.
+    const generated = await readFile(generatedWSOutboundPath, "utf8");
+    const starts = [...generated.matchAll(/function safeParse_\w+\(/g)].map((match) => match.index);
+    const sizes = starts.map((start, index) => (starts[index + 1] ?? generated.length) - start);
+
+    expect(Math.max(...sizes)).toBeLessThan(1_000_000);
+    expect(sizes.length).toBeGreaterThan(1);
+  });
+
+  it("keeps nested union issue paths rooted at the envelope", () => {
+    // Generated validators root branch issues at the input; runtime Zod reports them relative to the union.
+    const envelope = {
+      type: "session",
+      message: {
+        type: "read_project_config_response",
+        payload: { repoRoot: "/repo", ok: true, config: {}, revision: { mtimeMs: 1, size: 1 } },
+      },
+    };
+    const paths = (issues: z.core.$ZodIssue[]): PropertyKey[][] =>
+      issues.flatMap((issue) => [
+        issue.path,
+        ...(issue.code === "invalid_union" ? paths(issue.errors.flat()) : []),
+      ]);
+
+    const result = validateWSOutboundMessage(envelope);
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(paths(result.error.issues)).toEqual([
+      ["message", "payload"],
+      ["message", "payload", "requestId"],
+      ["message", "payload", "requestId"],
+      ["message", "payload", "ok"],
+      ["message", "payload", "error"],
+    ]);
+  });
+
+  it("applies defaults from the matching session message schema", () => {
+    const envelope = {
+      type: "session",
+      message: {
+        type: "agent_update",
+        payload: {
+          kind: "upsert",
+          agent: {
+            id: "agent-1",
+            provider: "claude",
+            cwd: "/repo",
+            model: "model",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            lastUserMessageAt: "2026-01-01T00:00:00.000Z",
+            status: "initializing",
+            capabilities: {
+              supportsStreaming: false,
+              supportsSessionPersistence: false,
+              supportsDynamicModes: false,
+              supportsMcpServers: false,
+              supportsReasoningStream: false,
+              supportsToolInvocations: false,
+            },
+            currentModeId: "default",
+            availableModes: [],
+            pendingPermissions: [],
+            persistence: { provider: "claude", sessionId: "session-1" },
+            title: "Agent",
+          },
+        },
+      },
+    };
+
+    const result = validateWSOutboundMessage(envelope);
+    const expected = WSOutboundMessageSchema.safeParse(envelope);
+
+    expect(expected.success).toBe(true);
+    expect(result).toEqual(expected);
+    expect(result.success && result.data).toMatchObject({
+      message: { payload: { agent: { capabilities: { supportsRewindConversation: false } } } },
+    });
   });
 });

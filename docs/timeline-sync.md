@@ -43,11 +43,12 @@ minimum sequence without changing the live tail.
 Config-only session reloads preserve native paging cursors and rewind targets along with the cached
 timeline; a fresh history reload starts a new epoch from the latest native page.
 
-The Codex adapter releases its native process after 60 seconds idle. It verifies loaded root and
-child thread status, background terminals and, when enabled, active goals, and preserves runtimes
-with active turns, pending requests or approvals. An unavailable native safety check keeps the
-runtime attached. The next turn reconnects the same saved thread without replaying
-the already cached history. A failed idle shutdown blocks a second writer instead of spawning one.
+The shared idle collector releases Codex runtimes after 60 seconds idle, checked once a minute.
+The adapter verifies loaded root and child thread status, background terminals and, when enabled,
+active goals, and vetoes collection with active turns, pending requests or approvals. The collector
+also protects pending finish subscriptions and deliveries. An unavailable native safety check keeps
+the runtime attached. The next turn resumes the saved thread through the normal bounded history
+path. A failed idle shutdown blocks a second writer instead of spawning one.
 Stop recovery identifies the active turn from the latest native turn metadata, without fetching
 the full transcript.
 
@@ -56,13 +57,9 @@ containing both previously seen and new text is a full replacement and keeps its
 only a genuinely separate earlier fragment suppresses a repeated stamp. This does not change
 the official client's Markdown block rendering or pagination protocol.
 
-The existing Codex connection-to-subscription handoff remains a separate delivery gap:
-`establishConnection()` finishes hydration before `AgentManager.registerSession()` subscribes.
-A notification arriving after the last history response but before that subscription can be lost,
-including a turn's final items. This predates native paging and is not fixed by refreshing turn
-metadata during the scan. A follow-up must preserve and reconcile notifications across that
-handoff, with a regression that injects a final item and completion after history EOF and verifies
-exactly-once delivery after registration. See [the tracked finding](https://github.com/zhab1/paseo/pull/38#discussion_r4187947146).
+Interactive Codex resume buffers startup events until `AgentManager.registerSession()` finishes
+initializing history and subscribes. Registration drains those events before returning, preserving
+turns that resume or finish during that handoff.
 
 ## Presence is not delivery
 
@@ -299,7 +296,8 @@ do not imply local ownership or authorization. Capture the sender title at deliv
 removed senders must remain understandable without a live directory lookup.
 
 The optional `agentMessage` payload carries event, sender, and delivered text. Shared client
-presentation (`protocol/agent-message-display`) owns its heading and expanded details. The daemon
+presentation (`protocol/paseo-tool-presentation`) owns its heading and expanded details, next to the
+labels for every Paseo MCP tool. The daemon
 must not construct UI labels or prepend sender labels to the semantic message body. The existing
 `tool_call` / `plain_text` envelope is a compatibility adapter: older clients still parse the row and
 expand its body. New clients use the typed payload, never infer the event from a tool name or parse

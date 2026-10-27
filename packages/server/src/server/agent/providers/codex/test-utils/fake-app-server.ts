@@ -198,7 +198,7 @@ export function createFakeCodexAppServer(
         },
       };
     },
-    "thread/read": () => ({ thread: { turns: [] } }),
+    "thread/read": () => ({ thread: { status: { type: "idle" }, turns: [] } }),
     "thread/list": () => ({ data: [], nextCursor: null }),
     "thread/turns/list": () => ({ data: [] }),
     ...handlers,
@@ -206,7 +206,7 @@ export function createFakeCodexAppServer(
   const historyRequest = pagedHistoryRequest(async (method, params) => {
     const handler = handlers[method];
     if (handler) return handler(params);
-    if (method === "thread/read") return { thread: { turns: [] } };
+    if (method === "thread/read") return { thread: { status: { type: "idle" }, turns: [] } };
     return { data: [], nextCursor: null };
   });
   for (const method of ["thread/read", "thread/turns/list", "thread/items/list"]) {

@@ -1,9 +1,10 @@
+import { createIdleRuntimeCleanup } from "./idle-runtime-cleanup/index.js";
 import {
   prepareAgentMessage,
   formatAgentMessage,
   formatSystemNotificationPrompt,
 } from "./agent-messages/index.js";
-import { expect, test, vi } from "vitest";
+import { expect, test, vi, onTestFinished } from "vitest";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -56,7 +57,6 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
-import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
@@ -10334,6 +10334,47 @@ test("closeAgent persists one final closed snapshot", async () => {
   }
 });
 
+test("idle runtime cleanup honors a provider veto and resumes the saved conversation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-cleanup-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let safe = false;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = await super.createSession(config);
+      session.canStopRuntime = async () => safe;
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const collect = runtimeCleanup(manager);
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const now = new Date(Date.now() + 61 * 60_000);
+    expect(await collect({ now })).toEqual({ collected: [], failures: [] });
+    safe = true;
+    expect(await collect({ now })).toEqual({ collected: [], failures: [] });
+    const later = new Date(now.getTime() + 61 * 60_000);
+    expect((await collect({ now: later })).collected).toEqual([
+      { agentId: agent.id, provider: "codex", sessionId: agent.persistence?.sessionId },
+    ]);
+    expect(manager.getAgent(agent.id)).toBeNull();
+    const resumed = await ensureAgentLoaded(agent.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    expect(resumed.id).toBe(agent.id);
+    expect(resumed.persistence).toEqual(agent.persistence);
+    await manager.runAgent(agent.id, "Continue the saved conversation");
+  } finally {
+    await manager.closeAgent(manager.listAgents()[0]?.id ?? "missing").catch(() => undefined);
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("idle agents remain resident until an explicit lifecycle action closes them", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-residency-"));
   let closeCount = 0;
@@ -11290,6 +11331,41 @@ test("authoritative timeline records a daemon-handled submitted prompt before it
   }
 });
 
+test("tryRunOutOfBand gives providers the command another agent sent, not its envelope", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-agent-out-of-band-"));
+  const seenPrompts: AgentPromptInput[] = [];
+
+  class SlashCommandSession extends TestAgentSession {
+    override tryHandleOutOfBand(prompt: AgentPromptInput) {
+      seenPrompts.push(prompt);
+      return prompt === "/handled" ? { run: async () => {} } : null;
+    }
+  }
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new SlashCommandSession(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  try {
+    const fromAgent = prepareAgentMessage("/handled", { kind: "agent-message", agentId: "sender" });
+    expect(await manager.tryRunOutOfBand(agent.id, fromAgent.prompt)).toBe(true);
+    expect(seenPrompts).toEqual(["/handled"]);
+
+    // A human who pastes an envelope gets it quoted, and it stays a plain prompt.
+    const pasted = prepareAgentMessage(String(fromAgent.prompt));
+    expect(await manager.tryRunOutOfBand(agent.id, pasted.prompt)).toBe(false);
+    expect(seenPrompts.at(-1)).toBe(pasted.prompt);
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun succeeds when foreground turn terminal event is never delivered", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stale-fg-"));
   const storagePath = join(workdir, "agents");
@@ -12151,122 +12227,50 @@ test.each(["create", "import"])(
   },
 );
 
-test.each([false, true])(
-  "turn hooks explicitly freeze complete history with a prior scroll=%s",
-  async (scrollFirst) => {
-    let historyReads = 0;
-    const olderAllowed = deferred<void>();
-    const olderStarted = deferred<void>();
-    const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
-    const hookStarted = deferred<void>();
-    const plugin: AgentTimelineItem = {
-      type: "plugin",
-      id: "report",
-      pluginId: "test",
-      kind: "report",
-      version: 1,
-      data: "before",
-    };
-    const oldChild: AgentTimelineItem = {
-      type: "tool_call",
-      callId: "old-child",
-      name: "Sub-agent",
-      status: "completed",
-      error: null,
-      detail: { type: "unknown", input: "before", output: "before" },
-    };
-    class PagedSession extends TestAgentSession {
-      readonly initialTimeline = [
-        { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
-        { item: plugin },
-      ];
-      hasOlderHistory() {
-        return historyReads === 0;
-      }
-      async loadOlderHistory() {
-        historyReads++;
-        olderStarted.resolve();
-        await olderAllowed.promise;
-        return [
-          { item: { type: "user_message" as const, text: "Original prompt" } },
-          { item: oldChild },
-          { item: { type: "assistant_message" as const, messageId: "recent", text: "earlier " } },
-        ];
-      }
+test("turn hooks do not load older native history", async () => {
+  let historyReads = 0;
+  const hook = deferred<PluginLifecycleEvents["agent.turn_ended"]>();
+  class PagedSession extends TestAgentSession {
+    readonly initialTimeline = [
+      { item: { type: "assistant_message" as const, messageId: "recent", text: "recent" } },
+    ];
+    hasOlderHistory() {
+      return true;
     }
-    const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
-    const client = new (class extends TestAgentClient {
-      override async createSession() {
-        return session;
-      }
-    })();
-    const lifecycle: PluginLifecycle = {
+    async loadOlderHistory() {
+      historyReads++;
+      return [];
+    }
+  }
+  const session = new PagedSession({ provider: "codex", cwd: process.cwd() });
+  const client = new (class extends TestAgentClient {
+    override async createSession() {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    pluginLifecycle: {
       emit(name, event) {
         if (name === "agent.turn_ended") {
-          void Promise.resolve(typeof event === "function" ? event() : event)
-            .then((value) => hook.resolve(value as PluginLifecycleEvents["agent.turn_ended"]))
-            .catch(hook.reject);
-          hookStarted.resolve();
+          hook.resolve(event as PluginLifecycleEvents["agent.turn_ended"]);
         }
       },
       async before(_name, request) {
         return request;
       },
-    };
-    const manager = new AgentManager({
-      clients: { codex: client },
-      pluginLifecycle: lifecycle,
-      logger,
-    });
-    const agent = await manager.createAgent(
-      { provider: "codex", cwd: process.cwd() },
-      undefined,
-      {},
-    );
-    try {
-      expect(historyReads).toBe(0);
-      const page = manager.fetchTimeline(agent.id, { limit: 1 });
-      const scroll = scrollFirst
-        ? manager.fetchTimelinePage(agent.id, {
-            direction: "before",
-            cursor: { epoch: page.epoch, seq: page.window.minSeq },
-            limit: 1,
-          })
-        : null;
-      if (scroll) await olderStarted.promise;
-      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
-      await hookStarted.promise;
-      await olderStarted.promise;
-      session.pushEvent({
-        type: "timeline",
-        provider: "codex",
-        item: {
-          type: "user_message",
-          text: "Following turn",
-        },
-      });
-      await manager.appendTimelineItem(agent.id, { ...plugin, data: "after" });
-      await manager.appendTimelineItem(agent.id, {
-        ...oldChild,
-        status: "running",
-        detail: { type: "unknown", input: "after", output: "after" },
-      });
-      olderAllowed.resolve();
-      await scroll;
-      const event = await hook.promise;
-      expect(event.timeline).toEqual([
-        { type: "user_message", text: "Original prompt" },
-        oldChild,
-        { type: "assistant_message", messageId: "recent", text: "earlier recent" },
-        plugin,
-      ]);
-      expect(historyReads).toBe(1);
-    } finally {
-      olderAllowed.resolve();
-      await manager.closeAgent(agent.id);
-    }
-  },
-);
+    },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {});
+  try {
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
+    expect((await hook.promise).timeline).toEqual([]);
+    expect(historyReads).toBe(0);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+});
 
 test("import retains a metadata title when the newest page contains no user prompt", async () => {
   const client = new (class extends TestAgentClient {
@@ -12462,3 +12466,367 @@ test.each([false, true])(
     }
   },
 );
+
+test.each([
+  {
+    event: {
+      type: "turn_completed",
+      provider: "codex",
+      turnId: "hook-turn",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "completed" },
+  },
+  {
+    event: {
+      type: "turn_failed",
+      provider: "codex",
+      turnId: "hook-turn",
+      error: "Failed",
+      code: "test",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "failed", error: { message: "Failed", code: "test" } },
+  },
+  {
+    event: {
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "hook-turn",
+      reason: "Stopped",
+    } satisfies AgentStreamEvent,
+    outcome: { kind: "canceled", reason: "Stopped" },
+  },
+])(
+  "lifecycle hooks receive no conversation for $event.type and stream dispatch never reads timeline items",
+  async ({ event: terminalEvent, outcome }) => {
+    class CountingTimelineStore extends InMemoryAgentTimelineStore {
+      itemReads = 0;
+      override getItems(agentId: string): AgentTimelineItem[] {
+        this.itemReads += 1;
+        return super.getItems(agentId);
+      }
+    }
+    const workdir = mkdtempSync(join(tmpdir(), "agent-hook-payload-"));
+    const client = new SessionRecordingAgentClient();
+    const timelineStore = new CountingTimelineStore();
+    const events: Array<{ name: string; event: unknown }> = [];
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: new AgentStorage(join(workdir, "agents"), logger),
+      logger,
+      timelineStore,
+      pluginLifecycle: {
+        before: async (_name, request) => request,
+        emit: (name, event) => {
+          events.push({ name, event });
+        },
+      },
+    });
+    onTestFinished(async () => {
+      await manager.closeAgent(manager.listAgents()[0]!.id);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "A long conversation".repeat(10_000),
+    });
+    expect(manager.getTimeline(agent.id)).toHaveLength(1);
+    const readsBeforeDispatch = timelineStore.itemReads;
+    const session = client.sessions[0]!;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "hook-turn" });
+    await expect
+      .poll(() => events.filter(({ name }) => name === "agent.turn_started").length)
+      .toBe(1);
+    expect(timelineStore.itemReads).toBe(readsBeforeDispatch);
+    session.pushEvent(terminalEvent);
+    await expect
+      .poll(() => events.filter(({ name }) => name === "agent.turn_ended"))
+      .toEqual([
+        {
+          name: "agent.turn_ended",
+          event: {
+            agent: {
+              id: agent.id,
+              workspaceId: null,
+              parentAgentId: null,
+              provider: "codex",
+              cwd: workdir,
+              title: null,
+            },
+            turnId: "hook-turn",
+            outcome,
+            timeline: [],
+          },
+        },
+      ]);
+    expect(timelineStore.itemReads).toBe(readsBeforeDispatch);
+  },
+);
+
+test.each(["live", "history", "accepted"] as const)(
+  "batched agent entries retain their identities through %s ingestion",
+  async (ingestion) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-batch-provenance-"));
+    const entries = [
+      {
+        id: "report",
+        source: { kind: "agent-message" as const, agentId: "worker", serverId: "remote-host" },
+        text: "Result <ready>",
+      },
+      {
+        id: "finish",
+        source: {
+          kind: "agent-notification" as const,
+          agentId: "worker",
+          serverId: "remote-host",
+          event: "finished" as const,
+        },
+        text: "Worker finished",
+      },
+    ];
+    const prompt = entries.map(formatAgentMessage).join("\n\n");
+    const item: AgentTimelineItem = {
+      type: "user_message",
+      text: prompt,
+      clientMessageId: "report",
+      messageId: "provider-batch",
+    };
+    const codex = fakeCodexEmitting(
+      ingestion === "history" ? { historyItems: [item] } : { turnItems: [item] },
+    );
+    const manager = new AgentManager({ clients: { codex }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    try {
+      if (ingestion === "history")
+        await manager.hydrateTimelineFromProvider(agent.id, { force: true });
+      else if (ingestion === "accepted") {
+        for await (const _event of manager.streamAgent(agent.id, prompt, {
+          clientMessageId: "report",
+        })) {
+        }
+      } else await manager.runAgent(agent.id, { text: "start" });
+      expect(
+        manager
+          .getTimeline(agent.id)
+          .filter((row) => row.type === "tool_call")
+          .map((row) => ({ callId: row.callId, agentMessage: row.agentMessage })),
+      ).toEqual([
+        {
+          callId: "paseo-agent-message:report",
+          agentMessage: {
+            event: "message",
+            sender: { id: "worker", serverId: "remote-host" },
+            text: "Result <ready>",
+          },
+        },
+        {
+          callId: "paseo-agent-message:finish",
+          agentMessage: {
+            event: "finished",
+            sender: { id: "worker", serverId: "remote-host" },
+            text: "Worker finished",
+          },
+        },
+      ]);
+      expect(manager.getTimeline(agent.id).filter((row) => row.type === "user_message")).toEqual(
+        [],
+      );
+      expect(manager.getAgent(agent.id)?.lastUserMessageAt).toBeNull();
+    } finally {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("reads the last durable assistant response without loading a stored-only child", async () => {
+  const store = new RecordingTimelineStore();
+  await store.appendCommitted("stored-child", {
+    type: "assistant_message",
+    text: "Partial work saved before restart",
+  });
+  const manager = new AgentManager({ clients: {}, durableTimelineStore: store, logger });
+  expect(manager.getAgent("stored-child")).toBeNull();
+  expect(await manager.getLastAssistantMessage("stored-child")).toBe(
+    "Partial work saved before restart",
+  );
+  expect(manager.getAgent("stored-child")).toBeNull();
+});
+
+function runtimeCleanup(manager: AgentManager) {
+  let now = Date.now();
+  let protectedCaller = (_agentId: string) => false;
+  const cleanup = createIdleRuntimeCleanup({
+    enabled: true,
+    runtimes: () => manager.getRuntimeCleanupCandidates(),
+    logger,
+    now: () => now,
+    isProtected: (agentId) => protectedCaller(agentId),
+    schedule: () => () => {},
+  });
+  onTestFinished(() => cleanup.close());
+  return (options: { now: Date; isProtected?: (agentId: string) => boolean }) => {
+    now = options.now.getTime();
+    protectedCaller = options.isProtected ?? (() => false);
+    return cleanup.sweep();
+  };
+}
+
+function idleCleanupHarness() {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-protection-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const commands: AgentPromptInput[] = [];
+  const prompts: AgentPromptInput[] = [];
+  const recordPrompts = (session: AgentSession) => {
+    session.tryHandleOutOfBand = (prompt) =>
+      prompt === "/maintenance"
+        ? {
+            run: async () => {
+              commands.push(prompt);
+            },
+          }
+        : null;
+    const start = session.startTurn.bind(session);
+    session.startTurn = (prompt, options) => {
+      prompts.push(prompt);
+      return start(prompt, options);
+    };
+    return session;
+  };
+  const sessions: AgentSession[] = [];
+  const probes: Array<(() => Promise<boolean>) | undefined> = [];
+  const closeEntered = deferred<void>();
+  let closeGate: Promise<void> | undefined;
+  let closes = 0;
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      const session = await super.resumeSession(handle, config);
+      session.describePersistence = () => handle;
+      return recordPrompts(session);
+    }
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const index = sessions.length;
+      const session: AgentSession = await super.createSession(config);
+      session.canStopRuntime = async () => probes[index]?.() ?? false;
+      session.close = async () => {
+        closes++;
+        closeEntered.resolve();
+        await closeGate;
+      };
+      sessions.push(session);
+      return recordPrompts(session);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  onTestFinished(async () => {
+    closeGate = undefined;
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  return {
+    commands,
+    sweep: runtimeCleanup(manager),
+    manager,
+    storage,
+    sessions,
+    probes,
+    prompts,
+    closeEntered,
+    get closes() {
+      return closes;
+    },
+    holdClose: (gate: Promise<void>) => {
+      closeGate = gate;
+    },
+    create: (labels?: Record<string, string>) =>
+      manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+        workspaceId: undefined,
+        labels,
+      }),
+    later: (minutes: number) => new Date(Date.now() + minutes * 60_000),
+  };
+}
+
+test("idle cleanup rechecks new prompt activity after an asynchronous safety probe", async () => {
+  const h = idleCleanupHarness();
+  const agent = await h.create();
+  const entered = deferred<void>();
+  const probe = deferred<boolean>();
+  h.probes[0] = () => {
+    entered.resolve();
+    return probe.promise;
+  };
+  const sweep = h.sweep({ now: h.later(61) });
+  await entered.promise;
+  await h.manager.runAgent(agent.id, "arrived during safety query");
+  probe.resolve(true);
+  expect((await sweep).collected).toEqual([]);
+  expect(h.closes).toBe(0);
+});
+
+test("idle cleanup retains a parent whose idle managed child owns background work", async () => {
+  const h = idleCleanupHarness();
+  const parent = await h.create();
+  await h.create({ [PARENT_AGENT_ID_LABEL]: parent.id });
+  h.probes[0] = async () => true;
+  h.probes[1] = async () => false;
+  expect((await h.sweep({ now: h.later(61) })).collected).toEqual([]);
+  expect(h.closes).toBe(0);
+});
+
+test("idle cleanup rechecks queued deliveries admitted during the safety probe", async () => {
+  const h = idleCleanupHarness();
+  await h.create();
+  let queued = false;
+  h.probes[0] = async () => {
+    queued = true;
+    return true;
+  };
+  expect((await h.sweep({ now: h.later(61), isProtected: () => queued })).collected).toEqual([]);
+  expect(h.closes).toBe(0);
+});
+
+test("a prompt racing idle cleanup waits for close and resumes exactly once", async () => {
+  const h = idleCleanupHarness();
+  const agent = await h.create();
+  h.probes[0] = async () => true;
+  const gate = deferred<void>();
+  h.holdClose(gate.promise);
+  const sweep = h.sweep({ now: h.later(61) });
+  await h.closeEntered.promise;
+  const run = h.manager.runAgent(agent.id, "arrived while closing");
+  gate.resolve();
+  expect((await sweep).collected).toHaveLength(1);
+  const result = await run;
+  expect(result.sessionId).toBe(agent.persistence?.sessionId);
+  expect(h.closes).toBe(1);
+  expect(h.prompts).toEqual(["arrived while closing"]);
+});
+
+test("an out-of-band command racing idle cleanup waits for the resumed runtime", async () => {
+  const h = idleCleanupHarness();
+  const agent = await h.create();
+  h.probes[0] = async () => true;
+  const gate = deferred<void>();
+  h.holdClose(gate.promise);
+  const sweep = h.sweep({ now: h.later(61) });
+  await h.closeEntered.promise;
+  const command = startAgentRun(h.manager, agent.id, "/maintenance", logger);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const deliveredWhileClosing = [...h.commands];
+  gate.resolve();
+  await sweep;
+  expect(deliveredWhileClosing).toEqual([]);
+  expect(await command).toEqual({ disposition: "out_of_band" });
+  expect(h.commands).toEqual(["/maintenance"]);
+  expect(h.prompts).toEqual([]);
+});

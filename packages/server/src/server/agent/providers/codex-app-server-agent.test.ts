@@ -17,6 +17,7 @@ beforeEach(() => {
 });
 
 import type {
+  AgentClient,
   AgentLaunchContext,
   AgentPermissionRequest,
   AgentSession,
@@ -102,6 +103,7 @@ import {
 } from "./codex/test-utils/fake-app-server.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
+import { AgentManager } from "../agent-manager.js";
 import { buildProviderRegistry } from "../provider-registry.js";
 
 interface CollaborationModeRecord {
@@ -511,7 +513,7 @@ function asInternals(session: CodexTestSession): CodexSessionTestAccess {
 }
 
 function markdownImageSource(markdown: string): string {
-  const match = markdown.match(/^!\[[^\]]*]\((.*)\)$/);
+  const match = markdown.trim().match(/^!\[[^\]]*]\((.*)\)$/);
   if (!match) {
     throw new Error(`Expected markdown image, got: ${markdown}`);
   }
@@ -7479,7 +7481,7 @@ describe("Codex app-server provider", () => {
         turnId: "test-turn",
         item: {
           type: "assistant_message",
-          text: "![Image](file:///tmp/paseo%20image.png)",
+          text: "\n\n![Image](file:///tmp/paseo%20image.png)\n\n",
         },
       },
     ]);
@@ -7511,7 +7513,7 @@ describe("Codex app-server provider", () => {
           turnId: "test-turn",
           item: {
             type: "assistant_message",
-            text: `![Image](${expectedPath})`,
+            text: `\n\n![Image](${expectedPath})\n\n`,
           },
         },
       ]);
@@ -8552,4 +8554,131 @@ describe("Codex denied plan approvals", () => {
       metadata: { approved: false },
     });
   });
+});
+
+describe("Codex interactive resume startup", () => {
+  test("delivers an autonomous turn that starts during resume to the first subscriber", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/interrupt": () => {
+        appServer.completeTurn({ threadId: "saved-thread", status: "interrupted" });
+        return {};
+      },
+      "thread/resume": () => {
+        appServer.startsTurn({ threadId: "saved-thread", turnId: "autonomous-turn" });
+        appServer.says({ threadId: "saved-thread", text: "Working on the goal" });
+        return { thread: { id: "saved-thread" } };
+      },
+      "thread/read": () => ({ thread: { turns: [] } }),
+    });
+    const session = new CodexAppServerAgentSession(
+      createConfig({ modeId: "full-access" }),
+      { sessionId: "saved-thread" },
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    try {
+      await session.connect();
+      const events: AgentStreamEvent[] = [];
+      const unsubscribe = session.subscribe((event) => events.push(event));
+      expect(events.some((event) => event.type === "turn_started")).toBe(true);
+      expect(
+        events.some(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "assistant_message" &&
+            event.item.text.includes("Working on the goal"),
+        ),
+      ).toBe(true);
+      await session.interrupt();
+      expect(
+        appServer.requests().find((request) => request.method === "turn/interrupt"),
+      ).toMatchObject({ params: { threadId: "saved-thread", turnId: "autonomous-turn" } });
+      unsubscribe();
+      const laterEvents: AgentStreamEvent[] = [];
+      session.subscribe((event) => laterEvents.push(event));
+      expect(laterEvents).toEqual([]);
+    } finally {
+      await session.close();
+      appServer.assertNoErrors();
+    }
+  });
+  test.each([false, true])(
+    "applies resumed goal events before returning (completed during resume: %s)",
+    async (completedDuringResume) => {
+      const appServer = createFakeCodexAppServer({
+        "thread/resume": () => {
+          appServer.startsTurn({ threadId: "saved-thread", turnId: "autonomous-turn" });
+          if (completedDuringResume) appServer.completeTurn({ threadId: "saved-thread" });
+          return { thread: { id: "saved-thread" } };
+        },
+        "thread/read": () => ({ thread: { turns: [] } }),
+      });
+      const session = new CodexAppServerAgentSession(
+        createConfig({ title: "Resumed goal", cwd: process.cwd() }),
+        { sessionId: "saved-thread" },
+        createTestLogger(),
+        async () => appServer.child,
+      );
+      const client: AgentClient = {
+        provider: "codex",
+        capabilities: session.capabilities,
+        isAvailable: async () => true,
+        fetchCatalog: async () => ({ models: [], modes: [] }),
+        createSession: async () => {
+          throw new Error("Unexpected create");
+        },
+        resumeSession: async () => {
+          await session.connect();
+          return session;
+        },
+      };
+      const manager = new AgentManager({ clients: { codex: client }, logger: createTestLogger() });
+      let id: string | undefined;
+      try {
+        const resumed = await manager.resumeAgentFromPersistence(
+          { provider: "codex", sessionId: "saved-thread" },
+          createConfig({ title: "Resumed goal", cwd: process.cwd() }),
+        );
+        id = resumed.id;
+        expect(resumed.lifecycle).toBe(completedDuringResume ? "idle" : "running");
+        expect(manager.getAgent(id)?.lifecycle).toBe(completedDuringResume ? "idle" : "running");
+      } finally {
+        if (id) await manager.closeAgent(id);
+        await session.close();
+        appServer.assertNoErrors();
+      }
+    },
+  );
+});
+
+test("Codex runtime safety queries live terminals and retains unsupported app servers", async () => {
+  let response: unknown = { data: [], nextCursor: null };
+  const appServer = createFakeCodexAppServer({ "thread/backgroundTerminals/list": () => response });
+  const session = new CodexAppServerAgentSession(
+    createConfig(),
+    null,
+    createTestLogger(),
+    async () => appServer.child,
+  );
+  try {
+    await session.startTurn("hello");
+    await appServer.waitForTurnStart();
+    expect(await session.canStopRuntime()).toBe(false);
+    appServer.completeTurn({ threadId: "thread-1" });
+    await expect.poll(() => session.canStopRuntime()).toBe(true);
+    response = { data: [{ processId: "shell-1" }], nextCursor: null };
+    expect(await session.canStopRuntime()).toBe(false);
+    response = {};
+    await expect(session.canStopRuntime()).rejects.toThrow();
+    response = { __jsonRpcError: { code: -32601, message: "Method not found" } };
+    await expect(session.canStopRuntime()).rejects.toThrow("Method not found");
+    expect(
+      appServer
+        .requests()
+        .findLast((request) => request.method === "thread/backgroundTerminals/list"),
+    ).toMatchObject({ params: { threadId: "thread-1" } });
+    appServer.assertNoErrors();
+  } finally {
+    await session.close();
+  }
 });
