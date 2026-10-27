@@ -232,6 +232,7 @@ type ScheduleAgentManager = Pick<
   AgentRunController,
   | "getAgent"
   | "reloadAgentSession"
+  | "reloadStalePluginSession"
   | "tryRunOutOfBand"
   | "cancelQuotaContinuationForIntent"
   | "hasInFlightRun"

@@ -274,6 +274,8 @@ function buildAgentManagerSpies() {
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
+    getPluginTools: () => [],
+    reloadStalePluginSession: async () => {},
     hasInFlightRun: vi.fn().mockReturnValue(false),
     steerOrReplaceActiveTurn: async () => ({ status: "inactive" as const }),
     tryRunOutOfBand: vi.fn().mockReturnValue(false),
@@ -633,6 +635,10 @@ class FakeBrowserToolsBroker {
 }
 
 class BoundaryAgentManagerFake {
+  public getPluginTools(): [] {
+    return [];
+  }
+
   private readonly agent = createManagedAgent({
     id: "agent-1",
     cwd: REPO_CWD,

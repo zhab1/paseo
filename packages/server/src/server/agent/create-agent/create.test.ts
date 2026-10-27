@@ -70,6 +70,7 @@ test("session create forwards clientMessageId to the initial prompt run options"
       tryRunOutOfBand: vi.fn(() => false),
       cancelQuotaContinuationForIntent: vi.fn(() => undefined),
       hasInFlightRun: vi.fn(() => false),
+      reloadStalePluginSession: async () => {},
       streamAgent,
       waitForAgentRunStart: vi.fn(async () => undefined),
     } as unknown as Parameters<typeof createAgentCommand>[0]["agentManager"],

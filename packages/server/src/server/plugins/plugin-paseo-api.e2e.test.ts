@@ -1,3 +1,6 @@
+import pino from "pino";
+import { createPaseoDaemon } from "../bootstrap.js";
+import { loadConfig } from "../config.js";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -195,6 +198,60 @@ export default function contribute(server: PluginServerContext) {
   } finally {
     await client.close().catch(() => undefined);
     await daemon.close();
+  }
+}, 60_000);
+
+test("password-protected config reload preserves startup auth and session construction does not read config", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "paseo-protected-config-reload-"));
+  roots.push(home);
+  const password = "synthetic-audit-password";
+  const config = loadConfig(home, { env: { PASEO_PASSWORD: password, PASEO_RELAY_ENABLED: "0" } });
+  const daemon = await createPaseoDaemon(
+    {
+      ...config,
+      listen: "127.0.0.1:0",
+      mcpEnabled: false,
+      agentClients: createTestAgentClients(),
+      staticDir: home,
+    },
+    pino({ level: "silent" }),
+  );
+  await daemon.start();
+  const target = daemon.getListenTarget();
+  if (target?.type !== "tcp") throw new Error("Expected TCP daemon");
+  const connect = () =>
+    new DaemonClient({ url: `ws://127.0.0.1:${target.port}/ws`, password, appVersion: "0.4.0" });
+  const client = connect();
+  const replacement = connect();
+  try {
+    await client.connect();
+    await client.fetchAgents({ subscribe: {} });
+    const configPath = path.join(home, "config.json");
+    await writeFile(configPath, JSON.stringify({ daemon: { browserTools: { enabled: true } } }));
+    let longestGap = 0;
+    let previous = performance.now();
+    const probe = setInterval(() => {
+      const now = performance.now();
+      longestGap = Math.max(longestGap, now - previous);
+      previous = now;
+    }, 1);
+    try {
+      const reloaded = await client.reloadDaemonConfig();
+      longestGap = Math.max(longestGap, performance.now() - previous);
+      expect(reloaded.appliedPaths).toContain("daemon.browserTools.enabled");
+      expect(longestGap).toBeLessThan(50);
+    } finally {
+      clearInterval(probe);
+    }
+    expect((await client.getDaemonConfig()).config.browserTools.enabled).toBe(true);
+    // A new physical session uses ready daemon state; corrupt config is reported only by an explicit read.
+    await writeFile(configPath, "invalid JSON");
+    await replacement.connect();
+    await replacement.fetchAgents({ subscribe: {} });
+    await expect(replacement.reloadDaemonConfig()).rejects.toThrow("Invalid JSON");
+  } finally {
+    await Promise.all([client.close(), replacement.close()]);
+    await daemon.stop();
   }
 }, 60_000);
 

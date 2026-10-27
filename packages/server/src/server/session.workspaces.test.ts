@@ -9233,8 +9233,8 @@ test("workspace auto-name uses the backing root for a nested worktree", async ()
   execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "pipe" });
   execFileSync("git", ["commit", "-m", "initial"], { cwd: repoDir, stdio: "pipe" });
   execFileSync("git", ["branch", "-M", "placeholder-branch"], { cwd: repoDir, stdio: "pipe" });
-  writePaseoWorktreeMetadata(repoDir, { baseRefName: "main" });
-  writePaseoWorktreeFirstAgentBranchAutoNameMetadata(repoDir, {
+  await writePaseoWorktreeMetadata(repoDir, { baseRefName: "main" });
+  await writePaseoWorktreeFirstAgentBranchAutoNameMetadata(repoDir, {
     placeholderBranchName: "placeholder-branch",
   });
   const workspaceCwd = path.join(repoDir, "packages", "app");
@@ -9293,6 +9293,7 @@ test("workspace auto-name uses the backing root for a nested worktree", async ()
       firstAgentContext: { prompt: "Fix checkout title" },
     });
     await vi.runAllTimersAsync();
+    await vi.waitFor(() => expect(emittedCwds).toEqual([workspaceCwd]));
 
     expect(generateCalls).toBe(1);
     expect(stored.get(workspace.workspaceId)).toMatchObject({
@@ -9304,7 +9305,7 @@ test("workspace auto-name uses the backing root for a nested worktree", async ()
         .toString()
         .trim(),
     ).toBe("placeholder-branch");
-    expect(readPaseoWorktreeMetadata(repoDir)).toMatchObject({
+    expect(await readPaseoWorktreeMetadata(repoDir)).toMatchObject({
       version: 2,
       firstAgentBranchAutoName: {
         status: "attempted",

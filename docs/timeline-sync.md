@@ -11,6 +11,8 @@ are never retained for history or catch-up. Provider history is the durable tran
 and rebuilds the projection when an agent resumes. Routine appends read only the previous row
 and, for tool/plugin updates, the matching identity. Fetches load only the selected message
 bodies; unfetched history stays with the provider. Full export/search can explicitly request all rows.
+The in-memory projection uses retained sequence indexes for pages and assistant-message anchors
+for timestamp continuity. Fetching a bounded page does not copy or reproject the full timeline.
 
 The invariants are:
 

@@ -44,6 +44,8 @@ class FakePermissionAgentManager {
     return undefined;
   }
 
+  async reloadStalePluginSession(): Promise<void> {}
+
   hasInFlightRun(): boolean {
     return this.hasRunInFlight;
   }

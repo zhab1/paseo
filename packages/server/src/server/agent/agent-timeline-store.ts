@@ -1,11 +1,6 @@
 import { CachedTimelineProjection, type TimelineCache } from "./timeline-cache.js";
 import { randomUUID } from "node:crypto";
-import {
-  TimelineProjection,
-  selectProjectedTimelinePage,
-  type ProjectedTimelineRow,
-  type ProjectedTimelinePageSelection,
-} from "./timeline-projection.js";
+import { TimelineProjection, type ProjectedTimelineRow } from "./timeline-projection.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type {
   AgentTimelineFetchOptions,
@@ -34,30 +29,6 @@ function cloneRow<T extends AgentTimelineRow>(row: T): T {
   return { ...row };
 }
 
-function getPriorAssistantMessageIds(
-  rows: readonly ProjectedTimelineRow[],
-  page: ProjectedTimelinePageSelection,
-): string[] {
-  const pageMessageIds = new Set(
-    page.entries.flatMap(({ item }) =>
-      item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
-    ),
-  );
-  const priorAssistantMessageIds = new Set<string>();
-  const selectedAnchors = new Set(page.entries.map((entry) => entry.seqStart));
-  for (const row of rows) {
-    if (page.startSeq === null || row.seqStart >= page.startSeq) break;
-    if (
-      row.item.type === "assistant_message" &&
-      row.item.messageId &&
-      pageMessageIds.has(row.item.messageId) &&
-      !selectedAnchors.has(row.seqStart)
-    )
-      priorAssistantMessageIds.add(row.item.messageId);
-  }
-  return [...priorAssistantMessageIds];
-}
-
 export class InMemoryAgentTimelineStore {
   private readonly states = new Map<string, AgentTimelineState>();
   private readonly historyLoads = new Map<string, Promise<void>>();
@@ -78,8 +49,9 @@ export class InMemoryAgentTimelineStore {
     const epoch = options?.epoch ?? randomUUID();
     const projection = this.cache
       ? new CachedTimelineProjection(this.cache, `${agentId}:${epoch}`)
-      : new TimelineProjection();
-    for (const row of rows) projection.append(row);
+      : new TimelineProjection(rows);
+    if (projection instanceof CachedTimelineProjection)
+      for (const row of rows) projection.append(row);
     this.states.set(agentId, {
       epoch,
       projection,
@@ -124,9 +96,7 @@ export class InMemoryAgentTimelineStore {
     if (state.projection instanceof CachedTimelineProjection) {
       state.projection.prepend(rows);
     } else {
-      const projection = new TimelineProjection();
-      for (const row of [...rows, ...state.projection.getRows()]) projection.append(row);
-      state.projection = projection;
+      state.projection = new TimelineProjection([...rows, ...state.projection.getRows()]);
     }
     state.minSeq = startSeq;
     // A complete turn snapshot accepts older history, including an in-flight
@@ -171,8 +141,6 @@ export class InMemoryAgentTimelineStore {
     const state = this.requireState(agentId);
     const direction = options?.direction ?? "tail";
     const cursor = options?.cursor;
-    const rows =
-      state.projection instanceof CachedTimelineProjection ? null : state.projection.getRows();
     const window = { minSeq: state.minSeq, maxSeq: state.nextSeq - 1, nextSeq: state.nextSeq };
     const staleCursor = cursor !== undefined && cursor.epoch !== state.epoch;
     const gap =
@@ -182,16 +150,12 @@ export class InMemoryAgentTimelineStore {
       state.minSeq > 0 &&
       cursor.seq < state.minSeq - 1;
     const reset = staleCursor || gap;
-    const selection = {
+    const page = state.projection.selectPage({
       bounds: window,
       direction: reset ? ("tail" as const) : direction,
       cursorSeq: cursor?.seq,
       limit: options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT,
-    };
-    const page =
-      state.projection instanceof CachedTimelineProjection
-        ? state.projection.selectPage(selection)
-        : selectProjectedTimelinePage({ ...selection, rows: rows! });
+    });
     return {
       epoch: state.epoch,
       direction,
@@ -206,7 +170,7 @@ export class InMemoryAgentTimelineStore {
       priorAssistantMessageIds:
         "priorAssistantMessageIds" in page
           ? (page.priorAssistantMessageIds as string[])
-          : getPriorAssistantMessageIds(rows!, page),
+          : (state.projection as TimelineProjection).getPriorAssistantMessageIds(page),
       rows: page.entries.map((entry) => Object.assign({ seq: entry.seqEnd }, entry)),
     };
   }
@@ -276,7 +240,7 @@ export class InMemoryAgentTimelineStore {
       const row = state.projection.getLastItem();
       return row?.seqEnd === state.nextSeq - 1 ? row.item : null;
     }
-    return state.projection.getRows().find((row) => row.seqEnd === state.nextSeq - 1)?.item ?? null;
+    return state.projection.getLastItem(state.nextSeq - 1);
   }
 
   getLastAssistantMessage(agentId: string): string | null {
@@ -285,10 +249,7 @@ export class InMemoryAgentTimelineStore {
       const item = projection.getLastItem("assistant_message")?.item;
       return item?.type === "assistant_message" ? item.text : null;
     }
-    const row = this.requireState(agentId)
-      .projection.getRows()
-      .findLast((candidate) => candidate.item.type === "assistant_message");
-    return row?.item.type === "assistant_message" ? row.item.text : null;
+    return projection.getLastAssistantMessage();
   }
 
   private requireState(agentId: string): AgentTimelineState {
