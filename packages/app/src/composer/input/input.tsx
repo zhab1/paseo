@@ -27,7 +27,9 @@ import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { ArrowUp, Mic, MicOff, CornerDownLeft, Plus, Square } from "lucide-react-native";
+import * as Haptics from "expo-haptics";
 import { useDictation } from "@/hooks/use-dictation";
+import { hasFinePointer } from "@/hooks/use-fine-pointer";
 import { DictationOverlay } from "@/components/dictation-controls";
 import { RealtimeVoiceOverlay } from "@/components/realtime-voice-overlay";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -56,7 +58,7 @@ import { formatShortcut, type ShortcutKey } from "@/utils/format-shortcut";
 import { getShortcutOs } from "@/utils/shortcut-platform";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
-import { isWeb } from "@/constants/platform";
+import { isNative, isWeb } from "@/constants/platform";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useComposerKeyboardScope } from "@/composer/keyboard-scope";
 import { RenderProfile } from "@/utils/render-profiler";
@@ -75,6 +77,7 @@ const ComposerTextInput = withUnistyles(EditingTextInput, (theme) => ({
 }));
 import {
   resolveSendTooltipLabel,
+  resolveSubmitAccessibilityHint,
   resolveSubmitAccessibilityLabel,
   resolveVoiceAccessibilityLabel,
   resolveVoiceTooltipText,
@@ -82,8 +85,10 @@ import {
 import {
   applyDictationTranscript,
   computeCanStartDictation,
+  resolveAlternateSendAction,
   resolveComposerSurfacePresentation,
   resolveComposerSurfaceText,
+  resolveRetainedSelection,
   runAlternateSendAction,
   runDefaultSendAction,
   runMessageInputKeyboardAction,
@@ -108,6 +113,8 @@ export interface ComposerInputSnapshot {
 
 export interface ComposerKeyPressEvent {
   key: string;
+  /** Shift, Alt, Ctrl, or Meta was held. */
+  hasModifier: boolean;
   preventDefault: () => void;
   input: ComposerInputSnapshot;
 }
@@ -208,6 +215,7 @@ type WebTextInputKeyPressEvent = NativeSyntheticEvent<
     metaKey?: boolean;
     ctrlKey?: boolean;
     shiftKey?: boolean;
+    altKey?: boolean;
     // Web-only: present on DOM KeyboardEvent during IME composition (CJK input).
     isComposing?: boolean;
     keyCode?: number;
@@ -394,8 +402,6 @@ interface DesktopKeyPressContext {
   onKeyPressCallback: ((event: ComposerKeyPressEvent) => boolean) | undefined;
   input: ComposerKeyPressEvent["input"];
   submitOnEnter: boolean;
-  isAgentRunning: boolean;
-  onQueue: ((payload: MessagePayload) => void) | undefined;
   isSubmitDisabled: boolean;
   isSubmitLoading: boolean;
   disabled: boolean;
@@ -409,30 +415,28 @@ function handleDesktopKeyPressImpl(
 ): void {
   if (isImeComposingKeyboardEvent(event.nativeEvent)) return;
 
+  const { shiftKey, metaKey, ctrlKey, altKey } = event.nativeEvent;
+
   if (ctx.onKeyPressCallback) {
     const handled = ctx.onKeyPressCallback({
       key: event.nativeEvent.key,
+      hasModifier: Boolean(shiftKey || metaKey || ctrlKey || altKey),
       preventDefault: () => event.preventDefault(),
       input: ctx.input,
     });
     if (handled) return;
   }
 
-  const { shiftKey, metaKey, ctrlKey } = event.nativeEvent;
-
   if (event.nativeEvent.key !== "Enter") return;
   if (!ctx.submitOnEnter) return;
   if (shiftKey) return;
 
-  if ((metaKey || ctrlKey) && ctx.isAgentRunning && ctx.onQueue) {
-    if (ctx.isSubmitDisabled || ctx.isSubmitLoading || ctx.disabled) return;
-    event.preventDefault();
+  if (ctx.isSubmitDisabled || ctx.isSubmitLoading || ctx.disabled) return;
+  event.preventDefault();
+  if (metaKey || ctrlKey) {
     ctx.handleAlternateSendAction();
     return;
   }
-
-  if (ctx.isSubmitDisabled || ctx.isSubmitLoading || ctx.disabled) return;
-  event.preventDefault();
   ctx.handleDefaultSendAction();
 }
 
@@ -523,8 +527,8 @@ function MessageInputAutoFocus({
   autoFocusKey: string | undefined;
   textInputRef: React.MutableRefObject<ComposerTextInputHandle | null>;
 }) {
-  const { isActiveComposer } = useComposerKeyboardScope();
-  useAutoFocusOnWebEffect(textInputRef, enabled && isActiveComposer, autoFocusKey);
+  const { isPaneFocused } = useComposerKeyboardScope();
+  useAutoFocusOnWebEffect(textInputRef, enabled && isPaneFocused, autoFocusKey);
   return null;
 }
 
@@ -676,13 +680,7 @@ function ComposerTextSurface(props: ComposerTextSurfaceProps): React.ReactElemen
     );
   }
   return (
-    <View
-      style={[
-        styles.textInputScrollWrapper,
-        props.fullscreen && styles.fullscreenTextSurface,
-        props.compact && !props.fullscreen && styles.compactTextSurface,
-      ]}
-    >
+    <View style={[styles.textInputScrollWrapper, props.fullscreen && styles.fullscreenTextSurface]}>
       {!isWeb && props.compact && !props.fullscreen ? (
         <Text
           accessible={false}
@@ -769,8 +767,10 @@ function SendButtonTooltip({
   canPressLoadingButton,
   onSubmitLoadingPress,
   onDefaultSendAction,
+  onLongPressSend,
   isSendButtonDisabled,
   submitAccessibilityLabel,
+  submitAccessibilityHint,
   sendButtonCombinedStyle,
   isSubmitLoading,
   submitIcon,
@@ -784,8 +784,10 @@ function SendButtonTooltip({
   canPressLoadingButton: boolean;
   onSubmitLoadingPress: (() => void) | undefined;
   onDefaultSendAction: () => void;
+  onLongPressSend: () => void;
   isSendButtonDisabled: boolean;
   submitAccessibilityLabel: string;
+  submitAccessibilityHint: string | undefined;
   sendButtonCombinedStyle: React.ComponentProps<typeof TooltipTrigger>["style"];
   isSubmitLoading: boolean;
   submitIcon: "arrow" | "return";
@@ -800,8 +802,10 @@ function SendButtonTooltip({
     <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
       <TooltipTrigger
         onPress={canPressLoadingButton ? onSubmitLoadingPress : onDefaultSendAction}
+        onLongPress={canPressLoadingButton ? undefined : onLongPressSend}
         disabled={isSendButtonDisabled}
         accessibilityLabel={submitAccessibilityLabel}
+        accessibilityHint={submitAccessibilityHint}
         accessibilityRole="button"
         testID={submitButtonTestID}
         style={sendButtonCombinedStyle}
@@ -947,6 +951,7 @@ interface SendMessageContext {
   onSubmit: (payload: MessagePayload) => void;
   onMinimizeHeight: () => void;
   preserveHeightOnSubmit: boolean;
+  exitFullscreen: () => void;
 }
 
 function sendMessageImpl(ctx: SendMessageContext): void {
@@ -959,6 +964,7 @@ function sendMessageImpl(ctx: SendMessageContext): void {
   ) {
     return;
   }
+  ctx.exitFullscreen();
   ctx.onSubmit({
     text: trimmed,
     attachments: ctx.attachments,
@@ -979,12 +985,14 @@ interface QueueMessageContext {
   onQueue: ((payload: MessagePayload) => void) | undefined;
   replaceText: (text: string) => void;
   onMinimizeHeight: () => void;
+  exitFullscreen: () => void;
 }
 
 function queueMessageImpl(ctx: QueueMessageContext): void {
   if (!ctx.onQueue) return;
   const trimmed = ctx.value.trim();
   if (!trimmed && ctx.attachments.length === 0) return;
+  ctx.exitFullscreen();
   ctx.onQueue({ text: trimmed, attachments: ctx.attachments, cwd: ctx.cwd });
   ctx.replaceText("");
   ctx.onMinimizeHeight();
@@ -1040,11 +1048,8 @@ function getComposerInputSnapshot(
   current: ComposerTextInputHandle | null,
   fallbackText: string,
   fallbackSelection: ComposerInputSnapshot["selection"],
-  mountedTextArea?: TextAreaHandle | null,
 ): ComposerInputSnapshot {
-  // The inner DOM ref can detach before the outer editing handle. Keep the mounted
-  // element available until this owner's ref callback captures the remount handoff.
-  const textArea = mountedTextArea ?? getWebTextAreaImpl(current);
+  const textArea = getWebTextAreaImpl(current);
   const text = textArea?.value ?? current?.getText() ?? fallbackText;
   const start = textArea?.selectionStart ?? fallbackSelection.start;
   const end = textArea?.selectionEnd ?? fallbackSelection.end;
@@ -1244,7 +1249,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       textReplacement,
       submitLabel,
     } = resolveMessageInputProps(props);
-    const { isActiveComposer } = useComposerKeyboardScope();
+    const { isPaneFocused } = useComposerKeyboardScope();
     const mode = resolveComposerInputMode(inputMode);
     const { t } = useTranslation();
     const isCompact = useIsCompactFormFactor();
@@ -1269,18 +1274,13 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const inputWrapperRef = useRef<View | null>(null);
     const textInputRef = useRef<ComposerTextInputHandle | null>(null);
     const isInputFocusedRef = useRef(false);
-    const handoff = editingSession.peekHandoff(textReplacement);
-    const focusIntentRef = useRef(Boolean(handoff?.focused));
-    const valueRef = useRef(handoff?.snapshot.text ?? value);
-    const selectionRef = useRef(
-      handoff?.snapshot.selection ?? { start: value.length, end: value.length },
-    );
-    const activeComposerRef = useRef(isActiveComposer);
-    activeComposerRef.current = isActiveComposer;
+    const focusIntentRef = useRef(false);
+    const valueRef = useRef(value);
+    const selectionRef = useRef({ start: value.length, end: value.length });
+    const paneFocusedRef = useRef(isPaneFocused);
+    paneFocusedRef.current = isPaneFocused;
     const [webTextArea, setWebTextArea] = useState<HTMLElement | null>(null);
     const appliedTextReplacementKeyRef = useRef(textReplacement.key);
-    const textReplacementRef = useRef(textReplacement);
-    textReplacementRef.current = textReplacement;
     const webTextareaRef = useRef<HTMLElement | null>(null);
     const updateLiveTextPresence = useCallback((text: string) => {
       const nextHasLiveText = text.trim().length > 0;
@@ -1289,43 +1289,60 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       setHasLiveText(nextHasLiveText);
     }, []);
 
-    const assignTextInput = useCallback(
-      (input: ComposerTextInputHandle | null) => {
-        const previous = textInputRef.current;
-        if (!input && previous) {
-          editingSession.captureForRemount({
-            snapshot: getComposerInputSnapshot(
-              previous,
-              valueRef.current,
-              selectionRef.current,
-              webTextareaRef.current,
-            ),
-            focused: previous.isFocused() || isInputFocusedRef.current,
-            replacementKey: appliedTextReplacementKeyRef.current,
-          });
-        }
-        textInputRef.current = input;
-        if (isWeb) {
-          const element = getWebTextAreaImpl(input) as HTMLElement | null;
-          webTextareaRef.current = element;
-          setWebTextArea(element);
-        }
-        if (!input) return;
-        const transfer = editingSession.takeHandoff(textReplacementRef.current);
-        if (transfer) {
-          appliedTextReplacementKeyRef.current = textReplacementRef.current.key;
-          valueRef.current = transfer.snapshot.text;
-          updateLiveTextPresence(transfer.snapshot.text);
-          selectionRef.current = transfer.snapshot.selection;
-          input.replaceText(transfer.snapshot.text, transfer.snapshot.selection);
-          if (transfer.focused && activeComposerRef.current) input.focus();
-        }
-      },
-      [editingSession, updateLiveTextPresence],
-    );
+    // One editor stays mounted through every layout mode, so this ref only follows
+    // the editor's own mount and unmount.
+    const assignTextInput = useCallback((input: ComposerTextInputHandle | null) => {
+      textInputRef.current = input;
+      if (!isWeb) return;
+      const element = getWebTextAreaImpl(input) as HTMLElement | null;
+      webTextareaRef.current = element;
+      setWebTextArea(element);
+    }, []);
+    // Only mouse-driven UIs restore editing focus on navigation. Touch users return
+    // to the conversation; replaying old focus would reopen their software keyboard.
+    // Read pointer capability when restoring, without making a pointer change itself
+    // a focus trigger.
     useLayoutEffect(() => {
-      if (isActiveComposer && focusIntentRef.current) textInputRef.current?.focus();
-    }, [isActiveComposer]);
+      const finePointer = hasFinePointer();
+      if (!isPaneFocused && isWeb && !finePointer) {
+        // Hiding a retained tab only blurs its editor after the browser renders.
+        // A quick return before that frame would otherwise keep touch focus.
+        textInputRef.current?.blur();
+      } else if (isPaneFocused && focusIntentRef.current && finePointer) {
+        textInputRef.current?.focus();
+      }
+    }, [isPaneFocused]);
+    // The compact and desktop screens mount the editor in different trees, so a
+    // viewport that crosses the breakpoint remounts it. The draft owner brings the
+    // text back; the session brings the caret and focus intent back. On web the
+    // owner may still hold an unpublished edit while the new editor mounts, so the
+    // caret is placed now against the text on screen and again when the owner's
+    // hydrated text arrives.
+    const retainedSelectionRef = useRef<{ start: number; end: number } | null>(null);
+    useLayoutEffect(() => {
+      const retained = editingSession.takeEditor();
+      if (retained) {
+        const text = textInputRef.current?.getText() ?? valueRef.current;
+        const selection = resolveRetainedSelection(retained.selection, text.length);
+        retainedSelectionRef.current = retained.selection;
+        selectionRef.current = selection;
+        textInputRef.current?.setSelection(selection);
+        if (retained.focused && hasFinePointer()) {
+          focusIntentRef.current = true;
+          if (paneFocusedRef.current) textInputRef.current?.focus();
+        }
+      }
+      return () => {
+        editingSession.retainEditor({
+          selection: getComposerInputSnapshot(
+            textInputRef.current,
+            valueRef.current,
+            selectionRef.current,
+          ).selection,
+          focused: isInputFocusedRef.current || focusIntentRef.current,
+        });
+      };
+    }, [editingSession]);
     const getLiveText = useCallback(() => valueRef.current, []);
     const composerHeight = useComposerHeight({
       getText: getLiveText,
@@ -1340,29 +1357,15 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const updateComposerHeightForText = measuredComposerHeight?.onTextChange;
     const resetComposerHeight = measuredComposerHeight?.reset;
 
-    const changePresentation = useCallback(
-      (fullscreen: boolean) => {
-        if (editingSession.getFullscreen() === fullscreen) return;
-        const snapshot = getComposerInputSnapshot(
-          textInputRef.current,
-          valueRef.current,
-          selectionRef.current,
-        );
-        editingSession.changePresentation(fullscreen, {
-          snapshot,
-          focused: textInputRef.current?.isFocused() ?? isInputFocusedRef.current,
-          replacementKey: appliedTextReplacementKeyRef.current,
-        });
-        valueRef.current = snapshot.text;
-        selectionRef.current = snapshot.selection;
-      },
-      [editingSession],
-    );
-    const exitFullscreen = useCallback(() => changePresentation(false), [changePresentation]);
+    const exitFullscreen = useCallback(() => editingSession.setFullscreen(false), [editingSession]);
+    const enterFullscreen = useCallback(() => editingSession.setFullscreen(true), [editingSession]);
 
+    // The conversation sizes itself against the inline composer; fullscreen covers it.
     const handleComposerLayout = useCallback(
-      (event: LayoutChangeEvent) => onHeightChange?.(event.nativeEvent.layout.height),
-      [onHeightChange],
+      (event: LayoutChangeEvent) => {
+        if (!isFullscreen) onHeightChange?.(event.nativeEvent.layout.height);
+      },
+      [isFullscreen, onHeightChange],
     );
 
     const replaceText = useCallback(
@@ -1427,8 +1430,15 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       updateComposerHeightForText?.(valueRef.current, textReplacement.text);
       valueRef.current = textReplacement.text;
       updateLiveTextPresence(textReplacement.text);
+      const retainedSelection =
+        textReplacement.kind === "hydrated" ? retainedSelectionRef.current : null;
+      retainedSelectionRef.current = null;
       if (textReplacement.text === "") {
         textInputRef.current?.reset();
+      } else if (retainedSelection) {
+        const selection = resolveRetainedSelection(retainedSelection, textReplacement.text.length);
+        selectionRef.current = selection;
+        textInputRef.current?.replaceText(textReplacement.text, selection);
       } else {
         textInputRef.current?.replaceText(textReplacement.text);
       }
@@ -1650,6 +1660,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         onSubmit,
         onMinimizeHeight: minimizeInputHeight,
         preserveHeightOnSubmit,
+        exitFullscreen,
       });
     }, [
       allowEmptySubmit,
@@ -1661,6 +1672,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       minimizeInputHeight,
       preserveHeightOnSubmit,
       updateLiveTextPresence,
+      exitFullscreen,
     ]);
 
     const handleQueueMessage = useCallback(
@@ -1672,8 +1684,9 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           onQueue,
           replaceText,
           onMinimizeHeight: minimizeInputHeight,
+          exitFullscreen,
         }),
-      [attachments, cwd, onQueue, replaceText, minimizeInputHeight],
+      [attachments, cwd, onQueue, replaceText, minimizeInputHeight, exitFullscreen],
     );
 
     const handleDefaultSendAction = useCallback(() => {
@@ -1696,16 +1709,18 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       });
     }, [defaultSendBehavior, isAgentRunning, handleSendMessage, handleQueueMessage, onQueue]);
 
-    const getWebTextArea = useCallback(
-      (): TextAreaHandle | null => getWebTextAreaImpl(textInputRef.current),
-      [],
-    );
+    const alternateSendAction = resolveAlternateSendAction({
+      defaultSendBehavior,
+      isAgentRunning,
+      onQueue,
+    });
 
-    useLayoutEffect(() => {
-      if (isWeb) {
-        webTextareaRef.current = getWebTextArea() as HTMLElement | null;
+    const handleLongPressSend = useCallback(() => {
+      if (alternateSendAction && isNative) {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
       }
-    }, [getWebTextArea, isFullscreen]);
+      handleAlternateSendAction();
+    }, [alternateSendAction, handleAlternateSendAction]);
 
     usePasteImagesEffect({
       textarea: webTextArea,
@@ -1740,8 +1755,6 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
             selectionRef.current,
           ),
           submitOnEnter: shouldSubmitOnEnter,
-          isAgentRunning,
-          onQueue,
           isSubmitDisabled,
           isSubmitLoading,
           disabled,
@@ -1753,8 +1766,6 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         shouldHandleWebKeyPress,
         onKeyPressCallback,
         shouldSubmitOnEnter,
-        isAgentRunning,
-        onQueue,
         isSubmitDisabled,
         isSubmitLoading,
         disabled,
@@ -1792,6 +1803,11 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       defaultActionQueues,
       defaultSendBehavior,
       isAgentRunning,
+      t,
+    });
+    const submitAccessibilityHint = resolveSubmitAccessibilityHint({
+      canPressLoadingButton,
+      alternateSendAction,
       t,
     });
 
@@ -1832,11 +1848,12 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     }, [onFocusChange]);
 
     const handleInputBlur = useCallback(() => {
-      if (activeComposerRef.current && !isFullscreen) focusIntentRef.current = false;
+      // A blur in the active pane is a dismissal; only hiding the pane preserves intent.
+      if (paneFocusedRef.current) focusIntentRef.current = false;
       isInputFocusedRef.current = false;
       setIsInputFocused(false);
       onFocusChange?.(false);
-    }, [isFullscreen, onFocusChange]);
+    }, [onFocusChange]);
 
     const handlePasteError = useCallback(
       (message: string) => {
@@ -1872,11 +1889,12 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const inputWrapperCombinedStyle = useMemo(
       () => [
         styles.inputWrapper,
+        isCompact && !isFullscreen && styles.inputWrapperCompact,
         readOnly && styles.inputWrapperReadOnly,
         inputWrapperStyle,
         { opacity: surfacePresentation.input.opacity },
       ],
-      [inputWrapperStyle, readOnly, surfacePresentation.input.opacity],
+      [inputWrapperStyle, isCompact, isFullscreen, readOnly, surfacePresentation.input.opacity],
     );
     // `withUnistyles` maps this component's `style` into a `.hash > *` child
     // rule, which ties on specificity with react-native-web's own
@@ -1888,8 +1906,9 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         styles.textInput,
         mode.isMonospace && styles.textInputMonospace,
         isFullscreen ? styles.fullscreenTextInput : composerHeightStyle,
+        isCompact && !isFullscreen && styles.compactTextInput,
       ],
-      [composerHeightStyle, mode.isMonospace, isFullscreen],
+      [composerHeightStyle, mode.isMonospace, isFullscreen, isCompact],
     );
     // Static content has no textarea to mirror, so it grows with its own text
     // instead of the measured input height.
@@ -1897,13 +1916,22 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       () => [styles.textInput, mode.isMonospace && styles.textInputMonospace, styles.readOnlyText],
       [mode.isMonospace],
     );
+    // Fullscreen always shows Send; without content it is disabled, and looks it.
+    const isPresentedSendDisabled = resolvePresentationSendDisabled({
+      fullscreen: isFullscreen,
+      disabled: isSendButtonDisabled,
+      hasText: hasLiveText,
+      attachments,
+      hasExternalContent,
+      allowEmpty: allowEmptySubmit,
+    });
     const sendButtonCombinedStyle = useMemo(
       () => [
         styles.sendButton,
         submitLabel ? styles.sendButtonLabeled : undefined,
-        isSendButtonDisabled && styles.buttonDisabled,
+        isPresentedSendDisabled && styles.buttonDisabled,
       ],
-      [isSendButtonDisabled, submitLabel],
+      [isPresentedSendDisabled, submitLabel],
     );
     const overlayContainerStyle = useMemo(
       () => [styles.overlayContainer, { opacity: surfacePresentation.overlay.opacity }],
@@ -1942,15 +1970,10 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           canPressLoadingButton={canPressLoadingButton}
           onSubmitLoadingPress={onSubmitLoadingPress}
           onDefaultSendAction={handleDefaultSendAction}
-          isSendButtonDisabled={resolvePresentationSendDisabled({
-            fullscreen: isFullscreen,
-            disabled: isSendButtonDisabled,
-            hasText: hasLiveText,
-            attachments,
-            hasExternalContent,
-            allowEmpty: allowEmptySubmit,
-          })}
+          onLongPressSend={handleLongPressSend}
+          isSendButtonDisabled={isPresentedSendDisabled}
           submitAccessibilityLabel={submitAccessibilityLabel}
+          submitAccessibilityHint={submitAccessibilityHint}
           sendButtonCombinedStyle={sendButtonCombinedStyle}
           isSubmitLoading={isSubmitLoading}
           submitIcon={submitIcon}
@@ -1968,12 +1991,10 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         canPressLoadingButton,
         onSubmitLoadingPress,
         handleDefaultSendAction,
-        isSendButtonDisabled,
-        hasLiveText,
-        attachments,
-        hasExternalContent,
-        allowEmptySubmit,
+        handleLongPressSend,
+        isPresentedSendDisabled,
         submitAccessibilityLabel,
+        submitAccessibilityHint,
         sendButtonCombinedStyle,
         isSubmitLoading,
         submitIcon,
@@ -2008,9 +2029,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
             onBlur={handleInputBlur}
             editable={!isDictating && !isRealtimeVoiceForCurrentAgent && !disabled}
             scrollEnabled={isComposerScrollEnabled}
-            autoFocus={
-              Boolean(editingSession.peekHandoff(textReplacement)?.focused) && isActiveComposer
-            }
+            autoFocus={false}
             onKeyPress={shouldHandleWebKeyPress ? handleDesktopKeyPress : undefined}
             onSelectionChange={handleSelectionChange}
             onPasteImages={onPasteImages}
@@ -2029,8 +2048,6 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       [
         readOnly,
         textReplacement,
-        editingSession,
-        isActiveComposer,
         assignTextInput,
         textInputStyle,
         readOnlyTextStyle,
@@ -2162,11 +2179,10 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         handleRealtimeVoiceStop,
       ],
     );
-    const enterFullscreen = useCallback(() => changePresentation(true), [changePresentation]);
     return (
       <View
         ref={rootRef}
-        style={styles.container}
+        style={isFullscreen ? styles.fullscreenContainer : styles.container}
         testID="message-input-root"
         onLayout={handleComposerLayout}
       >
@@ -2177,8 +2193,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         />
         <ComposerInputPresentation
           fullscreen={isFullscreen}
-          iconSize={buttonIconSize}
-          active={isActiveComposer}
+          sendIconSize={buttonIconSize}
           surface={textSurface}
           toolbar={toolbar}
           send={sendButton}
@@ -2205,6 +2220,10 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
 const styles = StyleSheet.create((theme: Theme) => ({
   container: {
     flexShrink: 1,
+    position: "relative",
+  },
+  fullscreenContainer: {
+    flex: 1,
     position: "relative",
   },
   inputWrapper: {
@@ -2236,19 +2255,27 @@ const styles = StyleSheet.create((theme: Theme) => ({
         }
       : {}),
   },
+  // Lifts the composer off the chat it sits under on phones.
+  inputWrapperCompact: {
+    ...theme.shadow.sm,
+  },
   // Dotted says "this surface is the same box, but there is nothing to type
   // into it" without swapping the border colour, which reads as an error state.
   inputWrapperReadOnly: {
     borderStyle: "dotted",
   },
-  compactTextSurface: { paddingRight: 36 },
+  // The band the fullscreen glyph sits in is the input's own padding, so a tap
+  // anywhere in it (under the glyph, or where the glyph would be) is a tap on the
+  // editor: it focuses, shows the keyboard, and places the caret. Reserved whether
+  // or not the glyph shows, so text never reflows when it appears.
+  compactTextInput: { paddingRight: 36 },
   fullscreenTextSurface: { flex: 1, minHeight: 0 },
   fullscreenTextInput: { flex: 1, height: "100%", textAlignVertical: "top" },
   lineMeasurement: {
     position: "absolute",
     top: 0,
     left: 0,
-    right: 36,
+    right: 0,
     opacity: 0,
     maxHeight: undefined,
     minHeight: undefined,

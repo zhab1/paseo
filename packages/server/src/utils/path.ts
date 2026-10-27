@@ -90,36 +90,9 @@ export function normalizePathForIdentity(value: string): string {
  * must keep those two operations coupled.
  */
 export function getRealpathAwareRelativePath(root: string, candidate: string): string | null {
-  return relativePathFromVariants(collectPathVariants(root), collectPathVariants(candidate));
-}
+  const rootVariants = collectPathVariants(root);
+  const candidateVariants = collectPathVariants(candidate);
 
-/** Resolve each path once during one synchronous event batch, never across batches. */
-export function createRealpathAwarePathResolver() {
-  const variants = new Map<string, string[]>();
-  const resolve = (path: string): string[] => {
-    let value = variants.get(path);
-    if (!value) {
-      value = collectPathVariants(path);
-      variants.set(path, value);
-    }
-    return value;
-  };
-  return {
-    relativePath: (root: string, candidate: string) =>
-      relativePathFromVariants(resolve(root), resolve(candidate)),
-    matches: (root: string, candidate: string) =>
-      resolve(root).some((rootVariant) =>
-        resolve(candidate).some((candidateVariant) =>
-          areEquivalentPaths(rootVariant, candidateVariant),
-        ),
-      ),
-  };
-}
-
-function relativePathFromVariants(
-  rootVariants: string[],
-  candidateVariants: string[],
-): string | null {
   for (const rootVariant of rootVariants) {
     for (const candidateVariant of candidateVariants) {
       const relativePath = getRelativePathInsideRoot(rootVariant, candidateVariant);
@@ -134,17 +107,18 @@ export function isRealpathInsideRoot(root: string, candidate: string): boolean {
   return getRealpathAwareRelativePath(root, candidate) !== null;
 }
 
-function getRelativePathInsideRoot(root: string, candidate: string): string | null {
+export function getRelativePathInsideRoot(root: string, candidate: string): string | null {
   const compareAsWindows = shouldCompareAsWindows(root, candidate);
   const platformPath = compareAsWindows ? nodePath.win32 : nodePath.posix;
   const normalizedRoot = normalizePathForComparison(root, compareAsWindows);
   const normalizedCandidate = normalizePathForComparison(candidate, compareAsWindows);
   const comparableRelative = platformPath.relative(normalizedRoot, normalizedCandidate);
 
-  if (
-    comparableRelative !== "" &&
-    (comparableRelative.startsWith("..") || platformPath.isAbsolute(comparableRelative))
-  ) {
+  const isOutsideRoot =
+    comparableRelative === ".." ||
+    comparableRelative.startsWith(`..${platformPath.sep}`) ||
+    platformPath.isAbsolute(comparableRelative);
+  if (isOutsideRoot) {
     return null;
   }
 
@@ -201,7 +175,7 @@ function normalizePathForComparison(value: string, compareAsWindows: boolean): s
   return compareAsWindows ? normalized.toLowerCase() : normalized;
 }
 
-function normalizePathPreservingCase(value: string, compareAsWindows: boolean): string {
+export function normalizePathPreservingCase(value: string, compareAsWindows: boolean): string {
   const platformPath = compareAsWindows ? nodePath.win32 : nodePath.posix;
   const comparableValue = compareAsWindows ? stripWindowsNamespacePrefix(value) : value;
   const platformNormalized = platformPath.normalize(comparableValue);

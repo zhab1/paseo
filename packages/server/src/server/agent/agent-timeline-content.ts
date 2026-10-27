@@ -6,17 +6,17 @@ const TOOL_CALL_CONTENT_MAX_LENGTH = 64 * 1024;
 export const AGENT_TIMELINE_ITEM_LIMIT = 200;
 export const PLUGIN_TIMELINE_DATA_MAX_BYTES = 64 * 1024;
 
-function copyContentPrefix(content: string, length = TOOL_CALL_CONTENT_MAX_LENGTH): string {
-  // V8 slices can retain the entire oversized source. Copy the UTF-16 code units,
-  // including a surrogate split at the existing character limit, into bounded storage.
-  return Buffer.from(content.slice(0, length), "utf16le").toString("utf16le");
-}
-
 export function assertPluginTimelineDataSize(data: JsonValue): void {
   const serializedBytes = Buffer.byteLength(JSON.stringify(data), "utf8");
   if (serializedBytes > PLUGIN_TIMELINE_DATA_MAX_BYTES) {
     throw new Error(`Plugin timeline item data exceeds ${PLUGIN_TIMELINE_DATA_MAX_BYTES} bytes`);
   }
+}
+
+/** A sliced string can keep the entire provider output alive. Copy only the retained UTF-16
+ * units, including an unmatched surrogate at the existing character limit. */
+function retainTextPrefix(text: string, length: number): string {
+  return Buffer.from(text.slice(0, length), "utf16le").toString("utf16le");
 }
 
 function limitFailedShellError(item: AgentTimelineItem): AgentTimelineItem {
@@ -36,7 +36,7 @@ function limitFailedShellError(item: AgentTimelineItem): AgentTimelineItem {
     ...item,
     error: {
       ...item.error,
-      content: copyContentPrefix(item.error.content),
+      content: retainTextPrefix(item.error.content, TOOL_CALL_CONTENT_MAX_LENGTH),
     },
   };
 }
@@ -56,7 +56,7 @@ function limitPlainText(item: AgentTimelineItem): AgentTimelineItem {
     detail: {
       ...item.detail,
       text:
-        copyContentPrefix(item.detail.text, TOOL_CALL_CONTENT_MAX_LENGTH - notice.length) + notice,
+        retainTextPrefix(item.detail.text, TOOL_CALL_CONTENT_MAX_LENGTH - notice.length) + notice,
     },
   };
 }
@@ -68,7 +68,10 @@ function limitUnknownOutput(item: AgentTimelineItem): AgentTimelineItem {
   const output = item.detail.output;
   const text = typeof output === "string" ? output : JSON.stringify(output, null, 2);
   if (text === undefined || text.length <= TOOL_CALL_CONTENT_MAX_LENGTH) return item;
-  return { ...item, detail: { ...item.detail, output: copyContentPrefix(text) } };
+  return {
+    ...item,
+    detail: { ...item.detail, output: retainTextPrefix(text, TOOL_CALL_CONTENT_MAX_LENGTH) },
+  };
 }
 
 export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTimelineItem {
@@ -89,7 +92,7 @@ export function limitAgentTimelineItemContent(item: AgentTimelineItem): AgentTim
     ...item,
     detail: {
       ...item.detail,
-      output: copyContentPrefix(item.detail.output),
+      output: retainTextPrefix(item.detail.output, TOOL_CALL_CONTENT_MAX_LENGTH),
     },
   };
 }

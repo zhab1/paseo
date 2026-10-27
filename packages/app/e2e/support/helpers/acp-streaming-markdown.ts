@@ -49,19 +49,18 @@ export async function requestAcpMarkdown(agent: AcpMarkdownAgent): Promise<void>
 export async function expectAcpMarkdown(page: Page, count: number): Promise<void> {
   // The message container has no semantic role; text and links inside it are user-facing assertions.
   const timestamp = /^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}:\d{2} UTC:$/;
-  const blocks = page.getByTestId("assistant-message");
-  await expect(blocks.filter({ hasText: timestamp })).toHaveCount(count);
-  const messages = blocks.filter({ hasNotText: timestamp });
+  const messages = page.getByTestId("assistant-message");
   await expect(messages).toHaveCount(count);
   for (let index = 0; index < count; index++) {
     const message = messages.nth(index);
-    await expect(message).toHaveText("•Current temperature: 25°C. Read Paseo docs.");
+    await expect(message.locator(".enrm-text > p")).toHaveText(timestamp);
+    await expect(message.getByRole("listitem")).toHaveText(
+      "Current temperature: 25°C. Read Paseo docs.",
+    );
     await expect(
       message.getByRole("link", { name: "Paseo docs" }).and(message.locator("a")),
     ).toHaveAttribute("href", "https://example.com/docs");
-    await expect(message.locator('[data-paseo-markdown-tag="strong"]')).toHaveText(
-      "Current temperature",
-    );
+    await expect(message.locator("strong")).toHaveText("Current temperature");
   }
 }
 

@@ -1,35 +1,16 @@
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import {
   areEquivalentPaths,
   createPathEquivalenceMatcher,
-  createRealpathAwarePathResolver,
   getRealpathAwareRelativePath,
   isPathInsideRoot,
 } from "./path.js";
 
 describe("path equivalence", () => {
-  test("a metadata batch resolves paths once instead of once per workspace comparison", () => {
-    const native = vi.spyOn(realpathSync, "native");
-    try {
-      const { relativePath } = createRealpathAwarePathResolver();
-      for (let workspace = 0; workspace < 8; workspace++) {
-        for (let event = 0; event < 64; event++) {
-          relativePath(
-            `/paseo-test/repo/.git/worktrees/w${workspace}`,
-            `/paseo-test/repo/.git/refs/heads/b${event}`,
-          );
-        }
-      }
-      expect(native).toHaveBeenCalledTimes(8 + 64);
-    } finally {
-      native.mockRestore();
-    }
-  });
-
   test.each([
     ["C:/Users/Administrator/GhostFactory", "C:\\Users\\Administrator\\GhostFactory"],
     ["d:\\Projects\\paseo", "D:\\Projects\\paseo"],
@@ -61,6 +42,35 @@ describe("path equivalence", () => {
     );
   });
 
+  test.each([
+    { root: "/repo", candidate: "/repo/..notes.txt", inside: true },
+    { root: "/repo", candidate: "/repo/..drafts/notes.md", inside: true },
+    { root: "/repo", candidate: "/repo/...drafts/notes.md", inside: true },
+    { root: "/repo", candidate: "/repo/docs/..notes.txt", inside: true },
+    { root: "/repo", candidate: "/repo", inside: true },
+    { root: "/repo", candidate: "/repo/../sibling/notes.md", inside: false },
+    { root: "/repo", candidate: "/repo/..drafts/../../outside.txt", inside: false },
+    { root: "/repo", candidate: "/repo-other/notes.md", inside: false },
+    { root: "C:\\Repo", candidate: "c:/repo/..notes.txt", inside: true },
+    { root: "C:\\Repo", candidate: "C:\\Repo\\..drafts\\notes.md", inside: true },
+    { root: "C:\\Repo", candidate: "C:\\Repo\\...drafts\\notes.md", inside: true },
+    { root: "C:\\Repo", candidate: "C:\\Repo\\..\\sibling\\notes.md", inside: false },
+    { root: "C:\\Repo", candidate: "C:\\Repo-other\\notes.md", inside: false },
+    { root: "C:\\Repo", candidate: "D:\\Repo\\..notes.txt", inside: false },
+    {
+      root: String.raw`\\server\share\repo`,
+      candidate: String.raw`\\server\share\repo\..drafts\notes.md`,
+      inside: true,
+    },
+    {
+      root: String.raw`\\?\C:\Repo`,
+      candidate: "C:\\Repo\\..notes.txt",
+      inside: true,
+    },
+  ])("checks named path containment for $candidate", ({ root, candidate, inside }) => {
+    expect(isPathInsideRoot(root, candidate)).toBe(inside);
+  });
+
   test("preserves the casing of Windows relative suffixes", () => {
     expect(getRealpathAwareRelativePath("C:\\Repo\\.git", "c:\\repo\\.git\\HEAD")).toBe("HEAD");
     expect(
@@ -78,23 +88,9 @@ describe("path equivalence", () => {
         const aliasRoot = join(tempDir, "root-alias");
         mkdirSync(nestedPath, { recursive: true });
         symlinkSync(realRoot, aliasRoot, "dir");
-        const nestedAlias = join(realRoot, "alias");
-        symlinkSync(realRoot, nestedAlias, "dir");
-        const resolver = createRealpathAwarePathResolver();
-        expect(resolver.matches(realRoot, nestedAlias)).toBe(true);
-        expect(resolver.relativePath(realRoot, nestedAlias)).toBe("alias");
 
         expect(getRealpathAwareRelativePath(aliasRoot, nestedPath)).toBe(join("packages", "app"));
         expect(getRealpathAwareRelativePath(aliasRoot, tempDir)).toBeNull();
-        const { relativePath: batch } = createRealpathAwarePathResolver();
-        expect(batch(aliasRoot, nestedPath)).toBe(join("packages", "app"));
-        expect(batch(aliasRoot, tempDir)).toBeNull();
-        unlinkSync(aliasRoot);
-        symlinkSync(tempDir, aliasRoot, "dir");
-        // A new callback must observe a changed link instead of retaining the prior resolution.
-        const { relativePath: nextBatch } = createRealpathAwarePathResolver();
-        expect(nextBatch(aliasRoot, nestedPath)).toBe(join("real-root", "packages", "app"));
-        expect(nextBatch(aliasRoot, tempDir)).toBe("");
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
