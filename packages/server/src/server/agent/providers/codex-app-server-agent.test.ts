@@ -104,6 +104,7 @@ import {
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
 import { AgentManager } from "../agent-manager.js";
+import { toStoredAgentRecord } from "../agent-projections.js";
 import { buildProviderRegistry } from "../provider-registry.js";
 
 interface CollaborationModeRecord {
@@ -5363,6 +5364,71 @@ describe("Codex app-server provider", () => {
       },
     });
   });
+
+  test.each([false, true])(
+    "reopens a stored session with no older history (has user message: %s)",
+    async (hasUserMessage) => {
+      const userTurns = hasUserMessage ? [["saved-user", "saved-turn"]] : [];
+      const appServer = createFakeCodexAppServer({
+        "thread/read": () => ({
+          thread: {
+            id: "saved-thread",
+            turns: [
+              {
+                id: "saved-turn",
+                status: "completed",
+                items: hasUserMessage
+                  ? [
+                      {
+                        type: "userMessage",
+                        id: "saved-user",
+                        content: [{ type: "text", text: "Hello" }],
+                      },
+                    ]
+                  : [],
+              },
+            ],
+          },
+        }),
+      });
+      const provider = createProviderWithFakeAppServer(appServer);
+      vi.spyOn(provider, "isAvailable").mockResolvedValue(true);
+      const manager = new AgentManager({
+        clients: { codex: provider },
+        logger: createTestLogger(),
+      });
+      const config = createConfig({ cwd: process.cwd() });
+      const agent = await manager.resumeAgentFromPersistence(
+        { provider: "codex", sessionId: "saved-thread" },
+        config,
+      );
+      const stored = toStoredAgentRecord(agent);
+      await manager.closeAgent(agent.id);
+      // The production persistence projection omits empty objects, including cursors.
+      expect(stored.persistence?.metadata?.historyState).toEqual({ userTurns });
+
+      const reopenedServer = createFakeCodexAppServer();
+      const reopened = await createProviderWithFakeAppServer(reopenedServer).resumeSession(
+        stored.persistence!,
+        config,
+        undefined,
+        { purpose: "history", loadHistory: false, deferNativeResume: true },
+      );
+      try {
+        expect(reopened.id).toBe("saved-thread");
+        expect(reopened.hasOlderHistory?.()).toBe(false);
+        await expect(reopened.loadOlderHistory?.()).resolves.toEqual([]);
+        expect(reopened.describePersistence()?.metadata?.historyState).toEqual({
+          cursors: {},
+          userTurns,
+        });
+        appServer.assertNoErrors();
+        reopenedServer.assertNoErrors();
+      } finally {
+        await reopened.close();
+      }
+    },
+  );
 
   test("continues older pages and preserves rewind targets across a config-only reload", async () => {
     const session = createSession();

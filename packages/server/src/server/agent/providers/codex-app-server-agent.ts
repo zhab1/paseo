@@ -3772,7 +3772,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.loadHistoryOnResume) {
       const history = z
         .object({
-          cursors: z.record(z.string(), CodexHistoryCursorSchema),
+          // Persistence projection omits empty objects when no older pages remain.
+          cursors: z.record(z.string(), CodexHistoryCursorSchema).default({}),
           userTurns: z.array(z.tuple([z.string(), z.string().nullable()])),
         })
         .optional()
