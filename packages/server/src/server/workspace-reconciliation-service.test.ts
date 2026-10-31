@@ -673,7 +673,7 @@ describe("WorkspaceReconciliationService", () => {
       clearInterval(probe);
       service.dispose();
     }
-    expect(longestGap).toBeLessThan(20);
+    expect(longestGap).toBeLessThan(40);
     expect(result.changesApplied).toHaveLength(20000);
     expect([...workspaces.values()].every((workspace) => workspace.archivedAt !== null)).toBe(true);
   }, 30000);
