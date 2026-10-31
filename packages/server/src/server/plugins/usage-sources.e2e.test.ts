@@ -6,11 +6,53 @@ import { expect, test } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
+import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 
 const fixtureRoot = fileURLToPath(new URL("./test-fixtures/", import.meta.url));
 const subprocessDirectory = fileURLToPath(
   new URL("./test-fixtures/usage-source-directory/", import.meta.url),
 );
+
+test("agent usage remains available after its idle runtime is released", async () => {
+  const provider = createTestAgentClient("codex");
+  const create = provider.createSession.bind(provider);
+  const resume = provider.resumeSession.bind(provider);
+  const descriptor = { provider: "codex", sessionKey: "usage-fixture", env: {} };
+  provider.createSession = async (...args) =>
+    Object.assign(await create(...args), { usageSession: () => descriptor });
+  provider.resumeSession = async (...args) =>
+    Object.assign(await resume(...args), { usageSession: () => descriptor });
+  const daemon = await createTestPaseoDaemon({
+    agentClients: { codex: provider },
+    builtinPlugins: new BuiltinPluginLoader(fixtureRoot, ["usage-source"]),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  try {
+    await client.connect();
+    const created = await client.createWorkspace({
+      source: { kind: "directory", path: daemon.paseoHome },
+    });
+    expect(created.error).toBeNull();
+    const agent = await client.createAgent({
+      provider: "codex",
+      cwd: daemon.paseoHome,
+      workspaceId: created.workspace!.id,
+    });
+    const first = await client.listUsageReports({ agentId: agent.id });
+    expect(first.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
+      "available",
+    );
+    await daemon.daemon.agentManager.closeAgent(agent.id);
+    expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+    const restored = await client.listUsageReports({ agentId: agent.id });
+    expect(
+      Object.fromEntries(restored.reports.map((entry) => [entry.id, entry.report.status])),
+    ).toEqual(Object.fromEntries(first.reports.map((entry) => [entry.id, entry.report.status])));
+  } finally {
+    await client.close();
+    await daemon.close();
+  }
+}, 60_000);
 
 test("lists built-in and subprocess usage; validates input and isolates fetch errors", async () => {
   const daemon = await createTestPaseoDaemon({
@@ -25,7 +67,7 @@ test("lists built-in and subprocess usage; validates input and isolates fetch er
     const first = await client.listUsageReports({}, (report) => updates.push(report.id));
     expect(updates).toEqual(first.reports.map((report) => report.id));
     await expect(client.listUsageReports({ agentId: "missing-agent" })).rejects.toThrow(
-      "Unknown agent",
+      "Agent not found",
     );
     expect(first.reports).toHaveLength(4);
     expect(first.reports[0]?.icon).toContain("<svg");

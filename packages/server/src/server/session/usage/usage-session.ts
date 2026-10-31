@@ -5,6 +5,7 @@ import type { SessionInboundMessage, SessionOutboundMessage } from "../../messag
 
 export interface UsageSessionOptions {
   emit(message: SessionOutboundMessage): void;
+  loadAgent(agentId: string): Promise<unknown>;
   runtime?: {
     listUsageReports(options: ListUsageReportsOptions): Promise<UsageReportEntry[]>;
     listLegacyUsage(): Promise<{ fetchedAt: string; providers: ProviderUsage[] }>;
@@ -20,6 +21,9 @@ export class UsageSession {
   ): Promise<void> {
     try {
       if (!this.options.runtime) throw new Error("Plugin runtime is unavailable");
+      if (msg.agentId !== undefined && msg.reportIds === undefined) {
+        await this.options.loadAgent(msg.agentId);
+      }
       await this.options.runtime.listUsageReports({
         forceRefresh: msg.forceRefresh,
         reportIds: msg.reportIds,
