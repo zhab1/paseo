@@ -3,10 +3,6 @@ import { expect, test } from "vitest";
 import type { SessionOutboundMessage } from "../../messages.js";
 import { UsageSession } from "./usage-session.js";
 
-async function unexpectedAgentLoad(): Promise<never> {
-  throw new Error("Account-wide requests must not load an agent");
-}
-
 test("lists reports from usage sources", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const requested: Array<{ forceRefresh?: boolean; reportIds?: string[] }> = [];
@@ -19,7 +15,6 @@ test("lists reports from usage sources", async () => {
     report: { status: "available" as const, windows: [] },
   };
   const usage = new UsageSession({
-    loadAgent: unexpectedAgentLoad,
     emit: (message) => emitted.push(message),
     runtime: {
       async listUsageReports(options) {
@@ -45,7 +40,6 @@ test("lists reports from usage sources", async () => {
 test("surfaces a legacy usage-list failure as an rpc_error envelope", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const usage = new UsageSession({
-    loadAgent: unexpectedAgentLoad,
     emit: (message) => emitted.push(message),
     runtime: {
       async listUsageReports() {
@@ -67,7 +61,6 @@ test("surfaces a legacy usage-list failure as an rpc_error envelope", async () =
 test("request failures terminate with an error response and no updates", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const usage = new UsageSession({
-    loadAgent: unexpectedAgentLoad,
     emit: (message) => emitted.push(message),
     logger: pino({ level: "silent" }),
   });
@@ -76,36 +69,6 @@ test("request failures terminate with an error response and no updates", async (
     {
       type: "usage.list_reports.response",
       payload: { requestId: "failed", error: "Plugin runtime is unavailable" },
-    },
-  ]);
-});
-
-test("reports restore failures without substituting account-wide usage", async () => {
-  const emitted: SessionOutboundMessage[] = [];
-  const usage = new UsageSession({
-    emit: (message) => emitted.push(message),
-    loadAgent: async () => {
-      throw new Error("Saved provider session is unavailable");
-    },
-    runtime: {
-      async listUsageReports() {
-        throw new Error("Usage must not be queried after a failed restore");
-      },
-      async listLegacyUsage() {
-        return { fetchedAt: "2026-01-01T00:00:00.000Z", providers: [] };
-      },
-    },
-    logger: pino({ level: "silent" }),
-  });
-  await usage.handleListReports({
-    type: "usage.list_reports.request",
-    requestId: "restore",
-    agentId: "saved-agent",
-  });
-  expect(emitted).toEqual([
-    {
-      type: "usage.list_reports.response",
-      payload: { requestId: "restore", error: "Saved provider session is unavailable" },
     },
   ]);
 });

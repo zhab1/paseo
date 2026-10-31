@@ -664,7 +664,8 @@ export async function createPaseoDaemon(
   const browserToolsBroker = new BrowserToolsBroker({});
   const pluginRuntime: PluginService = new PluginService(logger, daemonConfigStore, daemonVersion, {
     usageAgents: {
-      hasAgent: (id) => agentManager.getAgent(id) !== null,
+      hasAgent: async (id) =>
+        agentManager.getAgent(id) !== null || (await agentStorage.get(id)) !== null,
       usageSession: (id) => agentManager.usageSession(id),
     },
     managedSources: new ManagedPluginSources(config.paseoHome, {

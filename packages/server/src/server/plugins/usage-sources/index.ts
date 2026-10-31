@@ -31,7 +31,7 @@ interface KnownReport {
 }
 
 export interface AgentUsageLookup {
-  hasAgent(id: string): boolean;
+  hasAgent(id: string): boolean | Promise<boolean>;
   usageSession(id: string): AgentUsageSession | null;
 }
 
@@ -119,13 +119,13 @@ export class UsageSourceRegistry {
 
   private pruneAgents(): void {
     for (const id of this.byAgent.keys()) {
-      if (!this.agents.hasAgent(id)) this.byAgent.delete(id);
+      if (!this.agents.usageSession(id)) this.byAgent.delete(id);
     }
     this.mergeKnown();
   }
 
   private async discoverAgent(agentId: string): Promise<string[]> {
-    if (!this.agents.hasAgent(agentId)) throw new Error(`Unknown agent: ${agentId}`);
+    if (!(await this.agents.hasAgent(agentId))) throw new Error(`Unknown agent: ${agentId}`);
     const session = this.agents.usageSession(agentId);
     if (!session) {
       this.byAgent.delete(agentId);

@@ -1074,12 +1074,6 @@ export class Session {
     });
     this.usageSession = new UsageSession({
       emit: (msg) => this.emit(msg),
-      loadAgent: (agentId) =>
-        ensureAgentLoaded(agentId, {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-        }),
       runtime: pluginRuntime,
       logger: this.sessionLogger,
     });

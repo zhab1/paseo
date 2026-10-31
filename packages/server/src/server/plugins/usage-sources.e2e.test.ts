@@ -2,7 +2,7 @@ import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
@@ -13,15 +13,16 @@ const subprocessDirectory = fileURLToPath(
   new URL("./test-fixtures/usage-source-directory/", import.meta.url),
 );
 
-test("agent usage remains available after its idle runtime is released", async () => {
+test("usage recognizes a persisted agent without reopening its released runtime", async () => {
   const provider = createTestAgentClient("codex");
   const create = provider.createSession.bind(provider);
   const resume = provider.resumeSession.bind(provider);
   const descriptor = { provider: "codex", sessionKey: "usage-fixture", env: {} };
   provider.createSession = async (...args) =>
     Object.assign(await create(...args), { usageSession: () => descriptor });
-  provider.resumeSession = async (...args) =>
-    Object.assign(await resume(...args), { usageSession: () => descriptor });
+  provider.resumeSession = vi.fn(async (...args: Parameters<typeof resume>) =>
+    Object.assign(await resume(...args), { usageSession: () => descriptor }),
+  );
   const daemon = await createTestPaseoDaemon({
     agentClients: { codex: provider },
     builtinPlugins: new BuiltinPluginLoader(fixtureRoot, ["usage-source"]),
@@ -44,10 +45,16 @@ test("agent usage remains available after its idle runtime is released", async (
     );
     await daemon.daemon.agentManager.closeAgent(agent.id);
     expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
-    const restored = await client.listUsageReports({ agentId: agent.id });
-    expect(
-      Object.fromEntries(restored.reports.map((entry) => [entry.id, entry.report.status])),
-    ).toEqual(Object.fromEntries(first.reports.map((entry) => [entry.id, entry.report.status])));
+    const closed = await client.listUsageReports({ agentId: agent.id });
+    expect(closed.reports).toEqual([]);
+    expect(provider.resumeSession).not.toHaveBeenCalled();
+    expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+    await client.fetchAgentTimeline(agent.id, { limit: 20 });
+    expect(provider.resumeSession).toHaveBeenCalledOnce();
+    const reopened = await client.listUsageReports({ agentId: agent.id });
+    expect(reopened.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
+      "available",
+    );
   } finally {
     await client.close();
     await daemon.close();
@@ -67,7 +74,7 @@ test("lists built-in and subprocess usage; validates input and isolates fetch er
     const first = await client.listUsageReports({}, (report) => updates.push(report.id));
     expect(updates).toEqual(first.reports.map((report) => report.id));
     await expect(client.listUsageReports({ agentId: "missing-agent" })).rejects.toThrow(
-      "Agent not found",
+      "Unknown agent",
     );
     expect(first.reports).toHaveLength(4);
     expect(first.reports[0]?.icon).toContain("<svg");
