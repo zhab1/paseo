@@ -490,7 +490,10 @@ return `[]`. Global discovery lists every account, including expired logins.
 
 Resolve the session account from that session's launch environment. Return `[]` when no login exists.
 Never scan default stores from session discovery or scan agents from global discovery. Discovery is a query, with no agent
-lifecycle hooks. Closed agents have no session scope until resumed.
+lifecycle hooks. Releasing an idle or errored runtime retains its last launch scope in memory,
+so the agent's usage remains queryable without reopening the provider. A normal resume replaces
+that scope; archive and deletion discard it. After a daemon restart, a closed agent has no known
+launch scope until normally resumed. Launch environments are never persisted for usage queries.
 
 Inputs name credential stores; never put credentials in inputs or reports. Paseo validates each
 input against your schema before calling `fetch()`. The same key in any scope is the same report;
