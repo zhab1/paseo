@@ -55,6 +55,7 @@ import {
   type AgentStreamEvent,
   type AgentTimelineItem,
   type AgentUsage,
+  type AgentUsageSession,
   type AgentRuntimeInfo,
   type ImportedTimelineEntry,
   type ImportableProviderSession,
@@ -763,6 +764,8 @@ export class AgentManager {
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
+  // Keep only the launch descriptor when an idle runtime is released, never the session.
+  private readonly usageSessions = new Map<string, AgentUsageSession>();
   private readonly timelineStore: InMemoryAgentTimelineStore;
   private readonly providerSubagents: ProviderSubagentStore;
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
@@ -1406,7 +1409,9 @@ export class AgentManager {
 
   usageSession(id: string) {
     const agent = this.agents.get(id);
-    return agent?.session?.usageSession?.() ?? null;
+    const session = agent?.session?.usageSession?.();
+    if (session && !agent?.internal) this.usageSessions.set(id, session);
+    return session ?? this.usageSessions.get(id) ?? null;
   }
 
   getAgent(id: string): ManagedAgent | null {
@@ -1893,6 +1898,7 @@ export class AgentManager {
     let handedToRegistration = false;
     try {
       // A persisted thread can have only one writer, even when its turn is idle.
+      this.usageSession(agentId);
       await this.closeReloadedSession(existing.session, agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
@@ -2142,6 +2148,7 @@ export class AgentManager {
     if (canClose && !canClose()) return false;
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
+    this.usageSession(agentId);
     await agent.session.close();
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
@@ -4101,6 +4108,8 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
+      this.usageSessions.delete(resolvedAgentId);
+      this.usageSession(resolvedAgentId);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       if (session.initialTimeline?.length) {
@@ -4339,6 +4348,7 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.usageSessions.delete(agentId);
     this.quotaStoppedByUser.delete(agentId);
     this.timelineStore.delete(agentId);
     this.paseoToolPolicies.delete(agentId);

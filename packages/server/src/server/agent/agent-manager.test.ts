@@ -12095,35 +12095,47 @@ test("failed startup history closes the session without registering an agent", a
   }
 });
 
-test("usage session is a pure read of the live adapter and disappears on close", async () => {
-  const descriptor = {
-    provider: "claude",
-    model: "opus",
-    env: { HOME: "/fixture", CLAUDE_CONFIG_DIR: "/fixture/work" },
-    sessionKey: "launch-1",
-  };
-  const client = new (class extends TestAgentClient {
-    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-      return new (class extends TestAgentSession {
-        usageSession() {
-          return descriptor;
-        }
-      })(config);
+test.each([
+  { internal: false, closedSessionKey: "launch-1" },
+  { internal: true, closedSessionKey: undefined },
+])(
+  "usage retains only durable launch scopes after close: internal=$internal",
+  async ({ internal, closedSessionKey }) => {
+    const descriptor = {
+      provider: "claude",
+      model: "opus",
+      env: { HOME: "/fixture", CLAUDE_CONFIG_DIR: "/fixture/work" },
+      sessionKey: "launch-1",
+    };
+    const client = new (class extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return new (class extends TestAgentSession {
+          usageSession() {
+            return descriptor;
+          }
+        })(config);
+      }
+    })();
+    const manager = new AgentManager({ clients: { codex: client }, logger });
+    expect(manager.usageSession("missing")).toBeNull();
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: tmpdir(), internal },
+      undefined,
+      {
+        workspaceId: undefined,
+      },
+    );
+    try {
+      expect(manager.usageSession(agent.id)).toBe(descriptor);
+      expect(manager.usageSession(agent.id)).toBe(descriptor);
+    } finally {
+      await manager.closeAgent(agent.id);
     }
-  })();
-  const manager = new AgentManager({ clients: { codex: client }, logger });
-  expect(manager.usageSession("missing")).toBeNull();
-  const agent = await manager.createAgent({ provider: "codex", cwd: tmpdir() }, undefined, {
-    workspaceId: undefined,
-  });
-  try {
-    expect(manager.usageSession(agent.id)).toBe(descriptor);
-    expect(manager.usageSession(agent.id)).toBe(descriptor);
-  } finally {
-    await manager.closeAgent(agent.id);
-  }
-  expect(manager.usageSession(agent.id)).toBeNull();
-});
+    expect(manager.usageSession(agent.id)?.sessionKey).toBe(closedSessionKey);
+    await manager.deleteAgentState(agent.id);
+    expect(manager.usageSession(agent.id)).toBeNull();
+  },
+);
 
 test.each(["create", "import"])(
   "%s native pages retain stable cursors while older history is loaded on demand",

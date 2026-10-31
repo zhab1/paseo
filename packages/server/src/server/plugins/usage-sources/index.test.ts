@@ -412,7 +412,7 @@ test("session discovery reuses accounts, separates launches, and retains live ag
   ]);
   sessions.set("one", { provider: "claude", env: { HOME: "/new" }, sessionKey: "launch-3" });
   expect((await registry.listReports({ agentId: "one" })).map((r) => r.id)).toEqual(["claude:new"]);
-  // The durable agent still exists after its session closes.
+  // A durable agent can exist without a known launch scope after a daemon restart.
   sessions.delete("two");
   expect((await registry.listReports()).map((r) => r.id)).toEqual(["claude:default", "claude:new"]);
   await expect(registry.listReports({ agentId: "missing" })).rejects.toThrow("Unknown agent");

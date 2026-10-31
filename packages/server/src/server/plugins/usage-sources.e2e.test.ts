@@ -7,59 +7,79 @@ import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
+import type { AgentSession, AgentUsageSession } from "../agent/agent-sdk-types.js";
 
 const fixtureRoot = fileURLToPath(new URL("./test-fixtures/", import.meta.url));
 const subprocessDirectory = fileURLToPath(
   new URL("./test-fixtures/usage-source-directory/", import.meta.url),
 );
 
-test("usage recognizes a persisted agent without reopening its released runtime", async () => {
-  const provider = createTestAgentClient("codex");
-  const create = provider.createSession.bind(provider);
-  const resume = provider.resumeSession.bind(provider);
-  const descriptor = { provider: "codex", sessionKey: "usage-fixture", env: {} };
-  provider.createSession = async (...args) =>
-    Object.assign(await create(...args), { usageSession: () => descriptor });
-  provider.resumeSession = vi.fn(async (...args: Parameters<typeof resume>) =>
-    Object.assign(await resume(...args), { usageSession: () => descriptor }),
-  );
-  const daemon = await createTestPaseoDaemon({
-    agentClients: { codex: provider },
-    builtinPlugins: new BuiltinPluginLoader(fixtureRoot, ["usage-source"]),
-  });
-  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
-  try {
-    await client.connect();
-    const created = await client.createWorkspace({
-      source: { kind: "directory", path: daemon.paseoHome },
-    });
-    expect(created.error).toBeNull();
-    const agent = await client.createAgent({
+test.each([false, true])(
+  "usage survives runtime release with prior query=%s",
+  async (queryBeforeClose) => {
+    const provider = createTestAgentClient("codex");
+    const create = provider.createSession.bind(provider);
+    const resume = provider.resumeSession.bind(provider);
+    const descriptor = { provider: "codex", sessionKey: "usage-fixture", env: {} };
+    const resumedDescriptor = {
       provider: "codex",
-      cwd: daemon.paseoHome,
-      workspaceId: created.workspace!.id,
+      sessionKey: "usage-fixture-resumed",
+      env: { CODEX_HOME: "/next-account" },
+    };
+    function withUsage(session: AgentSession, scope: AgentUsageSession): AgentSession {
+      let closed = false;
+      const close = session.close.bind(session);
+      return Object.assign(session, {
+        usageSession: () => (closed ? null : scope),
+        close: async () => {
+          await close();
+          closed = true;
+        },
+      });
+    }
+    provider.createSession = async (...args) => withUsage(await create(...args), descriptor);
+    provider.resumeSession = vi.fn(async (...args: Parameters<typeof resume>) =>
+      withUsage(await resume(...args), resumedDescriptor),
+    );
+    const daemon = await createTestPaseoDaemon({
+      agentClients: { codex: provider },
+      builtinPlugins: new BuiltinPluginLoader(fixtureRoot, ["usage-source"]),
     });
-    const first = await client.listUsageReports({ agentId: agent.id });
-    expect(first.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
-      "available",
-    );
-    await daemon.daemon.agentManager.closeAgent(agent.id);
-    expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
-    const closed = await client.listUsageReports({ agentId: agent.id });
-    expect(closed.reports).toEqual([]);
-    expect(provider.resumeSession).not.toHaveBeenCalled();
-    expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
-    await client.fetchAgentTimeline(agent.id, { limit: 20 });
-    expect(provider.resumeSession).toHaveBeenCalledOnce();
-    const reopened = await client.listUsageReports({ agentId: agent.id });
-    expect(reopened.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
-      "available",
-    );
-  } finally {
-    await client.close();
-    await daemon.close();
-  }
-}, 60_000);
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    try {
+      await client.connect();
+      const created = await client.createWorkspace({
+        source: { kind: "directory", path: daemon.paseoHome },
+      });
+      expect(created.error).toBeNull();
+      const agent = await client.createAgent({
+        provider: "codex",
+        cwd: daemon.paseoHome,
+        workspaceId: created.workspace!.id,
+      });
+      if (queryBeforeClose) await client.listUsageReports({ agentId: agent.id });
+      await daemon.daemon.agentManager.closeAgent(agent.id);
+      expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+      const closed = await client.listUsageReports({ agentId: agent.id });
+      expect(closed.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
+        "available",
+      );
+      expect(provider.resumeSession).not.toHaveBeenCalled();
+      expect(daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+      await client.fetchAgentTimeline(agent.id, { limit: 20 });
+      expect(provider.resumeSession).toHaveBeenCalledOnce();
+      expect(daemon.daemon.agentManager.usageSession(agent.id)).toEqual(resumedDescriptor);
+      const reopened = await client.listUsageReports({ agentId: agent.id });
+      expect(reopened.reports.find((entry) => entry.id === "fixture:one")?.report.status).toBe(
+        "available",
+      );
+    } finally {
+      await client.close();
+      await daemon.close();
+    }
+  },
+  60_000,
+);
 
 test("lists built-in and subprocess usage; validates input and isolates fetch errors", async () => {
   const daemon = await createTestPaseoDaemon({
