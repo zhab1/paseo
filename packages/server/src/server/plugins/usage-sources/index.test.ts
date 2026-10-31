@@ -382,7 +382,7 @@ test("session discovery reuses accounts, separates launches, and retains live ag
   const discoveries: string[] = [];
   let fetches = 0;
   const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, {
-    hasAgent: (id) => existing.has(id),
+    hasAgent: async (id) => existing.has(id),
     usageSession: (id) => sessions.get(id) ?? null,
   });
   registry.register({
@@ -412,7 +412,7 @@ test("session discovery reuses accounts, separates launches, and retains live ag
   ]);
   sessions.set("one", { provider: "claude", env: { HOME: "/new" }, sessionKey: "launch-3" });
   expect((await registry.listReports({ agentId: "one" })).map((r) => r.id)).toEqual(["claude:new"]);
-  existing.delete("two");
+  // The durable agent still exists after its session closes.
   sessions.delete("two");
   expect((await registry.listReports()).map((r) => r.id)).toEqual(["claude:default", "claude:new"]);
   await expect(registry.listReports({ agentId: "missing" })).rejects.toThrow("Unknown agent");
