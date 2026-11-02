@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { hasQuotaContinuationPending } from "./quota-continuation-presentation.js";
+import { isContinuationStop } from "./continuation-stop.js";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -1003,7 +1004,7 @@ export class AgentManager {
       this.quotaContinuationAdmissions.set(options, onStarted);
       const iterator = this.streamAgent(
         agentId,
-        "Continue the task that was interrupted by the five-hour usage limit. Resume from the existing context and completed work.",
+        "Continue the interrupted task. Resume from the existing context and completed work.",
         options,
       );
       await iterator.next();
@@ -4888,11 +4889,7 @@ export class AgentManager {
   }
 
   private isExpectedQuotaWait(event: AgentStreamEvent): boolean {
-    return (
-      event.type === "turn_failed" &&
-      event.subscriptionLimit?.type === "five_hour" &&
-      !!this.quotaContinuationHooks
-    );
+    return isContinuationStop(event) && !!this.quotaContinuationHooks;
   }
 
   private quotaLifecycleCancellation(
@@ -4957,7 +4954,7 @@ export class AgentManager {
       return;
     try {
       const lastUserMessageAt = agent.lastUserMessageAt;
-      if (event.subscriptionLimit?.type === "five_hour") {
+      if (isContinuationStop(event)) {
         // A durable job must never outlive the durable ownership snapshot it references.
         await this.persistSnapshot(agent);
         if (
@@ -5237,8 +5234,7 @@ export class AgentManager {
     options: { fromHistory?: boolean } | undefined;
   }): Promise<void> {
     const { agent, event, eventTurnId, isForegroundEvent, terminalDisposition, options } = params;
-    const quotaWait =
-      event.subscriptionLimit?.type === "five_hour" && !!this.quotaContinuationHooks;
+    const quotaWait = this.isExpectedQuotaWait(event);
     this.logger[quotaWait ? "info" : "warn"](
       {
         agentId: agent.id,

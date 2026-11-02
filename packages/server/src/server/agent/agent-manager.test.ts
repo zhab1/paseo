@@ -1565,63 +1565,79 @@ async function createControlledInterruptFixture(options: {
   };
 }
 
-test("quota-stop hooks run after the matching main run has settled", async () => {
-  const fixture = await createControlledInterruptFixture({
-    name: "quota-settled",
-    agentId: "00000000-0000-4000-8000-000000000091",
-    turnId: "limited-turn",
-    provider: "claude",
-    interrupt: async () => {},
-  });
-  const observed = deferred<void>();
-  const attention = vi.fn();
-  fixture.manager.setAgentAttentionCallback(attention);
-  fixture.manager.setQuotaContinuationHooks({
-    cancel: async () => false,
-    stopped: async () => {
-      expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
-      setQuotaContinuationPending(fixture.agentId, true);
-      observed.resolve();
-    },
-  });
-  await fixture.startForegroundRun();
-  fixture.session.pushEvent({
-    type: "turn_failed",
-    provider: "claude",
-    turnId: "limited-turn",
-    error: "quota",
-    subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
-  });
-  await observed.promise;
-  await fixture.manager.flush();
-  expect(attention).not.toHaveBeenCalled();
-  setQuotaContinuationPending(fixture.agentId, false);
-  await fixture.cleanup();
-});
+test.each(["claude", "codex"] as const)(
+  "%s continuation hooks run after the matching main run has settled",
+  async (provider) => {
+    const fixture = await createControlledInterruptFixture({
+      name: "quota-settled",
+      agentId: "00000000-0000-4000-8000-000000000091",
+      turnId: "limited-turn",
+      provider,
+      interrupt: async () => {},
+    });
+    const observed = deferred<void>();
+    const attention = vi.fn();
+    fixture.manager.setAgentAttentionCallback(attention);
+    fixture.manager.setQuotaContinuationHooks({
+      cancel: async () => false,
+      stopped: async () => {
+        expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
+        setQuotaContinuationPending(fixture.agentId, true);
+        observed.resolve();
+      },
+    });
+    await fixture.startForegroundRun();
+    fixture.session.pushEvent({
+      type: "turn_failed",
+      provider,
+      turnId: "limited-turn",
+      error:
+        provider === "codex"
+          ? "Selected model is at capacity. Please try a different model."
+          : "quota",
+      ...(provider === "claude"
+        ? { subscriptionLimit: { type: "five_hour" as const, resetsAt: 1780000000 } }
+        : {}),
+    });
+    await observed.promise;
+    await fixture.manager.flush();
+    expect(attention).not.toHaveBeenCalled();
+    setQuotaContinuationPending(fixture.agentId, false);
+    await fixture.cleanup();
+  },
+);
 
-test("Stop before a queued quota terminal cannot rearm the task", async () => {
-  const fixture = await createControlledInterruptFixture({
-    name: "quota-stop-race",
-    agentId: "00000000-0000-4000-8000-000000000092",
-    turnId: "limited-turn",
-    provider: "claude",
-    interrupt: async (session) => {
-      session.pushEvent({
-        type: "turn_failed",
-        provider: "claude",
-        turnId: "limited-turn",
-        error: "quota",
-        subscriptionLimit: { type: "five_hour", resetsAt: 1780000000 },
-      });
-    },
-  });
-  const stopped = vi.fn(async () => {});
-  fixture.manager.setQuotaContinuationHooks({ cancel: async () => false, stopped });
-  await fixture.startForegroundRun();
-  await fixture.manager.cancelAgentRun(fixture.agentId);
-  expect(stopped).not.toHaveBeenCalled();
-  await fixture.cleanup();
-});
+test.each(["claude", "codex"] as const)(
+  "Stop before a queued %s terminal cannot rearm the task",
+  async (provider) => {
+    const fixture = await createControlledInterruptFixture({
+      name: "quota-stop-race",
+      agentId: "00000000-0000-4000-8000-000000000092",
+      turnId: "limited-turn",
+      provider,
+      interrupt: async (session) => {
+        session.pushEvent({
+          type: "turn_failed",
+          provider,
+          turnId: "limited-turn",
+          error:
+            provider === "codex"
+              ? "Selected model is at capacity. Please try a different model."
+              : "quota",
+          ...(provider === "claude"
+            ? { subscriptionLimit: { type: "five_hour" as const, resetsAt: 1780000000 } }
+            : {}),
+        });
+      },
+    });
+    const stopped = vi.fn(async () => {});
+    fixture.manager.setQuotaContinuationHooks({ cancel: async () => false, stopped });
+    await fixture.startForegroundRun();
+    await fixture.manager.cancelAgentRun(fixture.agentId);
+    expect(stopped).not.toHaveBeenCalled();
+    await fixture.cleanup();
+  },
+);
 
 test.each(["Stop", "weekly", "archive"])(
   "%s during quota admission cancels before the provider receives a prompt",

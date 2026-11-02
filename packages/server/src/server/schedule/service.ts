@@ -15,6 +15,7 @@ import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import { ScheduleStore } from "./store.js";
 import { setQuotaContinuationPending } from "../agent/quota-continuation-presentation.js";
+import { isCodexCapacityStop } from "../agent/continuation-stop.js";
 import { computeNextRunAt, validateScheduleCadence } from "./cron.js";
 import type {
   CreateScheduleInput,
@@ -505,7 +506,18 @@ export class ScheduleService {
     event: Extract<AgentStreamEvent, { type: "turn_failed" }>,
     lastUserMessageAt: string | null,
   ): Promise<void> {
-    if (event.provider !== "claude" || !event.turnId) return;
+    if (!event.turnId) return;
+    if (isCodexCapacityStop(event)) {
+      await this.armQuotaContinuation({
+        agentId,
+        turnId: this.quotaTurnIdentity(agentId, event.turnId),
+        lastUserMessageAt,
+        resetsAt: this.now().getTime() / 1000,
+        reason: "codex_capacity",
+      });
+      return;
+    }
+    if (event.provider !== "claude") return;
     if (event.subscriptionLimit?.type === "weekly") {
       await this.cancelQuotaContinuation(agentId);
       return;
@@ -520,7 +532,7 @@ export class ScheduleService {
   }
 
   private quotaTurnIdentity(agentId: string, turnId: string): string {
-    // Claude's turn ordinal restarts with its SDK runtime. Its existing usage key is unique
+    // Provider turn ordinals restart with their runtime. The existing usage key is unique
     // per runtime, while a persisted job must distinguish those otherwise equal ordinals.
     return `${this.agentManager.usageSession(agentId)?.sessionKey ?? agentId}:${turnId}`;
   }
@@ -530,6 +542,7 @@ export class ScheduleService {
     turnId: string;
     lastUserMessageAt: string | null;
     resetsAt: number;
+    reason?: "codex_capacity";
   }): Promise<StoredSchedule | null> {
     if (
       !Number.isFinite(input.resetsAt) ||
@@ -543,7 +556,7 @@ export class ScheduleService {
       if (
         !record ||
         record.archivedAt ||
-        record.provider !== "claude" ||
+        record.provider !== (input.reason === "codex_capacity" ? "codex" : "claude") ||
         (record.lastUserMessageAt ?? null) !== input.lastUserMessageAt ||
         (live && (live.lastUserMessageAt?.toISOString() ?? null) !== input.lastUserMessageAt) ||
         this.agentManager.hasInFlightRun(input.agentId)
@@ -564,7 +577,7 @@ export class ScheduleService {
       if (attempt > 2) {
         this.logger.warn(
           { agentId: input.agentId, turnId: input.turnId },
-          "Five-hour continuation retry limit reached; resume manually",
+          "Automatic continuation retry limit reached; resume manually",
         );
         return null;
       }
@@ -574,19 +587,23 @@ export class ScheduleService {
       const created = await this.store.create({
         ...this.buildScheduleRecord(
           {
-            prompt: "Resume after five-hour limit",
+            prompt: "Resume interrupted task",
             cadence: { type: "every", everyMs: 1000 },
             target: { type: "agent", agentId: input.agentId },
             maxRuns: 1,
           },
           {
             name: null,
-            prompt: "Resume after five-hour limit",
+            prompt: "Resume interrupted task",
             target: { type: "agent", agentId: input.agentId },
           },
         ),
-        nextRunAt: new Date(input.resetsAt * 1000 + 5000).toISOString(),
+        nextRunAt: new Date(
+          input.resetsAt * 1000 +
+            (input.reason === "codex_capacity" ? 60_000 * 2 ** attempt : 5000),
+        ).toISOString(),
         quotaContinuation: {
+          reason: input.reason,
           turnId: input.turnId,
           lastUserMessageAt: input.lastUserMessageAt,
           attempt,
@@ -595,7 +612,7 @@ export class ScheduleService {
       this.rememberQuotaOwnership(created);
       this.logger.info(
         { agentId: input.agentId, scheduleId: created.id, nextRunAt: created.nextRunAt, attempt },
-        "Five-hour task continuation scheduled",
+        "Interrupted task continuation scheduled",
       );
       this.presentQuotaWork(input.agentId, created.id);
       return created;
@@ -1172,6 +1189,8 @@ export class ScheduleService {
     const record = await this.agentStorage.get(agentId);
     if (!record || record.archivedAt)
       throw new ScheduleTargetGoneError(`Quota-stopped agent ${agentId} is unavailable`);
+    const provider = schedule.quotaContinuation.reason === "codex_capacity" ? "codex" : "claude";
+    if (record.provider !== provider) return { agentId, output: "Continuation provider changed" };
     try {
       await ensureAgentLoaded(agentId, {
         agentManager: this.agentManager,
@@ -1221,7 +1240,7 @@ export class ScheduleService {
     if (accepted === "busy") return { quotaDeferred: true };
     this.logger.info(
       { agentId, scheduleId: schedule.id, accepted },
-      "Five-hour continuation admission completed",
+      "Interrupted task continuation admission completed",
     );
     return {
       agentId,
