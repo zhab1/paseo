@@ -117,7 +117,14 @@ older cancellation from settling a newer turn. If interruption is rejected or ti
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
 Accepting new work after an ambiguous interruption would create a split-brain session.
 
-## Claude five-hour quota continuation
+## Automatic interruption continuation
+
+Codex chats stopped by “Selected model is at capacity. Please try a different model.” use the
+same durable scheduler as Claude quota stops. The scheduler retries the same conversation after
+one, two and four minutes, keeping its selected model and settings. These delays are retry
+intervals, not a prediction of capacity recovery. After three unsuccessful retries the chat
+shows an error requiring manual action. Other Codex failures do not schedule a continuation;
+native retries must finish in a failed turn first.
 
 Ordinary Claude chats automatically resume after a five-hour subscription quota stops their main
 task. The phone can be disconnected. Eligibility requires both a main-session API `rate_limit`

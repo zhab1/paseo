@@ -73,6 +73,7 @@ export const StoredScheduleSchema = z.object({
   // Optional metadata keeps the existing cadence and summary wire format readable by old clients.
   quotaContinuation: z
     .object({
+      reason: z.literal("codex_capacity").optional(),
       turnId: z.string(),
       lastUserMessageAt: z.string().nullable(),
       attempt: z.number().int().min(0).max(2),
