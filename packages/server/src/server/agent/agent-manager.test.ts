@@ -1566,7 +1566,7 @@ async function createControlledInterruptFixture(options: {
 }
 
 test.each(["claude", "codex"] as const)(
-  "%s continuation hooks run after the matching main run has settled",
+  "%s continuation preserves the error before scheduling recovery after the main run settles",
   async (provider) => {
     const fixture = await createControlledInterruptFixture({
       name: "quota-settled",
@@ -1576,12 +1576,18 @@ test.each(["claude", "codex"] as const)(
       interrupt: async () => {},
     });
     const observed = deferred<void>();
+    let timelineAtStop: AgentTimelineItem[] = [];
+    const error =
+      provider === "codex"
+        ? "Selected model is at capacity. Please try a different model."
+        : "quota";
     const attention = vi.fn();
     fixture.manager.setAgentAttentionCallback(attention);
     fixture.manager.setQuotaContinuationHooks({
       cancel: async () => false,
       stopped: async () => {
         expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
+        timelineAtStop = fixture.manager.getTimeline(fixture.agentId);
         setQuotaContinuationPending(fixture.agentId, true);
         observed.resolve();
       },
@@ -1591,16 +1597,17 @@ test.each(["claude", "codex"] as const)(
       type: "turn_failed",
       provider,
       turnId: "limited-turn",
-      error:
-        provider === "codex"
-          ? "Selected model is at capacity. Please try a different model."
-          : "quota",
+      error,
       ...(provider === "claude"
         ? { subscriptionLimit: { type: "five_hour" as const, resetsAt: 1780000000 } }
         : {}),
     });
     await observed.promise;
     await fixture.manager.flush();
+    expect(timelineAtStop).toContainEqual({
+      type: "assistant_message",
+      text: `[System Error] ${error}`,
+    });
     expect(attention).not.toHaveBeenCalled();
     setQuotaContinuationPending(fixture.agentId, false);
     await fixture.cleanup();

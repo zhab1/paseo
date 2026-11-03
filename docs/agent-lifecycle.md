@@ -119,6 +119,10 @@ Accepting new work after an ambiguous interruption would create a split-brain se
 
 ## Automatic interruption continuation
 
+Claude quota and Codex capacity failures remain visible as `[System Error]` timeline entries
+before automatic continuation. Pending recovery suppresses failure attention notifications,
+but preserves the original error in conversation history.
+
 Codex chats stopped by “Selected model is at capacity. Please try a different model.” use the
 same durable scheduler as Claude quota stops. The scheduler retries the same conversation after
 one, two and four minutes, keeping its selected model and settings. These delays are retry
