@@ -5255,14 +5255,12 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
-    if (!quotaWait) {
-      await this.appendSystemErrorTimelineMessage(
-        agent,
-        event.provider,
-        this.formatTurnFailedMessage(event),
-        options,
-      );
-    }
+    await this.appendSystemErrorTimelineMessage(
+      agent,
+      event.provider,
+      this.formatTurnFailedMessage(event),
+      options,
+    );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
     if (!isForegroundEvent && !agent.activeForegroundTurnId && !quotaWait) {
       this.emitState(agent);
