@@ -1187,6 +1187,8 @@ describe("ScheduleService", () => {
       expect((await service.inspect(job.id)).runs.map((run) => run.output)).toEqual(
         outcome === "failed" ? [] : ["Continuation delivered"],
       );
+      await manager.waitForAgentEvent(input.agentId, { waitForActive: true });
+      expect(manager.hasInFlightRun(input.agentId)).toBe(false);
       await manager.flush();
     },
   );
