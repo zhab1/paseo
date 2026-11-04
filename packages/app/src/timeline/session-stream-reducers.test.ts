@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { capAssistantMessageForRender } from "@/components/assistant-message-render-limit.native";
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import type { AgentTimelineItem, ToolCallDetail } from "@getpaseo/protocol/agent-types";
 import {
@@ -514,6 +515,30 @@ describe("processTimelineResponse", () => {
         timelineCursor: { epoch: "timeline-1", seq: 42 },
       }),
     ]);
+  });
+
+  it.each([
+    "[System Error] Selected model is at capacity. Please try a different model.",
+    "You've hit your session limit · resets 5:50am (UTC)",
+  ])("keeps a restored refusal visible before automatic continuation: %s", (text) => {
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      payload: {
+        ...baseTimelineInput.payload,
+        entries: [
+          makeTimelineEntry(40, text),
+          makeTimelineEntry(41, "Continue the interrupted task.", "user_message"),
+        ],
+      },
+    });
+    expect(result.tail).toMatchObject([
+      { kind: "assistant_message", text },
+      { kind: "user_message", text: "Continue the interrupted task." },
+    ]);
+    expect(capAssistantMessageForRender(getAssistantTexts(result.tail)[0])).toEqual({
+      text,
+      capped: false,
+    });
   });
 
   it("returns error path when payload.error is set", () => {

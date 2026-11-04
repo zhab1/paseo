@@ -2106,6 +2106,56 @@ function readCodexHistoricalTurnStatus(
   }
 }
 
+function readCodexTurnError(turn: Record<string, unknown>): AgentTimelineItem | null {
+  const error = toObjectRecord(turn.error);
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  return turn.status === "failed" && message
+    ? {
+        type: "assistant_message",
+        messageId: `paseo-turn-error:${turn.id}`,
+        text: `[System Error] ${message}`,
+      }
+    : null;
+}
+
+async function readCodexHistoryGroups(
+  history: Awaited<ReturnType<typeof openCodexHistory>>,
+  cwd: string | null,
+  cursor?: CodexHistoryCursor,
+) {
+  const groups = [];
+  let newerTurnId = cursor?.newerTurnId;
+  for await (const entry of history.items) {
+    if (entry.turn.id !== newerTurnId) {
+      newerTurnId = entry.turn.id;
+      const item = readCodexTurnError(entry.turn);
+      if (item) {
+        // Native pages are newest first. Put the terminal error before the turn's
+        // newest item here so reversal places it after that turn's final output.
+        groups.push({
+          items: [item],
+          turn: entry.turn,
+          timestamp: readCodexTurnHistoryTimestamp(entry.turn, item),
+          activity: null,
+          childThreadIds: [],
+        });
+      }
+    }
+    const activity = readCodexSubAgentActivity(entry.item);
+    groups.push({
+      items: threadItemToTimelineEntries(entry.item, { cwd }).map(limitAgentTimelineItemContent),
+      turn: entry.turn,
+      timestamp:
+        readCodexHistoryTimestamp(entry.item) ??
+        normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
+        normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
+      activity,
+      childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
+    });
+  }
+  return groups;
+}
+
 async function loadCodexThreadHistoryTimeline(params: {
   threadId: string;
   cwd: string | null;
@@ -2119,22 +2169,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     params.throughTurnId,
     params.cursor,
   );
-  const groups = [];
-  for await (const entry of history.items) {
-    const activity = readCodexSubAgentActivity(entry.item);
-    groups.push({
-      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map(
-        limitAgentTimelineItemContent,
-      ),
-      turn: entry.turn,
-      timestamp:
-        readCodexHistoryTimestamp(entry.item) ??
-        normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
-        normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
-      activity,
-      childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
-    });
-  }
+  const groups = await readCodexHistoryGroups(history, params.cwd, params.cursor);
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
   for (const group of groups.toReversed()) {

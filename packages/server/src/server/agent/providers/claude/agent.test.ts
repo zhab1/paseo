@@ -53,6 +53,33 @@ afterEach(() => {
 });
 
 describe("convertClaudeHistoryEntry", () => {
+  test("keeps a saved quota refusal before the continuation on replay", () => {
+    const refusal = "You've hit your session limit · resets 5:50am (UTC)";
+    const entries = [
+      {
+        type: "assistant",
+        error: "rate_limit",
+        isApiErrorMessage: true,
+        message: { content: [{ type: "text", text: refusal }] },
+      },
+      { type: "user", message: { content: "Continue the interrupted task." } },
+    ];
+    const convertText: Parameters<typeof convertClaudeHistoryEntry>[1] = (content) => {
+      if (typeof content === "string") return [{ type: "assistant_message", text: content }];
+      const items: AgentTimelineItem[] = [];
+      for (const block of content) {
+        if (block.type === "text" && typeof block.text === "string")
+          items.push({ type: "assistant_message", text: block.text });
+      }
+      return items;
+    };
+    const restored = entries.flatMap((entry) => convertClaudeHistoryEntry(entry, convertText));
+    expect(restored).toMatchObject([
+      { type: "assistant_message", text: refusal },
+      { type: "user_message", text: "Continue the interrupted task." },
+    ]);
+  });
+
   test("maps user tool results to timeline items", () => {
     const toolUseId = "toolu_test";
     const entry = {
