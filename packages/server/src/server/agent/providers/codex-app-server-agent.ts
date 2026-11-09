@@ -2106,6 +2106,72 @@ function readCodexHistoricalTurnStatus(
   }
 }
 
+function readCodexTurnError(
+  turn: Record<string, unknown>,
+  itemCompletedAtMs: unknown,
+): AgentTimelineItem | null {
+  const turnCompletedAt = normalizeProviderReplayTimestamp(turn.completedAt);
+  const itemCompletedAt = normalizeProviderReplayTimestamp(itemCompletedAtMs);
+  // A tool can finish after the failed turn and even after continuation starts.
+  // Native turn timestamps have second precision; item timestamps have milliseconds.
+  if (
+    turnCompletedAt &&
+    itemCompletedAt &&
+    Math.floor(Date.parse(itemCompletedAt) / 1000) > Math.floor(Date.parse(turnCompletedAt) / 1000)
+  )
+    return null;
+  const error = toObjectRecord(turn.error);
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+  return turn.status === "failed" && message
+    ? {
+        type: "assistant_message",
+        messageId: `paseo-turn-error:${turn.id}`,
+        text: `[System Error] ${message}`,
+      }
+    : null;
+}
+
+async function readCodexHistoryGroups(
+  history: Awaited<ReturnType<typeof openCodexHistory>>,
+  cwd: string | null,
+  cursor?: CodexHistoryCursor,
+) {
+  const groups = [];
+  const errorTurnIds = new Set(cursor?.errorTurnIds);
+  for await (const entry of history.items) {
+    if (!errorTurnIds.has(entry.turn.id)) {
+      const item = readCodexTurnError(
+        entry.turn,
+        "completedAtMs" in entry ? entry.completedAtMs : undefined,
+      );
+      if (item) {
+        errorTurnIds.add(entry.turn.id);
+        // Native pages are newest first. Put the terminal error before the turn's
+        // newest item here so reversal places it after that turn's final output.
+        groups.push({
+          items: [item],
+          turn: entry.turn,
+          timestamp: readCodexTurnHistoryTimestamp(entry.turn, item),
+          activity: null,
+          childThreadIds: [],
+        });
+      }
+    }
+    const activity = readCodexSubAgentActivity(entry.item);
+    groups.push({
+      items: threadItemToTimelineEntries(entry.item, { cwd }).map(limitAgentTimelineItemContent),
+      turn: entry.turn,
+      timestamp:
+        readCodexHistoryTimestamp(entry.item) ??
+        normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
+        normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
+      activity,
+      childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
+    });
+  }
+  return { groups, errorTurnIds: [...errorTurnIds] };
+}
+
 async function loadCodexThreadHistoryTimeline(params: {
   threadId: string;
   cwd: string | null;
@@ -2119,22 +2185,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     params.throughTurnId,
     params.cursor,
   );
-  const groups = [];
-  for await (const entry of history.items) {
-    const activity = readCodexSubAgentActivity(entry.item);
-    groups.push({
-      items: threadItemToTimelineEntries(entry.item, { cwd: params.cwd }).map(
-        limitAgentTimelineItemContent,
-      ),
-      turn: entry.turn,
-      timestamp:
-        readCodexHistoryTimestamp(entry.item) ??
-        normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
-        normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
-      activity,
-      childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
-    });
-  }
+  const { groups, errorTurnIds } = await readCodexHistoryGroups(history, params.cwd, params.cursor);
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
   for (const group of groups.toReversed()) {
@@ -2188,7 +2239,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     timeline,
     subAgentRoutes,
     latestTurnStatus: readCodexHistoricalTurnStatus(history.turns),
-    nextCursor: history.nextCursor,
+    nextCursor: history.nextCursor ? { ...history.nextCursor, errorTurnIds } : null,
   };
 }
 

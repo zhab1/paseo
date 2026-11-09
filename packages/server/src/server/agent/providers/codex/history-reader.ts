@@ -37,6 +37,8 @@ export const CodexHistoryCursorSchema = z.object({
   nativeCursor: z.string().nullable(),
   turnIndex: z.number().int().nonnegative(),
   legacyItemIndex: z.number().int().nonnegative().optional(),
+  // Failed-turn errors already emitted on newer pages, including interleaved items.
+  errorTurnIds: z.array(z.string()).optional(),
 });
 export type CodexHistoryCursor = z.infer<typeof CodexHistoryCursorSchema>;
 

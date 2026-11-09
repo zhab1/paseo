@@ -6343,6 +6343,90 @@ describe("Codex app-server provider", () => {
     },
   );
 
+  test.each([undefined, "legacy", "interleaved"])(
+    "restores a capacity error before continuation across %s history pages",
+    async (historyMode) => {
+      const error = "Selected model is at capacity. Please try a different model.";
+      const turns = [
+        {
+          id: "failed",
+          status: "failed",
+          error: { message: error },
+          completedAt: 1793685709,
+          items: Array.from({ length: 405 }, (_, i) => ({
+            type: "agentMessage",
+            id: `answer-${i}`,
+            text: `Answer ${i}`,
+          })),
+        },
+        {
+          id: "continued",
+          status: "completed",
+          items: [
+            {
+              type: "userMessage",
+              id: "continue",
+              content: [{ type: "text", text: "Continue the interrupted task." }],
+            },
+          ],
+        },
+      ];
+      const nativeItems = [];
+      for (const turn of turns) {
+        for (const item of turn.items) nativeItems.push({ turnId: turn.id, item });
+      }
+      const lateTool = {
+        turnId: "failed",
+        item: {
+          type: "commandExecution",
+          id: "late-tool",
+          command: "sleep 600",
+          status: "completed",
+        },
+        startedAtMs: 1793685586524,
+        completedAtMs: 1793686294013,
+      };
+      const interleavedItems = [lateTool, ...nativeItems.toReversed()];
+      for (let restart = 0; restart < 2; restart++) {
+        const session = createSession();
+        const request = pagedHistoryRequest(async () => ({ thread: { historyMode, turns } }));
+        session.client = {
+          async request(method, params) {
+            if (historyMode !== "interleaved" || method !== "thread/items/list")
+              return request(method, params);
+            const input = params as { cursor?: string; limit: number };
+            const start = Number(input.cursor ?? 0);
+            const end = start + input.limit;
+            return {
+              data: interleavedItems.slice(start, end),
+              nextCursor: end < interleavedItems.length ? String(end) : null,
+            };
+          },
+        };
+        await asInternals(session).loadPersistedHistory(session.client);
+        const store = new InMemoryAgentTimelineStore();
+        store.initialize("a", { nextSeq: PAGED_HISTORY_ORIGIN });
+        for await (const event of session.streamHistory()) {
+          if (event.type === "timeline")
+            store.append("a", event.item, { timestamp: event.timestamp });
+        }
+        while (session.hasOlderHistory()) store.prepend("a", await session.loadOlderHistory());
+        const rows = store.fetch("a", { limit: 0 }).rows;
+        const errors = rows.filter(
+          (row) => row.item.type === "assistant_message" && row.item.text.includes(error),
+        );
+        expect(errors).toHaveLength(1);
+        expect(errors[0].timestamp).toBe("2026-11-03T06:01:49.000Z");
+        const index = rows.indexOf(errors[0]);
+        expect(rows.slice(index - 1, index + 2).map((row) => row.item)).toMatchObject([
+          { type: "assistant_message", text: "Answer 404" },
+          { type: "assistant_message", text: `[System Error] ${error}` },
+          { type: "user_message", text: "Continue the interrupted task." },
+        ]);
+      }
+    },
+  );
+
   test("imports the native first prompt from metadata without paging back through history", async () => {
     const session = createSession();
     const items = Array.from({ length: 401 }, (_, i) => ({
