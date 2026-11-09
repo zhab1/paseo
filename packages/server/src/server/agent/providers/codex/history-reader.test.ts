@@ -254,7 +254,7 @@ describe("native paged history", () => {
     expect(items[0]).toMatchObject({ item: { id: "item-10300" }, startedAtMs: 1791380000000 });
     expect(items.at(-1)?.item).toEqual({ id: "item-10101" });
     expect(pages).toBe(5);
-    expect(history.nextCursor).toEqual({ nativeCursor: "200", turnIndex: 0, newerTurnId: "turn" });
+    expect(history.nextCursor).toEqual({ nativeCursor: "200", turnIndex: 0 });
     const older = await openCodexHistory(client, "root", undefined, history.nextCursor!);
     const oldItems = [];
     for await (const entry of older.items) oldItems.push(entry.item);

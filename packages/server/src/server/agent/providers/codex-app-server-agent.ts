@@ -2106,7 +2106,20 @@ function readCodexHistoricalTurnStatus(
   }
 }
 
-function readCodexTurnError(turn: Record<string, unknown>): AgentTimelineItem | null {
+function readCodexTurnError(
+  turn: Record<string, unknown>,
+  itemCompletedAtMs: unknown,
+): AgentTimelineItem | null {
+  const turnCompletedAt = normalizeProviderReplayTimestamp(turn.completedAt);
+  const itemCompletedAt = normalizeProviderReplayTimestamp(itemCompletedAtMs);
+  // A tool can finish after the failed turn and even after continuation starts.
+  // Native turn timestamps have second precision; item timestamps have milliseconds.
+  if (
+    turnCompletedAt &&
+    itemCompletedAt &&
+    Math.floor(Date.parse(itemCompletedAt) / 1000) > Math.floor(Date.parse(turnCompletedAt) / 1000)
+  )
+    return null;
   const error = toObjectRecord(turn.error);
   const message = typeof error?.message === "string" ? error.message.trim() : "";
   return turn.status === "failed" && message
@@ -2124,12 +2137,15 @@ async function readCodexHistoryGroups(
   cursor?: CodexHistoryCursor,
 ) {
   const groups = [];
-  let newerTurnId = cursor?.newerTurnId;
+  const errorTurnIds = new Set(cursor?.errorTurnIds);
   for await (const entry of history.items) {
-    if (entry.turn.id !== newerTurnId) {
-      newerTurnId = entry.turn.id;
-      const item = readCodexTurnError(entry.turn);
+    if (!errorTurnIds.has(entry.turn.id)) {
+      const item = readCodexTurnError(
+        entry.turn,
+        "completedAtMs" in entry ? entry.completedAtMs : undefined,
+      );
       if (item) {
+        errorTurnIds.add(entry.turn.id);
         // Native pages are newest first. Put the terminal error before the turn's
         // newest item here so reversal places it after that turn's final output.
         groups.push({
@@ -2153,7 +2169,7 @@ async function readCodexHistoryGroups(
       childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
     });
   }
-  return groups;
+  return { groups, errorTurnIds: [...errorTurnIds] };
 }
 
 async function loadCodexThreadHistoryTimeline(params: {
@@ -2169,7 +2185,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     params.throughTurnId,
     params.cursor,
   );
-  const groups = await readCodexHistoryGroups(history, params.cwd, params.cursor);
+  const { groups, errorTurnIds } = await readCodexHistoryGroups(history, params.cwd, params.cursor);
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
   for (const group of groups.toReversed()) {
@@ -2223,7 +2239,7 @@ async function loadCodexThreadHistoryTimeline(params: {
     timeline,
     subAgentRoutes,
     latestTurnStatus: readCodexHistoricalTurnStatus(history.turns),
-    nextCursor: history.nextCursor,
+    nextCursor: history.nextCursor ? { ...history.nextCursor, errorTurnIds } : null,
   };
 }
 

@@ -122,8 +122,8 @@ Accepting new work after an ambiguous interruption would create a split-brain se
 Claude quota and Codex capacity failures remain visible as `[System Error]` timeline entries
 before automatic continuation. Pending recovery suppresses failure attention notifications,
 not the error text. Codex history restoration also projects the native failed turn's error
-after its last message and before the next turn. Paging through a long failed turn must not
-repeat that error. Claude's saved quota-refusal assistant text is preserved during replay.
+before continuation, even when an earlier tool finishes after continuation starts. Paging
+must not repeat that error. Claude's saved quota-refusal assistant text is preserved during replay.
 
 Codex chats stopped by “Selected model is at capacity. Please try a different model.” use the
 same durable scheduler as Claude quota stops. The scheduler retries the same conversation after

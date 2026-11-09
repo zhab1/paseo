@@ -6343,7 +6343,7 @@ describe("Codex app-server provider", () => {
     },
   );
 
-  test.each([undefined, "legacy"])(
+  test.each([undefined, "legacy", "interleaved"])(
     "restores a capacity error before continuation across %s history pages",
     async (historyMode) => {
       const error = "Selected model is at capacity. Please try a different model.";
@@ -6371,10 +6371,37 @@ describe("Codex app-server provider", () => {
           ],
         },
       ];
+      const nativeItems = [];
+      for (const turn of turns) {
+        for (const item of turn.items) nativeItems.push({ turnId: turn.id, item });
+      }
+      const lateTool = {
+        turnId: "failed",
+        item: {
+          type: "commandExecution",
+          id: "late-tool",
+          command: "sleep 600",
+          status: "completed",
+        },
+        startedAtMs: 1793685586524,
+        completedAtMs: 1793686294013,
+      };
+      const interleavedItems = [lateTool, ...nativeItems.toReversed()];
       for (let restart = 0; restart < 2; restart++) {
         const session = createSession();
+        const request = pagedHistoryRequest(async () => ({ thread: { historyMode, turns } }));
         session.client = {
-          request: pagedHistoryRequest(async () => ({ thread: { historyMode, turns } })),
+          async request(method, params) {
+            if (historyMode !== "interleaved" || method !== "thread/items/list")
+              return request(method, params);
+            const input = params as { cursor?: string; limit: number };
+            const start = Number(input.cursor ?? 0);
+            const end = start + input.limit;
+            return {
+              data: interleavedItems.slice(start, end),
+              nextCursor: end < interleavedItems.length ? String(end) : null,
+            };
+          },
         };
         await asInternals(session).loadPersistedHistory(session.client);
         const store = new InMemoryAgentTimelineStore();
@@ -6390,7 +6417,8 @@ describe("Codex app-server provider", () => {
         );
         expect(errors).toHaveLength(1);
         expect(errors[0].timestamp).toBe("2026-11-03T06:01:49.000Z");
-        expect(rows.slice(-3).map((row) => row.item)).toMatchObject([
+        const index = rows.indexOf(errors[0]);
+        expect(rows.slice(index - 1, index + 2).map((row) => row.item)).toMatchObject([
           { type: "assistant_message", text: "Answer 404" },
           { type: "assistant_message", text: `[System Error] ${error}` },
           { type: "user_message", text: "Continue the interrupted task." },

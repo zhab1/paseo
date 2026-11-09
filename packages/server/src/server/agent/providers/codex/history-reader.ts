@@ -37,8 +37,8 @@ export const CodexHistoryCursorSchema = z.object({
   nativeCursor: z.string().nullable(),
   turnIndex: z.number().int().nonnegative(),
   legacyItemIndex: z.number().int().nonnegative().optional(),
-  // A turn spanning pages has already projected its terminal error on the newer page.
-  newerTurnId: z.string().optional(),
+  // Failed-turn errors already emitted on newer pages, including interleaved items.
+  errorTurnIds: z.array(z.string()).optional(),
 });
 export type CodexHistoryCursor = z.infer<typeof CodexHistoryCursorSchema>;
 
@@ -124,17 +124,10 @@ export async function openCodexHistory(
         for (let index = itemIndex ?? turnItems.length - 1; index >= 0; index--) {
           yield { turnId: turn.id, item: turnItems[index], turn };
           if (--remaining === 0) {
-            nextCursor = page.nextCursor
-              ? { nativeCursor: page.nextCursor, turnIndex: 0, newerTurnId: turn.id }
-              : null;
+            nextCursor = page.nextCursor ? { nativeCursor: page.nextCursor, turnIndex: 0 } : null;
             nextCursor =
               index > 0
-                ? {
-                    nativeCursor: cursor,
-                    turnIndex: 0,
-                    legacyItemIndex: index - 1,
-                    newerTurnId: turn.id,
-                  }
+                ? { nativeCursor: cursor, turnIndex: 0, legacyItemIndex: index - 1 }
                 : nextCursor;
             return;
           }
@@ -180,10 +173,10 @@ export async function openCodexHistory(
           if (--remaining === 0) {
             nextCursor =
               turnIndex + 1 < turnIds.length
-                ? { nativeCursor: null, turnIndex: turnIndex + 1, newerTurnId: entry.turnId }
+                ? { nativeCursor: null, turnIndex: turnIndex + 1 }
                 : null;
             nextCursor = page.nextCursor
-              ? { nativeCursor: page.nextCursor, turnIndex, newerTurnId: entry.turnId }
+              ? { nativeCursor: page.nextCursor, turnIndex }
               : nextCursor;
             return;
           }
