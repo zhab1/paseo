@@ -37,6 +37,9 @@ const NetworkPolicySchema = z
 // Codex CLI 0.153.4+ is required: history restoration uses its native paging APIs.
 export const CodexProviderOptionsSchema = z
   .object({
+    // Composer controls, not Codex config: the provider reads them and keeps them out of `config`.
+    service_tier: z.string().optional(),
+    plan_mode: z.boolean().optional(),
     approval_policy: ApprovalPolicySchema.optional(),
     sandbox_mode: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
     sandbox_workspace_write: z

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   restoreArchivedWorkspace,
@@ -34,11 +33,73 @@ import {
 } from "../support/helpers/new-workspace";
 import { connectSeedClient } from "../support/helpers/seed-client";
 import { getServerId } from "../support/helpers/server-id";
+import { getE2EDaemonPort } from "../support/helpers/daemon-port";
 import { createTempGitRepo } from "../support/helpers/workspace";
 import {
   waitForSidebarHydration,
   waitForWorkspaceInSidebar,
 } from "../support/helpers/workspace-ui";
+
+function observeBranchlessUnarchive(page: Page, agentId: string, cwd: string) {
+  const refreshRequestIds = new Set<string>();
+  const observed: Array<{
+    kind: string;
+    status?: string;
+    hasId?: boolean;
+    cwdMatches?: boolean;
+    archived?: boolean;
+  }> = [];
+  page.on("websocket", (socket) => {
+    if (!socket.url().includes(`:${getE2EDaemonPort()}`)) return;
+    const readMessage = (payload: string | Buffer) => {
+      if (typeof payload !== "string") return null;
+      try {
+        const envelope = JSON.parse(payload);
+        return envelope.type === "session" ? envelope.message : envelope;
+      } catch {
+        return null;
+      }
+    };
+    socket.on("framesent", ({ payload }) => {
+      const message = readMessage(payload);
+      if (message?.type === "refresh_agent_request" && message.agentId === agentId) {
+        refreshRequestIds.add(message.requestId);
+        observed.push({ kind: "refresh-request" });
+      }
+    });
+    socket.on("framereceived", ({ payload }) => {
+      const message = readMessage(payload);
+      const body = message?.payload;
+      if (
+        message?.type === "status" &&
+        body?.status === "agent_refreshed" &&
+        refreshRequestIds.has(body.requestId)
+      ) {
+        observed.push({ kind: "refresh-complete" });
+      } else if (message?.type === "rpc_error" && refreshRequestIds.has(body?.requestId)) {
+        observed.push({ kind: "refresh-error" });
+      } else {
+        let snapshot = null;
+        if (message?.type === "agent_update" && body?.kind === "upsert") snapshot = body.agent;
+        if (message?.type === "fetch_agent_response") snapshot = body?.agent;
+        if (snapshot?.id === agentId) {
+          observed.push({
+            kind: message.type,
+            status: snapshot.status,
+            hasId: true,
+            cwdMatches: snapshot.cwd === cwd,
+            archived: Boolean(snapshot.archivedAt),
+          });
+        }
+      }
+    });
+  });
+
+  return {
+    observed,
+    hasRefreshComplete: () => observed.some((event) => event.kind === "refresh-complete"),
+  };
+}
 
 test.describe("Worktree restore", () => {
   let client: Awaited<ReturnType<typeof connectSeedClient>>;
@@ -402,6 +463,12 @@ test.describe("Worktree restore", () => {
       .toBe(false);
     await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).not.toBeNull();
 
+    const { observed, hasRefreshComplete } = observeBranchlessUnarchive(
+      page,
+      agent.id,
+      backingWorktree.workspaceDirectory,
+    );
+
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
     await openSessions(page);
@@ -425,8 +492,32 @@ test.describe("Worktree restore", () => {
     await captureBranchlessRestoreStep(page, "02-unarchive-agent.png");
 
     await page.getByRole("button", { name: "Unarchive", exact: true }).click();
-    await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).toBeNull();
-    await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
+    try {
+      // Refresh uses the session RPC deadline while the provider resumes.
+      await expect
+        .poll(() => fetchAgentArchivedAt(client, agent.id), { timeout: 60_000 })
+        .toBeNull();
+      await expect
+        .poll(hasRefreshComplete, {
+          timeout: 60_000,
+        })
+        .toBe(true);
+      expect(observed).toContainEqual(
+        expect.objectContaining({
+          kind: "agent_update",
+          hasId: true,
+          cwdMatches: true,
+          status: expect.any(String),
+          archived: false,
+        }),
+      );
+      await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
+    } finally {
+      await test.info().attach("branchless-unarchive-events", {
+        body: JSON.stringify(observed),
+        contentType: "application/json",
+      });
+    }
     await captureBranchlessRestoreStep(page, "03-agent-ready.png");
 
     const restoredHead = execFileSync("git", ["rev-parse", "HEAD"], {
@@ -515,7 +606,11 @@ test.describe("Worktree restore", () => {
 });
 
 async function captureBranchlessRestoreStep(page: Page, filename: string): Promise<void> {
-  const screenshotDirectory = path.join(tmpdir(), "paseo-branchless-restore-evidence");
+  const screenshotDirectory = path.join(
+    process.cwd(),
+    ".artifacts",
+    "paseo-branchless-restore-evidence",
+  );
   mkdirSync(screenshotDirectory, { recursive: true });
   await page.screenshot({ path: path.join(screenshotDirectory, filename), fullPage: true });
 }

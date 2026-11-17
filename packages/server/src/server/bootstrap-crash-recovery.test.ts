@@ -114,3 +114,65 @@ test("recovers only crash-interrupted Codex agents without a client connection",
     ]);
   }
 });
+
+test.each([true, false])(
+  "native Codex recovery sends a restart prompt only when inactive (active=%s)",
+  async (active) => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-native-recovery-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-native-agent-"));
+    const agentId = "00000000-0000-4000-8000-000000000409";
+    const storage = new AgentStorage(
+      path.join(paseoHomeRoot, ".paseo", "agents"),
+      pino({ level: "silent" }),
+    );
+    await storage.upsert(storedAgentRecord(agentId, agentCwd, "codex", "running"));
+    await storage.flush();
+    const clients = createTestAgentClients();
+    const base = clients.codex!;
+    let prompts = 0;
+    const codex: AgentClient = {
+      provider: base.provider,
+      capabilities: base.capabilities,
+      createSession: (...args) => base.createSession(...args),
+      resumeSession: async (...args) => {
+        const session = await base.resumeSession(...args);
+        session.getActiveTurnId = () => (active ? "native-turn" : null);
+        const startTurn = session.startTurn.bind(session);
+        session.startTurn = async (...promptArgs) => {
+          prompts++;
+          return startTurn(...promptArgs);
+        };
+        return session;
+      },
+      fetchCatalog: (...args) => base.fetchCatalog(...args),
+      isAvailable: (...args) => base.isAvailable(...args),
+    };
+    const daemon = await createTestPaseoDaemon({
+      paseoHomeRoot,
+      cleanup: false,
+      resumeOnStartup: true,
+      resumePrompt: "Continue",
+      agentClients: { ...clients, codex },
+    });
+    try {
+      await expect.poll(() => daemon.daemon.agentManager.getAgent(agentId)?.id).toBe(agentId);
+      await expect
+        .poll(async () => (await daemon.daemon.agentStorage.get(agentId))?.resumeOnStartup)
+        .toBe(false);
+      if (active) {
+        expect(daemon.daemon.agentManager.getAgent(agentId)?.lifecycle).toBe("running");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(prompts).toBe(0);
+      } else {
+        await expect.poll(() => prompts).toBe(1);
+      }
+    } finally {
+      await daemon.close();
+      await Promise.all([
+        rm(paseoHomeRoot, { recursive: true, force: true }),
+        rm(agentCwd, { recursive: true, force: true }),
+        rm(daemon.staticDir, { recursive: true, force: true }),
+      ]);
+    }
+  },
+);

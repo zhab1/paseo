@@ -77,8 +77,14 @@ const callIds: string[] = [];
 for await (const event of session.streamHistory()) {
   if (event.type !== "timeline") continue;
   rows++;
-  if (event.item.type === "tool_call") callIds.push(event.item.callId);
-  maxOutput = Math.max(maxOutput, event.item.detail?.output?.length ?? 0);
+  if (event.item.type === "tool_call") {
+    callIds.push(event.item.callId);
+    const detail = event.item.detail;
+    const output = detail.type === "shell" || detail.type === "unknown" ? detail.output : undefined;
+    const outputSize =
+      typeof output === "string" ? output.length : (JSON.stringify(output)?.length ?? 0);
+    maxOutput = Math.max(maxOutput, outputSize);
+  }
 }
 process.stdout.write(
   JSON.stringify({

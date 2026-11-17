@@ -115,6 +115,10 @@ class InMemoryAgentManager {
     };
   }
 
+  getAgentBackgroundWorkSummary() {
+    return undefined;
+  }
+
   async fetchTimelinePage(_agentId: string, options?: AgentTimelineFetchOptions) {
     return this.timeline.fetch("agent-1", options);
   }
@@ -129,12 +133,21 @@ class InMemoryAgentManager {
 }
 
 class EmptyAgentStorage {
-  async list() {
+  async listActive() {
     return [];
   }
 
   async get() {
     return null;
+  }
+  async listByWorkspaces() {
+    return [];
+  }
+  async lastUserMessageAtByWorkspace() {
+    return new Map<string, string>();
+  }
+  async listAll() {
+    return [];
   }
 }
 
@@ -157,6 +170,12 @@ class EmptyProjectRegistry {
 }
 
 class EmptyWorkspaceRegistry {
+  listActive() {
+    return [];
+  }
+  listAll() {
+    return [];
+  }
   get() {
     return null;
   }
@@ -242,7 +261,7 @@ function createSessionForWireCompatTest(options?: {
     directorySync: options?.directorySync,
     scheduleService: {} as SessionOptions["scheduleService"],
     checkoutDiffManager: {
-      scheduleRefreshForCwd() {},
+      async scheduleRefreshForCwd() {},
       onWorkspaceStateMayHaveChanged() {},
     } as unknown as SessionOptions["checkoutDiffManager"],
     github: {
@@ -852,7 +871,7 @@ test("setup observation includes a transition that happens during its initial re
         readStarted();
         return pendingRead;
       },
-      list: () => [],
+      listActive: () => [],
     } as unknown as SessionOptions["workspaceRegistry"],
   });
   session.updateClientCapabilities(

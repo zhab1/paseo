@@ -124,6 +124,84 @@ test("refresh restores an archived worktree and publishes selected-agent recover
   expect(runGit(cwd, "rev-parse", "HEAD")).toBe(head);
 }, 60000);
 
+test("explicit unarchive after branchless workspace restore leaves sibling archived", async () => {
+  const daemon = await createTestPaseoDaemon();
+  const { repoDir, tempRoot } = createGitRepoWithBranch();
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    appVersion: "0.11.2",
+  });
+  onTestFinished(async () => {
+    await client.close();
+    await daemon.close();
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await client.connect();
+  const backing = await client.createWorkspace({
+    source: {
+      kind: "worktree",
+      cwd: repoDir,
+      action: "checkout",
+      refName: "feature/existing-branch",
+    },
+  });
+  const cwd = backing.workspace!.workspaceDirectory;
+  runGit(cwd, "switch", "--detach", "main");
+  const created = await client.createWorkspace({
+    source: { kind: "directory", path: cwd },
+    title: "Sample workspace",
+  });
+  expect(created.error).toBeNull();
+  const workspace = created.workspace!;
+  const selected = await client.createAgent({
+    config: { provider: "codex", cwd },
+    workspaceId: workspace.id,
+  });
+  const sibling = await client.createAgent({
+    config: { provider: "codex", cwd },
+    workspaceId: workspace.id,
+  });
+  expect(
+    (await client.archivePaseoWorktree({ worktreePath: cwd, scope: "worktree" })).error,
+  ).toBeNull();
+  expect(existsSync(cwd)).toBe(false);
+  const archived = (await client.fetchAgent({ agentId: sibling.id }))!.agent.archivedAt;
+  expect(archived).toEqual(expect.any(String));
+  await client.fetchAgents({ scope: "active", includeBackground: true, subscribe: {} });
+  const timeline = client.observeTimeline([selected.id]);
+  await timeline.ready;
+  await client.fetchWorkspaces({ subscribe: {} });
+  const updates: DaemonEvent[] = [];
+  client.subscribe((event) => updates.push(event));
+  await client.restoreWorkspace(workspace.id);
+  expect(existsSync(cwd)).toBe(true);
+  expect((await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt).toEqual(
+    expect.any(String),
+  );
+  await client.refreshAgent(selected.id);
+  expect((await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt).toBeNull();
+  const selectedUpdates = updates.filter(
+    (event) =>
+      event.type === "agent_update" &&
+      event.payload.kind === "upsert" &&
+      event.payload.agent.id === selected.id,
+  );
+  expect(selectedUpdates.length).toBeGreaterThan(0);
+  expect(selectedUpdates.at(-1)).toMatchObject({
+    payload: {
+      agent: {
+        id: selected.id,
+        status: expect.any(String),
+        cwd,
+        workspaceId: workspace.id,
+        archivedAt: null,
+      },
+    },
+  });
+  expect((await client.fetchAgent({ agentId: sibling.id }))?.agent.archivedAt).toBe(archived);
+  await timeline.release();
+}, 60000);
+
 test("workspace.create worktree source forwards action=checkout + refName into the real worktree", async () => {
   const daemon = await createTestPaseoDaemon();
   const { repoDir, tempRoot } = createGitRepoWithBranch();

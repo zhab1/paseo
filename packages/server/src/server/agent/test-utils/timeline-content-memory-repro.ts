@@ -5,6 +5,13 @@ function retainedItem(kind: string) {
   source.charCodeAt(source.length - 1);
   const base = { type: "tool_call" as const, callId: "memory", name: "tool" };
   switch (kind) {
+    case "unknown":
+      return limitAgentTimelineItemContent({
+        ...base,
+        status: "completed",
+        error: null,
+        detail: { type: "unknown", input: null, output: { text: source } },
+      });
     case "plain_text":
       return limitAgentTimelineItemContent({
         ...base,
@@ -27,7 +34,7 @@ function retainedItem(kind: string) {
         detail: { type: "shell", command: "example" },
       });
     default:
-      throw new Error("Expected plain_text, shell or error");
+      throw new Error("Expected plain_text, shell, error or unknown");
   }
 }
 

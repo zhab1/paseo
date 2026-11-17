@@ -6,23 +6,30 @@ function record(value: unknown): RecordValue {
 }
 
 /** Serve existing history fixtures through the native metadata/turn/item page protocol. */
-export function pagedHistoryRequest(request: Request): Request {
+export function pagedHistoryRequest(
+  request: Request,
+  options?: { nativePages?: boolean },
+): Request {
   const saved = new Map<string, RecordValue[]>();
   return async (method, params) => {
+    if (options?.nativePages) return request(method, params);
     const input = record(params);
     const threadId = String(input.threadId);
     if (method === "thread/read" && input.includeTurns === false) {
       const response = record(await request(method, params));
       const thread = record(response.thread);
-      const turns = Array.isArray(thread.turns) ? thread.turns : [];
-      saved.set(
-        threadId,
-        turns.map((turn, index) =>
-          Object.assign({}, record(turn), {
-            id: record(turn).id ?? `fixture-turn-${index}`,
-          }),
-        ),
-      );
+      if (Array.isArray(thread.turns)) {
+        saved.set(
+          threadId,
+          thread.turns.map((turn, index) =>
+            Object.assign({}, record(turn), {
+              id: record(turn).id ?? `fixture-turn-${index}`,
+            }),
+          ),
+        );
+      } else {
+        saved.delete(threadId);
+      }
       return { ...response, thread: { ...thread, turns: [] } };
     }
     const turns = saved.get(threadId);
