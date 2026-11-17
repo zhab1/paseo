@@ -22,6 +22,7 @@ import {
 import { AgentStorage } from "./agent-storage.js";
 import { setQuotaContinuationPending } from "./quota-continuation-presentation.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { TimelineCache } from "./timeline-cache.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -12160,6 +12161,43 @@ test.each([
   },
 );
 
+test.each([false, true])("timeline cache honors explicit store override: %s", async (override) => {
+  const dir = mkdtempSync(join(tmpdir(), "paseo-timeline-manager-"));
+  const cache = new TimelineCache(join(dir, "timeline.sqlite"));
+  class CachedSession extends TestAgentSession {
+    readonly initialTimeline = [
+      { item: { type: "assistant_message" as const, messageId: "cached", text: "cached" } },
+    ];
+  }
+  class CachedClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new CachedSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new CachedClient() },
+    logger,
+    timelineCache: cache,
+    ...(override ? { timelineStore: new InMemoryAgentTimelineStore() } : {}),
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const page = await manager.fetchTimelinePage(agent.id, { limit: 1 });
+    expect(page.rows.map((row) => row.item)).toEqual([
+      { type: "assistant_message", messageId: "cached", text: "cached" },
+    ]);
+    expect(cache.db.prepare("SELECT count(*) AS n FROM timeline_rows").get()).toEqual({
+      n: override ? 0 : 1,
+    });
+  } finally {
+    await manager.closeAgent(agent.id);
+    cache.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test.each(["create", "import"])(
   "%s native pages retain stable cursors while older history is loaded on demand",
   async (mode) => {
@@ -12209,7 +12247,13 @@ test.each(["create", "import"])(
         };
       }
     }
-    const manager = new AgentManager({ clients: { codex: new PagedClient() }, logger });
+    const dir = mkdtempSync(join(tmpdir(), "paseo-paged-manager-"));
+    const cache = new TimelineCache(join(dir, "timeline.sqlite"));
+    const manager = new AgentManager({
+      clients: { codex: new PagedClient() },
+      logger,
+      timelineCache: cache,
+    });
     const agent =
       mode === "import"
         ? await manager.importProviderSession({
@@ -12258,6 +12302,8 @@ test.each(["create", "import"])(
       expect((await manager.fetchTimelinePage(agent.id, { limit: 1 })).endSeq).toBe(recent.endSeq);
     } finally {
       await manager.closeAgent(agent.id);
+      cache.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   },
 );

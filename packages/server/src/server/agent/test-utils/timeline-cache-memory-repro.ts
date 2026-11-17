@@ -11,7 +11,18 @@ const directory = path.join(process.cwd(), ".dev", "timeline-cache-tests", rando
 const cache = new TimelineCache(path.join(directory, "timeline.sqlite"));
 const assistantFragments = process.argv[2] === "assistant";
 try {
-  const store = new InMemoryAgentTimelineStore(cache);
+  let store: InMemoryAgentTimelineStore;
+  if (process.argv[2] === "manager") {
+    const { AgentManager } = await import("../agent-manager.js");
+    const { createTestLogger } = await import("../../../test-utils/test-logger.js");
+    store = (
+      new AgentManager({ logger: createTestLogger(), timelineCache: cache }) as unknown as {
+        timelineStore: InMemoryAgentTimelineStore;
+      }
+    ).timelineStore;
+  } else {
+    store = new InMemoryAgentTimelineStore(cache);
+  }
   store.initialize("large");
   const child = process.argv[2] === "child" ? new ProviderSubagentStore(cache) : null;
   child?.apply("parent", "codex", { type: "upsert", id: "child" });

@@ -826,11 +826,11 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
-    this.timelineStore = new InMemoryAgentTimelineStore(options.timelineCache);
+    this.timelineStore =
+      options.timelineStore ?? new InMemoryAgentTimelineStore(options.timelineCache);
     this.providerSubagents = new ProviderSubagentStore(options.timelineCache);
     this.pluginLifecycle = options.pluginLifecycle;
     this.pluginAgentTools = options.pluginAgentTools;
-    this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
