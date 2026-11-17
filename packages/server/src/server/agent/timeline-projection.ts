@@ -1,3 +1,4 @@
+import { continuesTimelineTurn, isTimelineTurnTrigger } from "@getpaseo/protocol/timeline-turn";
 import type { AgentTimelineItem, ToolCallDetail } from "./agent-sdk-types.js";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 
@@ -241,6 +242,23 @@ function mergeReasoningChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
   return output;
 }
 
+/**
+ * Whether `next`, the row right after `previous`, is another chunk of the same assistant
+ * message. A turn id or message id change starts a new message, which matters where rows
+ * replayed from provider history carry no turn id.
+ */
+export function continuesAssistantMessage(
+  previous: Pick<AgentTimelineRow, "item" | "turnId">,
+  next: Pick<AgentTimelineRow, "item" | "turnId">,
+): boolean {
+  return (
+    previous.item.type === "assistant_message" &&
+    next.item.type === "assistant_message" &&
+    previous.turnId === next.turnId &&
+    (next.item.messageId === undefined || next.item.messageId === previous.item.messageId)
+  );
+}
+
 function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] {
   const output: WorkingEntry[] = [];
 
@@ -248,10 +266,8 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
     const previous = output[output.length - 1];
     const shouldMerge =
       previous &&
-      previous.item.type === "assistant_message" &&
-      entry.item.type === "assistant_message" &&
       previous.seqEnd + 1 === entry.seqStart &&
-      previous.turnId === entry.turnId;
+      continuesAssistantMessage(previous, entry);
 
     if (!shouldMerge || !previous) {
       output.push(entry);
@@ -262,13 +278,6 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
       { type: "assistant_message" }
     >;
     const entryAssistant = entry.item as Extract<AgentTimelineItem, { type: "assistant_message" }>;
-    if (
-      entryAssistant.messageId !== undefined &&
-      previousAssistant.messageId !== entryAssistant.messageId
-    ) {
-      output.push(entry);
-      continue;
-    }
 
     const collapsedKinds = new Set<TimelineProjectionKind>([
       ...previous.collapsed,
@@ -297,6 +306,7 @@ function mergeAssistantChunks(entries: readonly WorkingEntry[]): WorkingEntry[] 
 export type ProjectedTimelineRow = AgentTimelineRow & TimelineProjectionEntry;
 
 interface ProjectedTimelinePageOptions {
+  wholeTurns?: boolean;
   bounds: { minSeq: number; maxSeq: number };
   direction: TimelineLimitDirection;
   cursorSeq?: number;
@@ -323,7 +333,7 @@ export class TimelineProjection {
     this.sourceRanges.sort((a, b) => a.startSeq - b.startSeq);
   }
 
-  append(row: AgentTimelineRow): void {
+  append(row: AgentTimelineRow): ProjectedTimelineRow {
     const rowIndex = this.appendProjected(row);
     const last = this.sourceRanges.at(-1);
     if (last && last.rowIndex === rowIndex && last.endSeq + 1 === row.seq) {
@@ -331,6 +341,7 @@ export class TimelineProjection {
     } else {
       this.sourceRanges.push({ startSeq: row.seq, endSeq: row.seq, rowIndex });
     }
+    return { ...this.rows[rowIndex] };
   }
 
   private appendProjected(row: AgentTimelineRow): number {
@@ -448,7 +459,8 @@ export class TimelineProjection {
 
   private selectTail(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
     const limit = Math.max(0, Math.floor(input.limit ?? 0));
-    const start = limit === 0 ? 0 : Math.max(0, this.rows.length - limit);
+    const requestedStart = limit === 0 ? 0 : Math.max(0, this.rows.length - limit);
+    const start = input.wholeTurns ? this.wholeTurnWindowStart(requestedStart) : requestedStart;
     return {
       entries: this.rows.slice(start),
       startSeq: this.rows[start].seqStart,
@@ -457,6 +469,17 @@ export class TimelineProjection {
       hasNewer: false,
       reset: this.spans[this.spanIndex(start)].start < start,
     };
+  }
+
+  private wholeTurnWindowStart(requestedStart: number): number {
+    let start = requestedStart;
+    for (;;) {
+      while (start > 0 && continuesProjectedTurn(this.rows[start - 1], this.rows[start])) start--;
+      // Source coverage can pull in an earlier tool and therefore its entire run.
+      const coveredStart = this.spans[this.spanIndex(start)].start;
+      if (coveredStart === start) return start;
+      start = coveredStart;
+    }
   }
 
   private selectAfter(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
@@ -506,13 +529,23 @@ export class TimelineProjection {
         else high = middle;
       }
       const limit = Math.max(0, Math.floor(input.limit ?? 0));
-      const start = limit === 0 ? 0 : Math.max(0, low - limit);
+      const requestedStart = limit === 0 ? 0 : Math.max(0, low - limit);
+      const start = input.wholeTurns ? this.wholeTurnWindowStart(requestedStart) : requestedStart;
+      // Choose the window before extending the right edge, so a prompt jump
+      // cannot lose its target when the next turn is arbitrarily large.
+      if (input.wholeTurns) {
+        while (low < this.rows.length && continuesProjectedTurn(this.rows[low - 1], this.rows[low]))
+          low++;
+      }
+      let selectedEnd = endSeq;
+      if (input.wholeTurns)
+        selectedEnd = low === this.rows.length ? input.bounds.maxSeq : this.rows[low].seqStart - 1;
       return {
         entries: this.rows.slice(start, low),
         startSeq: this.rows[start]?.seqStart ?? null,
-        endSeq,
+        endSeq: selectedEnd,
         hasOlder: start > 0,
-        hasNewer: endSeq < input.bounds.maxSeq,
+        hasNewer: selectedEnd < input.bounds.maxSeq,
       };
     }
     return { entries: [], startSeq: null, endSeq: null, hasOlder: false, hasNewer: true };
@@ -836,6 +869,13 @@ export function selectProjectedEntriesPage<T extends PageEntry>(input: {
     hasOlder: selected.hasOlder,
     hasNewer: endSeq < bounds.maxSeq,
   };
+}
+
+function continuesProjectedTurn(
+  previous: TimelineProjectionEntry,
+  next: TimelineProjectionEntry,
+): boolean {
+  return continuesTimelineTurn(previous.turnId, next.turnId, isTimelineTurnTrigger(next.item));
 }
 
 /**

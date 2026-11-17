@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
+import { continuesTimelineTurn, isTimelineTurnTrigger } from "@getpaseo/protocol/timeline-turn";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import {
   TimelineProjection,
@@ -34,6 +35,8 @@ export class TimelineCache {
         client_message_id TEXT,
         assistant_message_id TEXT,
         item_type TEXT NOT NULL,
+        turn_id TEXT,
+        turn_trigger INTEGER NOT NULL,
         ranges TEXT NOT NULL,
         value TEXT NOT NULL,
         PRIMARY KEY (timeline, start)
@@ -73,8 +76,8 @@ export class CachedTimelineProjection {
     const item = row.item;
     this.cache.db
       .prepare(`INSERT OR REPLACE INTO timeline_rows
-      (timeline, start, end, identity, client_message_id, assistant_message_id, item_type, ranges, value)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (timeline, start, end, identity, client_message_id, assistant_message_id, item_type, turn_id, turn_trigger, ranges, value)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         this.key,
         row.seqStart,
@@ -83,6 +86,8 @@ export class CachedTimelineProjection {
         item.type === "user_message" ? (item.clientMessageId ?? null) : null,
         item.type === "assistant_message" ? (item.messageId ?? null) : null,
         item.type,
+        row.turnId ?? null,
+        isTimelineTurnTrigger(item) ? 1 : 0,
         JSON.stringify(row.sourceSeqRanges),
         JSON.stringify(row),
       );
@@ -190,6 +195,7 @@ export class CachedTimelineProjection {
     direction: TimelineLimitDirection;
     cursorSeq?: number;
     limit: number;
+    wholeTurns?: boolean;
   }) {
     const backwards = options.direction !== "after";
     const limit = Math.max(0, Math.floor(options.limit));
@@ -213,8 +219,90 @@ export class CachedTimelineProjection {
         sourceSeqRanges: JSON.parse(String(row.ranges)) as TimelineSeqRange[],
       }));
     if (backwards) metadata.reverse();
-    const selected = selectProjectedEntriesPage({ ...options, entries: metadata });
-    if (options.direction === "tail" && selected.startSeq !== null) {
+    let selected = selectProjectedEntriesPage({ ...options, entries: metadata });
+    if (options.wholeTurns && backwards && selected.startSeq !== null) {
+      let start = selected.startSeq;
+      const rowAt = (seq: number) =>
+        this.cache.db
+          .prepare(
+            "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start = ?",
+          )
+          .get(this.key, seq)!;
+      for (;;) {
+        const overlapping = this.cache.db
+          .prepare(
+            "SELECT min(start) AS first FROM timeline_rows WHERE timeline = ? AND start < ? AND end >= ?",
+          )
+          .get(this.key, start, start);
+        if (overlapping?.first !== null && overlapping?.first !== undefined) {
+          start = Number(overlapping.first);
+          continue;
+        }
+        const current = rowAt(start);
+        const previous = this.cache.db
+          .prepare(
+            "SELECT start, turn_id FROM timeline_rows WHERE timeline = ? AND start < ? ORDER BY start DESC LIMIT 1",
+          )
+          .get(this.key, start);
+        if (
+          !previous ||
+          !continuesTimelineTurn(
+            typeof previous.turn_id === "string" ? previous.turn_id : undefined,
+            typeof current.turn_id === "string" ? current.turn_id : undefined,
+            Number(current.turn_trigger) === 1,
+          )
+        )
+          break;
+        start = Number(previous.start);
+      }
+      let last = selected.entries.at(-1)!.seqStart;
+      if (options.direction === "before") {
+        for (;;) {
+          const current = rowAt(last);
+          const next = this.cache.db
+            .prepare(
+              "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
+            )
+            .get(this.key, last);
+          if (
+            !next ||
+            !continuesTimelineTurn(
+              typeof current.turn_id === "string" ? current.turn_id : undefined,
+              typeof next.turn_id === "string" ? next.turn_id : undefined,
+              Number(next.turn_trigger) === 1,
+            )
+          )
+            break;
+          last = Number(next.start);
+        }
+      }
+      const following = this.cache.db
+        .prepare(
+          "SELECT start FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
+        )
+        .get(this.key, last);
+      const endSeq = following ? Number(following.start) - 1 : options.bounds.maxSeq;
+      const entries = this.cache.db
+        .prepare(
+          "SELECT start, end, ranges FROM timeline_rows WHERE timeline = ? AND start >= ? AND start <= ? ORDER BY start",
+        )
+        .all(this.key, start, last)
+        .map((row) => ({
+          seqStart: Number(row.start),
+          seqEnd: Number(row.end),
+          sourceSeqRanges: JSON.parse(String(row.ranges)) as TimelineSeqRange[],
+        }));
+      selected = {
+        entries,
+        startSeq: start,
+        endSeq,
+        hasOlder: !!this.cache.db
+          .prepare("SELECT 1 FROM timeline_rows WHERE timeline = ? AND start < ? LIMIT 1")
+          .get(this.key, start),
+        hasNewer: endSeq < options.bounds.maxSeq,
+      };
+    }
+    if (!options.wholeTurns && options.direction === "tail" && selected.startSeq !== null) {
       selected.reset = !!this.cache.db
         .prepare(
           "SELECT 1 FROM timeline_rows WHERE timeline = ? AND end >= ? AND start < ? LIMIT 1",

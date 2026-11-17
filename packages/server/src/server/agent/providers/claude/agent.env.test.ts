@@ -30,16 +30,20 @@ function createQueryMock(events: unknown[]): Query {
 }
 
 describe("Claude SDK env", () => {
-  test.each(["node", "bun", process.execPath])(
-    "identifies the spawned %s process as Paseo after clearing parent session env",
-    async (command) => {
+  test.each(
+    ["node", "bun", process.execPath].flatMap((command) =>
+      [undefined, "Paseo", "custom-client"].map((entrypoint) => ({ command, entrypoint })),
+    ),
+  )(
+    "preserves explicit launch identity $entrypoint in $command while clearing inherited session env",
+    async ({ command, entrypoint }) => {
       let output = "";
       let exited = Promise.resolve<unknown[]>([]);
       const query = claudeQuery(
         { prompt: "", options: {} },
         {
           runtimeSettings: { env: { CLAUDE_CODE_ENTRYPOINT: "sdk-ts" } },
-          launchEnv: { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" },
+          launchEnv: entrypoint === undefined ? {} : { CLAUDE_CODE_ENTRYPOINT: entrypoint },
           queryFactory: ({ options }) => {
             if (!options.spawnClaudeCodeProcess) {
               throw new Error("Missing Claude process launcher");
@@ -65,7 +69,10 @@ describe("Claude SDK env", () => {
 
       try {
         expect(await exited).toEqual([0, null]);
-        expect(JSON.parse(output)).toEqual({ entrypoint: "Paseo", parentSession: null });
+        expect(JSON.parse(output)).toEqual({
+          ...(entrypoint === undefined ? {} : { entrypoint }),
+          parentSession: null,
+        });
       } finally {
         query.close();
       }
@@ -143,6 +150,56 @@ describe("Claude SDK env", () => {
     } finally {
       await session.close();
       expect(session.usageSession?.()).toBeNull();
+    }
+  });
+
+  test("resume uses current plugin instructions and excludes them from persistence", async () => {
+    const prompts: unknown[] = [];
+    const queryFactory = ({ options }: ClaudeQueryInput) => {
+      prompts.push(options.systemPrompt);
+      return createQueryMock([
+        {
+          type: "system",
+          subtype: "init",
+          session_id: "persisted-session",
+          permissionMode: "default",
+          model: "opus",
+        },
+        { type: "assistant", message: { content: "done" } },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+          total_cost_usd: 0,
+        },
+      ]);
+    };
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const first = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+      pluginAppendSystemPrompt: ["Plugin instructions"],
+    });
+    await first.run("first");
+    const handle = first.describePersistence()!;
+    expect(handle.metadata).not.toHaveProperty("pluginAppendSystemPrompt");
+    await first.close();
+    const resumed = await client.resumeSession(handle, {
+      cwd: process.cwd(),
+      pluginAppendSystemPrompt: undefined,
+    });
+    try {
+      await resumed.run("after disable");
+      expect(prompts).toEqual([
+        { type: "preset", preset: "claude_code", append: "Plugin instructions" },
+        { type: "preset", preset: "claude_code", append: "" },
+      ]);
+    } finally {
+      await resumed.close();
     }
   });
 

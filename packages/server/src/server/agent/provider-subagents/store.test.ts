@@ -160,7 +160,7 @@ describe("ProviderSubagentStore", () => {
     const [row] = subagents.fetchTimeline("parent-a", "child-1").rows;
     expect(row?.item).toMatchObject({
       type: "tool_call",
-      detail: { type: "shell", output: "x".repeat(64 * 1024) },
+      detail: { type: "shell", output: expect.stringMatching(/^x+…\[truncated \d+\.\d KB\]$/) },
     });
   });
 

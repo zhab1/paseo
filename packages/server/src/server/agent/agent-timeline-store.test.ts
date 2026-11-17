@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { selectReferenceProjectedTimelinePage } from "./test-utils/timeline-page-reference.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import { execFileSync } from "node:child_process";
@@ -47,6 +49,104 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
         limit: 2,
       }).priorAssistantMessageIds,
     ).toEqual([]);
+  });
+
+  it("resets stale forward cursors to complete available turns", () => {
+    const store = createStore();
+    store.initialize("agent", { epoch: "current" });
+    for (let index = 0; index < 60; index++)
+      store.append(
+        "agent",
+        {
+          type: "tool_call",
+          callId: `call-${index}`,
+          name: "shell",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: null, output: null },
+        },
+        { turnId: "run" },
+      );
+    const page = store.fetch("agent", {
+      direction: "after",
+      cursor: { epoch: "old", seq: 10 },
+      limit: 40,
+      wholeTurns: true,
+    });
+    expect(page.rows).toHaveLength(60);
+    expect(page).toMatchObject({
+      reset: true,
+      staleCursor: true,
+      startSeq: 1,
+      endSeq: 60,
+      hasOlder: false,
+      hasNewer: false,
+    });
+  });
+
+  it("extends tail and older pages to complete turns without losing cursor progress", () => {
+    const store = createStore();
+    store.initialize("turns", { epoch: "epoch" });
+    for (const turnId of ["first", "second", "third"]) {
+      store.append("turns", { type: "user_message", text: turnId }, { turnId });
+      for (let i = 0; i < 3; i++) {
+        store.append("turns", { type: "reasoning", text: `${turnId}-${i}` }, { turnId });
+        store.append(
+          "turns",
+          { type: "assistant_message", messageId: `${turnId}-${i}`, text: "answer" },
+          { turnId },
+        );
+      }
+    }
+    const tail = store.fetch("turns", { direction: "tail", limit: 2, wholeTurns: true });
+    expect(tail.rows).toHaveLength(7);
+    expect(tail.rows.map((row) => row.turnId)).toEqual(Array(7).fill("third"));
+    const older = store.fetch("turns", {
+      direction: "before",
+      cursor: { epoch: tail.epoch, seq: tail.startSeq! },
+      limit: 2,
+      wholeTurns: true,
+    });
+    expect(older.rows).toHaveLength(7);
+    expect(older.rows.map((row) => row.turnId)).toEqual(Array(7).fill("second"));
+    expect(older.endSeq).toBeLessThan(tail.startSeq!);
+    expect(older.hasOlder).toBe(true);
+  });
+
+  it("expands a middle cursor to the same complete turns on either backend", () => {
+    const store = createStore();
+    store.initialize("long-turns", { epoch: "epoch" });
+    for (let i = 0; i < 125; i++) {
+      const turnId = i < 3 ? "short" : i < 123 ? "long" : "latest";
+      store.append(
+        "long-turns",
+        {
+          type: "tool_call",
+          callId: `tool-${i}`,
+          name: "shell",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: null, output: null },
+        },
+        { turnId },
+      );
+    }
+    const jump = store.fetch("long-turns", {
+      direction: "before",
+      cursor: { epoch: "epoch", seq: 70 },
+      limit: 40,
+      wholeTurns: true,
+    });
+    expect(jump.rows).toHaveLength(120);
+    expect(jump).toMatchObject({ startSeq: 4, endSeq: 123, hasOlder: true, hasNewer: true });
+    const nearStart = store.fetch("long-turns", {
+      direction: "before",
+      cursor: { epoch: "epoch", seq: 10 },
+      limit: 40,
+      wholeTurns: true,
+    });
+    expect(nearStart.rows).toHaveLength(123);
+    expect(nearStart).toMatchObject({ startSeq: 1, endSeq: 123 });
   });
 
   it("clamps an overshooting before cursor into the bounded tail window", () => {
@@ -244,6 +344,20 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
       store.append("a", { type: "assistant_message", messageId: "second", text: "ond" });
       expect(store.getLastAssistantMessage("a")).toBe("Second");
     });
+  });
+
+  it("serves a merged assistant message within the item budget", () => {
+    const store = createStore();
+    store.initialize("agent", { epoch: "e" });
+    const chunk = "a".repeat(200 * 1024);
+    for (let index = 0; index < 10; index++) {
+      store.append("agent", { type: "assistant_message", messageId: "m", text: chunk });
+    }
+    const [row] = store.fetch("agent", { limit: 1 }).rows;
+    expect(row).toMatchObject({ seqStart: 1, seqEnd: 10 });
+    expect(row.item).toMatchObject({ type: "assistant_message", messageId: "m" });
+    expect(Buffer.byteLength(JSON.stringify(row.item))).toBeLessThanOrEqual(256 * 1024);
+    expect(store.getLastAssistantMessage("agent")).toHaveLength(10 * chunk.length);
   });
 
   it("keeps a tail bounded when older tools complete across the selected window", () => {
@@ -602,6 +716,81 @@ it.each(["user_message", "assistant_message"] as const)(
     // is measured separately. Eight requests amplify the old full-history work.
     expect(duration).toBeLessThan(50);
     expect(loopGap).toBeLessThan(50);
+  },
+);
+
+it("includes transitive tool updates in a contiguous projected tail", () => {
+  const store = new InMemoryAgentTimelineStore();
+  store.initialize("a");
+  const tool = (callId: string, status: "running" | "completed") => ({
+    type: "tool_call" as const,
+    callId,
+    name: "shell",
+    status,
+    error: null,
+    detail: { type: "plain_text" as const, label: "work" },
+  });
+  store.append("a", tool("first", "running"));
+  store.append("a", tool("second", "running"));
+  store.append("a", { type: "user_message", text: "Continue" });
+  store.append("a", tool("first", "completed"));
+  store.append("a", { type: "assistant_message", text: "Answer" });
+  store.append("a", tool("second", "completed"));
+  const tail = store.fetch("a", { limit: 1, wholeTurns: true });
+  expect(tail.rows.map((row) => row.seqStart)).toEqual([1, 2, 3, 5]);
+  expect(tail).toMatchObject({ startSeq: 1, endSeq: 6, hasOlder: false });
+});
+
+async function measureTimelineTail(wholeTurns: boolean) {
+  const fixture = fileURLToPath(
+    new URL("./test-utils/timeline-responsiveness.ts", import.meta.url),
+  );
+  const { stdout, stderr } = await promisify(execFile)(
+    process.execPath,
+    ["--expose-gc", "--import", "tsx", fixture, String(wholeTurns)],
+    { timeout: 15_000 },
+  );
+  process.stderr.write(stderr);
+  return JSON.parse(stdout) as {
+    result: ReturnType<InMemoryAgentTimelineStore["fetch"]>;
+    blockingMs: number;
+  };
+}
+
+it("excludes unrelated test-runner CPU from the timeline fetch budget", async () => {
+  let unrelatedWork: ReturnType<typeof setImmediate>;
+  const burnCpu = () => {
+    const threadCpuUsage: (previous?: NodeJS.CpuUsage) => NodeJS.CpuUsage = Reflect.get(
+      process,
+      "threadCpuUsage",
+    );
+    const start = threadCpuUsage();
+    let elapsed: NodeJS.CpuUsage;
+    do {
+      elapsed = threadCpuUsage(start);
+    } while (elapsed.user + elapsed.system < 80_000);
+    unrelatedWork = setImmediate(burnCpu);
+  };
+  unrelatedWork = setImmediate(burnCpu);
+  try {
+    const { result: tail, blockingMs } = await measureTimelineTail(false);
+    expect(tail.rows).toHaveLength(200);
+    expect(tail.startSeq).toBe(99_801);
+    expect(tail.endSeq).toBe(100_000);
+    expect(blockingMs).toBeLessThan(50);
+  } finally {
+    clearImmediate(unrelatedWork);
+  }
+});
+
+it.each([false, true])(
+  "serves tail 200 from 100,000 retained rows without stalling the loop (wholeTurns=%s)",
+  async (wholeTurns) => {
+    const { result: tail, blockingMs } = await measureTimelineTail(wholeTurns);
+    expect(tail.rows).toHaveLength(200);
+    expect(tail.startSeq).toBe(99_801);
+    expect(tail.endSeq).toBe(100_000);
+    expect(blockingMs).toBeLessThan(50);
   },
 );
 

@@ -92,7 +92,7 @@ const NO_UNATTENDED_SCHEDULE_POLICY: Pick<ProviderSnapshotManager, "resolveCreat
   async resolveCreateConfig(input) {
     return {
       modeId: input.unattended ? input.requestedMode : "interactive",
-      featureValues: input.featureValues,
+      providerOptions: input.providerOptions,
     };
   },
 };
@@ -236,6 +236,7 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
   await projectRegistry.initialize();
   const workspaceGitService = createNoopWorkspaceGitService();
   const workspaceProvisioning = createWorkspaceProvisioningService({
+    unarchiveWorkspaceAgents: async () => {},
     projectRegistry,
     workspaceRegistry,
     workspaceGitService,
@@ -261,9 +262,9 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
               agentManager,
               agentStorage,
               findWorkspaceIdForCwd: async (cwd) =>
-                resolveWorkspaceIdForPath(cwd, await workspaceRegistry.list()),
+                resolveWorkspaceIdForPath(cwd, await workspaceRegistry.listAll()),
               listActiveWorkspaces: async () =>
-                (await workspaceRegistry.list())
+                (await workspaceRegistry.listAll())
                   .filter((workspace) => !workspace.archivedAt)
                   .map((workspace) => ({
                     workspaceId: workspace.workspaceId,
@@ -940,7 +941,11 @@ describe("ScheduleService", () => {
       await freshService.start();
       expect(freshManager.getAgent(input.agentId)).toBeNull();
       expect(
-        buildStoredAgentPayload((await agentStorage.get(input.agentId))!, ["claude"]).status,
+        buildStoredAgentPayload(
+          (await agentStorage.get(input.agentId))!,
+          ["claude"],
+          (_provider, own) => own ?? {},
+        ).status,
       ).toBe("running");
       if (action === "cascade") {
         const parent = await freshManager.createAgent(
@@ -969,7 +974,10 @@ describe("ScheduleService", () => {
       });
       const restored = await agentStorage.get(input.agentId);
       if (action === "delete") expect(restored).toBeNull();
-      else expect(buildStoredAgentPayload(restored!, ["claude"]).status).not.toBe("running");
+      else
+        expect(
+          buildStoredAgentPayload(restored!, ["claude"], (_provider, own) => own ?? {}).status,
+        ).not.toBe("running");
       now = new Date(now.getTime() + 120_000);
       await freshService.tick();
       expect((await freshService.inspect(job.id)).runs).toEqual([]);
@@ -1549,9 +1557,13 @@ describe("ScheduleService", () => {
       stopped: (id, event, at) => freshService.handleQuotaStop(id, event, at),
     });
     await freshService.start();
-    expect(buildStoredAgentPayload((await reloaded.get(input.agentId))!, ["claude"]).status).toBe(
-      "running",
-    );
+    expect(
+      buildStoredAgentPayload(
+        (await reloaded.get(input.agentId))!,
+        ["claude"],
+        (_provider, own) => own ?? {},
+      ).status,
+    ).toBe("running");
     expect(freshManager.hasInFlightRun(input.agentId)).toBe(false);
     now = new Date(now.getTime() + 120_000);
     await Promise.all([freshService.tick(), freshService.tick()]);
@@ -2112,7 +2124,7 @@ describe("ScheduleService", () => {
       model: "test-model",
       cwd: tempDir,
     });
-    expect(await workspaceRegistry.list()).toEqual([]);
+    expect(await workspaceRegistry.listAll()).toEqual([]);
   });
 
   test("archiveOnFinish=false local runs create one active workspace per run", async () => {
@@ -2169,7 +2181,7 @@ describe("ScheduleService", () => {
     expect(firstAgent?.workspaceId).not.toBe(secondAgent?.workspaceId);
     expect(firstAgent?.archivedAt ?? null).toBeNull();
     expect(secondAgent?.archivedAt ?? null).toBeNull();
-    expect(await workspaceRegistry.list()).toEqual([
+    expect(await workspaceRegistry.listAll()).toEqual([
       expect.objectContaining({
         workspaceId: firstAgent?.workspaceId,
         cwd: tempDir,
@@ -2296,7 +2308,7 @@ describe("ScheduleService", () => {
       (service as unknown as ScheduleServiceInternals).executeSchedule(created, "run-create-fails"),
     ).rejects.toThrow("provider misconfigured");
 
-    expect(await workspaceRegistry.list()).toEqual([
+    expect(await workspaceRegistry.listAll()).toEqual([
       expect.objectContaining({
         cwd: tempDir,
         archivedAt: expect.any(String),
@@ -3167,7 +3179,7 @@ describe("ScheduleService", () => {
       agentId: expect.any(String),
       error: expect.stringContaining("start turn exploded"),
     });
-    const storedAgents = await agentStorage.list();
+    const storedAgents = await agentStorage.listAll();
     expect(storedAgents).toHaveLength(1);
     expect(inspected.runs[0]?.agentId).toBe(storedAgents[0]?.id);
     expect(storedAgents[0]).toMatchObject({
@@ -3195,7 +3207,7 @@ describe("ScheduleService", () => {
           });
           return {
             modeId: input.unattended ? "bypassPermissions" : "interactive",
-            featureValues: input.featureValues,
+            providerOptions: input.providerOptions,
           };
         },
       },
@@ -3264,9 +3276,9 @@ describe("ScheduleService", () => {
           });
           return {
             modeId: input.unattended ? "build" : "interactive",
-            featureValues: input.unattended
-              ? { ...input.featureValues, auto_accept: true }
-              : input.featureValues,
+            providerOptions: input.unattended
+              ? { ...input.providerOptions, auto_accept: true }
+              : input.providerOptions,
           };
         },
       },
@@ -3294,7 +3306,7 @@ describe("ScheduleService", () => {
     expect(inspected.runs[0]?.error).toBeNull();
     expect(createdConfigs[0]).toMatchObject({
       modeId: "build",
-      featureValues: { auto_accept: true },
+      providerOptions: { auto_accept: true },
     });
   });
 
@@ -3336,7 +3348,7 @@ describe("ScheduleService", () => {
           });
           return {
             modeId: input.requestedMode,
-            featureValues: { ...input.featureValues, resolved: true },
+            providerOptions: { ...input.providerOptions, resolved: true },
           };
         },
       },
@@ -3383,11 +3395,13 @@ describe("ScheduleService", () => {
       model: "test-model",
       modeId: "stored-mode",
       thinkingOptionId: "think-hard",
+      // Stored schedules written before options carry `featureValues`; launch folds them.
       providerOptions: {
         allowedTools: ["Read"],
         sandbox: { enabled: true, network: { allowLocalBinding: true } },
+        auto_accept: true,
+        resolved: true,
       },
-      featureValues: { auto_accept: true, resolved: true },
       systemPrompt: "Stay concise.",
       mcpServers: {
         docs: {
@@ -3396,6 +3410,81 @@ describe("ScheduleService", () => {
         },
       },
     });
+  });
+
+  test("rejects numeric cron steps when creating or updating a schedule", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+    const input = {
+      prompt: "Periodic check",
+      cadence: { type: "cron" as const, expression: "*/15 * * * *" },
+      target: {
+        type: "new-agent" as const,
+        config: { provider: "claude" as const, cwd: tempDir },
+      },
+      runOnCreate: false,
+    };
+
+    await expect(
+      service.create({ ...input, cadence: { type: "cron", expression: "0/15 * * * *" } }),
+    ).rejects.toThrow("Invalid cron minute step: use * or a range before /");
+    expect(await service.list()).toEqual([]);
+
+    const created = await service.create(input);
+    await expect(
+      service.update({ id: created.id, cadence: { type: "cron", expression: "0/15 * * * *" } }),
+    ).rejects.toThrow("Invalid cron minute step: use * or a range before /");
+    expect((await service.inspect(created.id)).cadence).toEqual(input.cadence);
+  });
+
+  test("recovers and runs numeric cron steps persisted by an older daemon", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "ok" }),
+    });
+    const created = await service.create({
+      prompt: "Periodic check",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      target: {
+        type: "new-agent",
+        config: { provider: "claude", cwd: tempDir },
+      },
+      runOnCreate: false,
+    });
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    await store.update(created.id, (schedule) => ({
+      ...schedule,
+      cadence: { type: "cron", expression: "0/15 * * * *" },
+    }));
+
+    now = new Date("2026-01-01T03:10:00.000Z");
+    try {
+      await service.start();
+      await service.stop();
+      expect((await service.inspect(created.id)).nextRunAt).toBe("2026-01-01T04:00:00.000Z");
+
+      now = new Date("2026-01-01T04:00:00.000Z");
+      await service.tick();
+      const inspected = await service.inspect(created.id);
+      expect(inspected.cadence).toEqual({ type: "cron", expression: "0/15 * * * *" });
+      expect(inspected.status).toBe("active");
+      expect(inspected.nextRunAt).toBe("2026-01-01T05:00:00.000Z");
+      expect(inspected.runs).toHaveLength(1);
+      expect(inspected.runs[0]).toMatchObject({ status: "succeeded", output: "ok" });
+    } finally {
+      await service.stop();
+    }
   });
 
   test("advances stale nextRunAt on daemon restart", async () => {
