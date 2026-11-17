@@ -424,7 +424,8 @@ test.describe("Worktree restore", () => {
     await captureBranchlessRestoreStep(page, "02-unarchive-agent.png");
 
     await page.getByRole("button", { name: "Unarchive", exact: true }).click();
-    await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).toBeNull();
+    // Refresh uses the session RPC deadline while the provider resumes.
+    await expect.poll(() => fetchAgentArchivedAt(client, agent.id), { timeout: 60_000 }).toBeNull();
     await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
     await captureBranchlessRestoreStep(page, "03-agent-ready.png");
 
