@@ -98,7 +98,8 @@ projected items. Backward pages and prompt-jump windows also include whole turns
 all currently available rows of an active run. A run can exceed the item target, but the
 serialized response, including its agent snapshot and envelope, targets 47 KiB of UTF-8.
 When a response exceeds that budget, the daemon reselects a smaller item-based page with
-the same direction and cursor. Oversized turns can therefore span pages; older pages
+the same direction and cursor. A prompt-jump window instead retains its target while
+reducing the surrounding context. Oversized turns can therefore span pages; older pages
 retain their turn identities and reconstruct the turn through ordinary pagination.
 A single intact projected item or agent snapshot may exceed the byte target so pagination
 still advances. This adds no content truncation beyond the existing per-item limits.

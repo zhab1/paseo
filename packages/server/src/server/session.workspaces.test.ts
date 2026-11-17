@@ -3239,7 +3239,7 @@ function createTimelineBudgetFixture(backend: "memory" | "disk", modern = false)
     session,
     emitted,
     source,
-    async fetch(options: AgentTimelineFetchOptions = {}) {
+    async fetch(options: AgentTimelineFetchOptions & { mergeWindow?: boolean } = {}) {
       await session.handleMessage(
         {
           type: "fetch_agent_timeline_request",
@@ -3390,14 +3390,29 @@ test.each(["memory", "disk"] as const)(
         );
       const prompt = await fixture.fetch({
         direction: "before",
-        cursor: { epoch: "prompt-epoch", seq: 2 },
+        // planTimelinePromptJump places half the original page after its target.
+        cursor: { epoch: "prompt-epoch", seq: 1 + Math.floor(40 / 2) + 1 },
         limit: 40,
         wholeTurns: true,
+        mergeWindow: true,
       });
+      expect(prompt.payload.entries.map((row) => row.seqStart)).toEqual([1]);
       expect(prompt.payload.entries.map((row) => row.item)).toEqual([
         { type: "user_message", text: "jump target" },
       ]);
-      expect(prompt.payload).toMatchObject({ hasNewer: true, endCursor: { seq: 1 } });
+      expect(prompt.payload).toMatchObject({
+        mergeWindow: true,
+        hasNewer: true,
+        endCursor: { seq: 1 },
+      });
+      const ordinary = await fixture.fetch({
+        direction: "before",
+        cursor: { epoch: "prompt-epoch", seq: 22 },
+        limit: 40,
+        wholeTurns: true,
+      });
+      expect(ordinary.payload).toMatchObject({ hasNewer: false, endCursor: { seq: 9 } });
+      expect(ordinary.payload.entries.at(-1)?.seqStart).toBe(9);
     } finally {
       await fixture.close();
     }

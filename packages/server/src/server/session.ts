@@ -8673,6 +8673,17 @@ export class Session {
         };
       };
       let response = buildResponse(timeline);
+      // Prompt jumps center their target in the original requested window. If
+      // that window must shrink, end at the target instead of dropping it with
+      // the newer context. Ordinary older-history cursors remain unchanged.
+      const budgetCursor =
+        msg.mergeWindow === true &&
+        direction === "before" &&
+        cursor &&
+        msg.limit !== undefined &&
+        msg.limit > 0
+          ? { ...cursor, seq: cursor.seq - Math.floor(msg.limit / 2) }
+          : cursor;
       // Reselect through the store so source coverage, overlap resets, and cursors
       // describe the delivered rows. Whole turns are a preference; one intact
       // entry (or a large agent envelope) may exceed the budget to make progress.
@@ -8684,7 +8695,7 @@ export class Session {
       ) {
         timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
           direction,
-          cursor,
+          cursor: budgetCursor,
           limit: Math.max(1, Math.floor(timeline.rows.length / 2)),
           wholeTurns: false,
         });
