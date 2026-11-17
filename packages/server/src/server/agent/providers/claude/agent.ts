@@ -5146,26 +5146,49 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private appendQuotaFailure(
+    message: Extract<SDKMessage, { type: "result" }>,
+    events: AgentStreamEvent[],
+  ): void {
+    const resultError =
+      message.subtype === "success" && message.is_error ? message.result.trim() : "";
+    if (resultError) this.withheldErrorReply = [];
+    else this.releaseWithheldErrorReply(events);
+    const usage = this.convertUsage(message);
+    if (usage) events.push({ type: "usage_updated", provider: "claude", usage });
+    events.push(...this.sidechainTracker.finishAll("failed"));
+    const error =
+      resultError ||
+      (this.mainSubscriptionLimit
+        ? "Claude subscription usage limit stopped the task"
+        : (message.subtype !== "success" && message.errors.join("\n")) ||
+          "Claude API rate limit stopped the task");
+    events.push({
+      ...this.buildTurnFailedEvent(error),
+      ...(this.mainSubscriptionLimit ? { subscriptionLimit: this.mainSubscriptionLimit } : {}),
+    });
+    this.mainQuotaStop = false;
+    this.mainSubscriptionLimit = undefined;
+  }
+
+  private isQuotaStopResult(message: Extract<SDKMessage, { type: "result" }>): boolean {
+    return Boolean(
+      this.mainQuotaStop &&
+      (message.subtype !== "success" || message.is_error !== false || this.mainSubscriptionLimit),
+    );
+  }
+
   private appendResultEvents(
     message: Extract<SDKMessage, { type: "result" }>,
     events: AgentStreamEvent[],
   ): void {
-    const usage = this.convertUsage(message);
-    if (this.mainQuotaStop) {
-      this.releaseWithheldErrorReply(events);
-      events.push(...this.sidechainTracker.finishAll("failed"));
-      const error = this.mainSubscriptionLimit
-        ? "Claude subscription usage limit stopped the task"
-        : (message.subtype !== "success" && message.errors.join("\n")) ||
-          "Claude API rate limit stopped the task";
-      events.push({
-        ...this.buildTurnFailedEvent(error),
-        ...(this.mainSubscriptionLimit ? { subscriptionLimit: this.mainSubscriptionLimit } : {}),
-      });
-      this.mainQuotaStop = false;
-      this.mainSubscriptionLimit = undefined;
+    if (this.isQuotaStopResult(message)) {
+      this.appendQuotaFailure(message, events);
       return;
     }
+    this.mainQuotaStop = false;
+    this.mainSubscriptionLimit = undefined;
+    const usage = this.convertUsage(message);
     // Claude Code reports a turn that stopped on an API error (a usage limit, an overloaded or
     // rejected request) as `success` with `is_error`, carrying the error text in `result`.
     if (message.subtype === "success" && message.is_error) {

@@ -357,7 +357,7 @@ test("timeline reads keep runnable unarchived agents interactive for the next pr
     const agent = await ctx.client.createAgent({ provider: "codex", cwd });
     await ctx.daemon.daemon.agentManager.closeAgent(agent.id);
     await ctx.client.fetchAgentTimeline(agent.id);
-    expect(purposes).toEqual([{ purpose: "interactive" }]);
+    expect(purposes).toEqual([expect.objectContaining({ purpose: "interactive" })]);
     await ctx.client.sendMessage(agent.id, "continue after opening history");
     expect((await ctx.client.waitForFinish(agent.id, 15000)).status).toBe("idle");
     const timeline = await ctx.client.fetchAgentTimeline(agent.id);
@@ -372,10 +372,11 @@ test("timeline reads keep runnable unarchived agents interactive for the next pr
       manager.tryRunOutOfBand(agent.id, "second prompt"),
     ]);
     expect(purposes).toEqual([
-      { purpose: "interactive" },
-      { purpose: "history" },
-      undefined, // Reload uses the provider's interactive default.
+      expect.objectContaining({ purpose: "interactive" }),
+      expect.objectContaining({ purpose: "history" }),
+      expect.objectContaining({ loadHistory: false }),
     ]);
+    expect(purposes[2]?.purpose).toBeUndefined(); // Provider's interactive default.
   } finally {
     await ctx.cleanup();
     await rm(cwd, { recursive: true, force: true });

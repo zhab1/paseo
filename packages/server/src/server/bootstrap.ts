@@ -1069,7 +1069,7 @@ export async function createPaseoDaemon(
     eligible: async (record) =>
       !record.workspaceId || !(await workspaceRegistry?.get(record.workspaceId))?.archivedAt,
     dispatch: async (agentId, prompt) => {
-      // Native Codex recovery may already have resumed the interrupted turn.
+      // Native recovery may already have resumed the interrupted turn.
       // Never send a second, synthetic prompt while that turn is still running.
       await interruptedAgentRecovery;
       if (agentManager.getAgent(agentId)?.lifecycle === "running") return;

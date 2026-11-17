@@ -3895,7 +3895,12 @@ export class CodexAppServerAgentSession implements AgentSession {
   // `item/started` is the only record of which turn owns a process.
   private terminalProcessIdsByTurnId = new Map<
     string,
-    { processIds: Set<string>; terminatedProcessIds: Set<string>; interruptAccepted: boolean }
+    {
+      processIds: Set<string>;
+      terminatedProcessIds: Set<string>;
+      interruptAccepted: boolean;
+      finished: boolean;
+    }
   >();
   private interruptedTurnCleanup: Promise<void> | null = null;
   private pendingUnlabeledTerminalInteractions = new Map<
@@ -4042,6 +4047,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.olderHistoryCursors.set(id, cursor);
       for (const [id, turnId] of history?.userTurns ?? [])
         this.rememberCodexUserMessageTurn(id, turnId ?? undefined);
+      // A config-only reload already has the timeline and its saved rewind index.
+      if (history) this.historyIndexed = true;
     }
   }
 
@@ -4854,10 +4861,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     return history.timeline;
   }
 
-  private async ensureThreadLoaded(): Promise<void> {
-    if (!this.client || !this.currentThreadId) return;
+  private threadResumeParams(threadId: string): Record<string, unknown> {
     const params: Record<string, unknown> = {
-      threadId: this.currentThreadId,
+      threadId,
       excludeTurns: true,
       initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
     };
@@ -4884,6 +4890,12 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (codexConfig) {
       params.config = codexConfig;
     }
+    return params;
+  }
+
+  private async ensureThreadLoaded(): Promise<void> {
+    if (!this.client || !this.currentThreadId) return;
+    const params = this.threadResumeParams(this.currentThreadId);
     try {
       const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
@@ -6012,6 +6024,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     const maxAttempts = params.maxAttempts ?? 2;
     let turnId = params.turnId;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      this.getTurnTerminalRecord(turnId);
+      const requestedTurnId = turnId;
       try {
         const request = params.client.request(
           "turn/interrupt",
@@ -6020,12 +6034,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         );
         this.trackInterruptedTurnCleanup(
           request.then(
-            () => this.endInterruptedTurnProcesses(params.client, params.threadId, turnId),
+            () => this.endInterruptedTurnProcesses(params.client, params.threadId, requestedTurnId),
             () => undefined,
           ),
         );
         await request;
-        const activeTurnId = this.currentTurnId;
+        const activeTurnId = this.currentInterruptTarget(turnId);
         if (!activeTurnId) {
           this.pendingInterruptRollover?.(null);
           return;
@@ -6061,6 +6075,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         return;
       }
     }
+  }
+
+  private currentInterruptTarget(interruptedTurnId: string): string | null {
+    // A completed interrupted turn cannot roll over into a later autonomous turn.
+    if (this.terminalProcessIdsByTurnId.get(interruptedTurnId)?.finished) return null;
+    return this.currentTurnId;
   }
 
   private waitForInterruptRollover(turnId: string, deadline: number): Promise<string | null> {
@@ -6110,6 +6130,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   async canStopRuntime(): Promise<boolean> {
+    await this.pendingNotifications;
     if (this.connectionState === "history-ready") return true;
     const client = this.client;
     if (!client || !this.currentThreadId || !this.canReleaseIdleRuntime()) return false;
@@ -6164,6 +6185,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       processIds: new Set<string>(),
       terminatedProcessIds: new Set<string>(),
       interruptAccepted: false,
+      finished: false,
     };
     this.terminalProcessIdsByTurnId.set(turnId, record);
     for (const oldestTurnId of this.terminalProcessIdsByTurnId.keys()) {
@@ -7495,6 +7517,30 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.emitEvent({ type: "thread_started", provider: CODEX_PROVIDER, sessionId: current });
   }
 
+  private emitFailedTurn(
+    parsed: Extract<ParsedCodexNotification, { kind: "turn_completed" }>,
+  ): void {
+    const terminalError = [parsed.errorMessage, parsed.errorDetails].filter(Boolean).join("\n\n");
+    this.settleStreamRetry({
+      status: "failed",
+      error: parsed.errorMessage ?? "Codex turn failed",
+    });
+    const diagnostic = [
+      parsed.errorDetails,
+      this.firstRetryError && this.firstRetryError !== terminalError
+        ? `Earlier provider retry: ${this.firstRetryError}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    this.emitEvent({
+      type: "turn_failed",
+      provider: CODEX_PROVIDER,
+      error: parsed.errorMessage ?? "Codex turn failed",
+      ...(diagnostic ? { diagnostic } : {}),
+    });
+  }
+
   private handleTurnCompletedNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "turn_completed" }>,
   ): void {
@@ -7511,6 +7557,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     if (parsed.turnId && this.currentTurnId && parsed.turnId !== this.currentTurnId) return;
+    const completedTurnId = parsed.turnId ?? this.currentTurnId;
+    if (completedTurnId) {
+      const interrupted = this.terminalProcessIdsByTurnId.get(completedTurnId);
+      if (interrupted) interrupted.finished = true;
+    }
     this.pendingInterruptRollover?.(null);
     this.completePendingRootCompactions();
     // What a turn that was not interrupted leaves running, it left on purpose; no later
@@ -7519,25 +7570,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.terminalProcessIdsByTurnId.delete(this.currentTurnId);
     }
     if (parsed.status === "failed") {
-      const terminalError = [parsed.errorMessage, parsed.errorDetails].filter(Boolean).join("\n\n");
-      this.settleStreamRetry({
-        status: "failed",
-        error: parsed.errorMessage ?? "Codex turn failed",
-      });
-      const diagnostic = [
-        parsed.errorDetails,
-        this.firstRetryError && this.firstRetryError !== terminalError
-          ? `Earlier provider retry: ${this.firstRetryError}`
-          : null,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      this.emitEvent({
-        type: "turn_failed",
-        provider: CODEX_PROVIDER,
-        error: parsed.errorMessage ?? "Codex turn failed",
-        ...(diagnostic ? { diagnostic } : {}),
-      });
+      this.emitFailedTurn(parsed);
     } else if (parsed.status === "interrupted") {
       this.settleStreamRetry({ status: "canceled" });
       this.dismissInterruptedAsyncQuestions();

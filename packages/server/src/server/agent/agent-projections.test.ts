@@ -232,7 +232,7 @@ describe("toAgentPayload", () => {
     try {
       expect(toAgentPayload(agent).status).toBe("running");
       expect(toAgentPayload(agent).activeTurn).toBeNull();
-      expect(buildStoredAgentPayload(record, ["claude"]).status).toBe("running");
+      expect(buildStoredAgentPayload(record, ["claude"], ownOptionsOnly).status).toBe("running");
       expect(toStoredAgentRecord(agent).lastStatus).toBe("idle");
     } finally {
       setQuotaContinuationPending(agent.id, false);

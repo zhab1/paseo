@@ -10,6 +10,7 @@ import {
   type ProjectedTimelineRow,
   type TimelineSeqRange,
   type TimelineLimitDirection,
+  type ProjectedTimelinePageSelection,
 } from "./timeline-projection.js";
 
 /** Disposable projection cache. Native provider histories remain the source of truth. */
@@ -190,6 +191,101 @@ export class CachedTimelineProjection {
     return enriched;
   }
 
+  private selectWholeTurnPage(
+    options: { bounds: { minSeq: number; maxSeq: number }; direction: TimelineLimitDirection },
+    selected: ProjectedTimelinePageSelection<{
+      seqStart: number;
+      seqEnd: number;
+      sourceSeqRanges: TimelineSeqRange[];
+    }>,
+    startSeq: number,
+  ): ProjectedTimelinePageSelection<{
+    seqStart: number;
+    seqEnd: number;
+    sourceSeqRanges: TimelineSeqRange[];
+  }> {
+    let start = startSeq;
+    const rowAt = (seq: number) =>
+      this.cache.db
+        .prepare(
+          "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start = ?",
+        )
+        .get(this.key, seq)!;
+    for (;;) {
+      const overlapping = this.cache.db
+        .prepare(
+          "SELECT min(start) AS first FROM timeline_rows WHERE timeline = ? AND start < ? AND end >= ?",
+        )
+        .get(this.key, start, start);
+      if (overlapping?.first !== null && overlapping?.first !== undefined) {
+        start = Number(overlapping.first);
+        continue;
+      }
+      const current = rowAt(start);
+      const previous = this.cache.db
+        .prepare(
+          "SELECT start, turn_id FROM timeline_rows WHERE timeline = ? AND start < ? ORDER BY start DESC LIMIT 1",
+        )
+        .get(this.key, start);
+      if (
+        !previous ||
+        !continuesTimelineTurn(
+          typeof previous.turn_id === "string" ? previous.turn_id : undefined,
+          typeof current.turn_id === "string" ? current.turn_id : undefined,
+          Number(current.turn_trigger) === 1,
+        )
+      )
+        break;
+      start = Number(previous.start);
+    }
+    let last = selected.entries.at(-1)!.seqStart;
+    if (options.direction === "before") {
+      for (;;) {
+        const current = rowAt(last);
+        const next = this.cache.db
+          .prepare(
+            "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
+          )
+          .get(this.key, last);
+        if (
+          !next ||
+          !continuesTimelineTurn(
+            typeof current.turn_id === "string" ? current.turn_id : undefined,
+            typeof next.turn_id === "string" ? next.turn_id : undefined,
+            Number(next.turn_trigger) === 1,
+          )
+        )
+          break;
+        last = Number(next.start);
+      }
+    }
+    const following = this.cache.db
+      .prepare(
+        "SELECT start FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
+      )
+      .get(this.key, last);
+    const endSeq = following ? Number(following.start) - 1 : options.bounds.maxSeq;
+    const entries = this.cache.db
+      .prepare(
+        "SELECT start, end, ranges FROM timeline_rows WHERE timeline = ? AND start >= ? AND start <= ? ORDER BY start",
+      )
+      .all(this.key, start, last)
+      .map((row) => ({
+        seqStart: Number(row.start),
+        seqEnd: Number(row.end),
+        sourceSeqRanges: JSON.parse(String(row.ranges)) as TimelineSeqRange[],
+      }));
+    return {
+      entries,
+      startSeq: start,
+      endSeq,
+      hasOlder: !!this.cache.db
+        .prepare("SELECT 1 FROM timeline_rows WHERE timeline = ? AND start < ? LIMIT 1")
+        .get(this.key, start),
+      hasNewer: endSeq < options.bounds.maxSeq,
+    };
+  }
+
   selectPage(options: {
     bounds: { minSeq: number; maxSeq: number };
     direction: TimelineLimitDirection;
@@ -221,86 +317,7 @@ export class CachedTimelineProjection {
     if (backwards) metadata.reverse();
     let selected = selectProjectedEntriesPage({ ...options, entries: metadata });
     if (options.wholeTurns && backwards && selected.startSeq !== null) {
-      let start = selected.startSeq;
-      const rowAt = (seq: number) =>
-        this.cache.db
-          .prepare(
-            "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start = ?",
-          )
-          .get(this.key, seq)!;
-      for (;;) {
-        const overlapping = this.cache.db
-          .prepare(
-            "SELECT min(start) AS first FROM timeline_rows WHERE timeline = ? AND start < ? AND end >= ?",
-          )
-          .get(this.key, start, start);
-        if (overlapping?.first !== null && overlapping?.first !== undefined) {
-          start = Number(overlapping.first);
-          continue;
-        }
-        const current = rowAt(start);
-        const previous = this.cache.db
-          .prepare(
-            "SELECT start, turn_id FROM timeline_rows WHERE timeline = ? AND start < ? ORDER BY start DESC LIMIT 1",
-          )
-          .get(this.key, start);
-        if (
-          !previous ||
-          !continuesTimelineTurn(
-            typeof previous.turn_id === "string" ? previous.turn_id : undefined,
-            typeof current.turn_id === "string" ? current.turn_id : undefined,
-            Number(current.turn_trigger) === 1,
-          )
-        )
-          break;
-        start = Number(previous.start);
-      }
-      let last = selected.entries.at(-1)!.seqStart;
-      if (options.direction === "before") {
-        for (;;) {
-          const current = rowAt(last);
-          const next = this.cache.db
-            .prepare(
-              "SELECT start, turn_id, turn_trigger FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
-            )
-            .get(this.key, last);
-          if (
-            !next ||
-            !continuesTimelineTurn(
-              typeof current.turn_id === "string" ? current.turn_id : undefined,
-              typeof next.turn_id === "string" ? next.turn_id : undefined,
-              Number(next.turn_trigger) === 1,
-            )
-          )
-            break;
-          last = Number(next.start);
-        }
-      }
-      const following = this.cache.db
-        .prepare(
-          "SELECT start FROM timeline_rows WHERE timeline = ? AND start > ? ORDER BY start LIMIT 1",
-        )
-        .get(this.key, last);
-      const endSeq = following ? Number(following.start) - 1 : options.bounds.maxSeq;
-      const entries = this.cache.db
-        .prepare(
-          "SELECT start, end, ranges FROM timeline_rows WHERE timeline = ? AND start >= ? AND start <= ? ORDER BY start",
-        )
-        .all(this.key, start, last)
-        .map((row) => ({
-          seqStart: Number(row.start),
-          seqEnd: Number(row.end),
-          sourceSeqRanges: JSON.parse(String(row.ranges)) as TimelineSeqRange[],
-        }));
-      selected = {
-        entries,
-        startSeq: start,
-        endSeq,
-        hasOlder: !!this.cache.db
-          .prepare("SELECT 1 FROM timeline_rows WHERE timeline = ? AND start < ? LIMIT 1")
-          .get(this.key, start),
-        hasNewer: endSeq < options.bounds.maxSeq,
-      };
+      selected = this.selectWholeTurnPage(options, selected, selected.startSeq);
     }
     if (!options.wholeTurns && options.direction === "tail" && selected.startSeq !== null) {
       selected.reset = !!this.cache.db

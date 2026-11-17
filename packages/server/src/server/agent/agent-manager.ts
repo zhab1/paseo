@@ -5472,15 +5472,15 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
-        this.runs.settleTerminalRun(agent.id, eventTurnId);
-        if (isForegroundEvent) {
-          this.finalizeForegroundTurn(agent, eventTurnId, quotaWait);
-        } else if (terminalDisposition !== "stale" && !agent.activeForegroundTurnId && !quotaWait) {
-          // Publish autonomous readiness only after the tracked run has settled.
-          this.emitState(agent);
-        }
-        if (this.quotaContinuationHooks)
-          await this.handleQuotaTerminal(agent, event, terminalDisposition);
+        const terminal = this.finishLiveTerminal(
+          agent,
+          event,
+          eventTurnId,
+          isForegroundEvent,
+          terminalDisposition,
+          quotaWait,
+        );
+        if (terminal) await terminal;
       }
 
       this.publishLiveStreamEvent({ agent, event, flags, quotaWait });
@@ -5489,6 +5489,26 @@ export class AgentManager {
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private finishLiveTerminal(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    eventTurnId: string | undefined,
+    isForegroundEvent: boolean,
+    terminalDisposition: ActiveTurnTerminalDisposition,
+    quotaWait: boolean,
+  ): Promise<void> | undefined {
+    this.runs.settleTerminalRun(agent.id, eventTurnId);
+    if (isForegroundEvent) {
+      this.finalizeForegroundTurn(agent, eventTurnId, quotaWait);
+    } else if (terminalDisposition !== "stale" && !agent.activeForegroundTurnId && !quotaWait) {
+      // Publish autonomous readiness only after the tracked run has settled.
+      this.emitState(agent);
+    }
+    if (this.quotaContinuationHooks)
+      return this.handleQuotaTerminal(agent, event, terminalDisposition);
+    return undefined;
   }
 
   private publishLiveStreamEvent(params: {

@@ -138,6 +138,21 @@ function appendAgentMessageEntries(entries: ActivityEntry[], message: AgentMessa
   if (body) entries.push(activityEntry(body));
 }
 
+function appendToolCallEntries(
+  entries: ActivityEntry[],
+  item: ToolCallTimelineItem,
+  options?: ActivityCuratorOptions,
+): void {
+  if (item.agentMessage) {
+    appendAgentMessageEntries(entries, item.agentMessage);
+    return;
+  }
+  entries.push(formatToolCallEntry(item, options));
+  if (item.detail.type === "sub_agent" && item.detail.log?.trim()) {
+    entries.push(activityEntry(item.detail.log.trim()));
+  }
+}
+
 function curateProjectedActivityEntries(
   items: readonly AgentTimelineItem[],
   options?: ActivityCuratorOptions,
@@ -164,17 +179,9 @@ function curateProjectedActivityEntries(
       case "reasoning":
         appendTextEntry(entries, item, options);
         break;
-      case "tool_call": {
-        if (item.agentMessage) {
-          appendAgentMessageEntries(entries, item.agentMessage);
-          break;
-        }
-        entries.push(formatToolCallEntry(item, options));
-        if (item.detail.type === "sub_agent" && item.detail.log?.trim()) {
-          entries.push(activityEntry(item.detail.log.trim()));
-        }
+      case "tool_call":
+        appendToolCallEntries(entries, item, options);
         break;
-      }
       case "todo":
         entries.push(activityEntry("[Tasks]"));
         for (const entry of item.items) {

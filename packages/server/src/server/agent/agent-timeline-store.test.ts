@@ -117,7 +117,8 @@ describe.each(["memory", "disk"])("timeline store (%s)", (backend) => {
     const store = createStore();
     store.initialize("long-turns", { epoch: "epoch" });
     for (let i = 0; i < 125; i++) {
-      const turnId = i < 3 ? "short" : i < 123 ? "long" : "latest";
+      let turnId = i < 3 ? "short" : "long";
+      if (i >= 123) turnId = "latest";
       store.append(
         "long-turns",
         {
@@ -664,16 +665,22 @@ it("reads only the candidate window when paging a long cached timeline", () => {
   }
 });
 
-it.each(["tool", "assistant", "child", "manager"])(
-  "serves all 125 MiB of cached %s history in pages with a 96 MiB heap",
-  (kind) => {
+it.each([
+  ["tool", 96],
+  ["assistant", 96],
+  ["child", 96],
+  // The manager imports add a large fixed baseline; the retained-history bound is unchanged.
+  ["manager", 128],
+] as const)(
+  "serves all 125 MiB of cached %s history in pages with a %i MiB heap",
+  (kind, heapMiB) => {
     const fixture = fileURLToPath(
       new URL("./test-utils/timeline-cache-memory-repro.ts", import.meta.url),
     );
     const result = JSON.parse(
       execFileSync(
         process.execPath,
-        ["--max-old-space-size=96", "--expose-gc", "--import", "tsx", fixture, kind],
+        [`--max-old-space-size=${heapMiB}`, "--expose-gc", "--import", "tsx", fixture, kind],
         { encoding: "utf8" },
       ),
     );

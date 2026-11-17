@@ -3,7 +3,6 @@ import { fileURLToPath } from "node:url";
 import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
 import { describe, expect, test } from "vitest";
 
-import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 

@@ -309,7 +309,9 @@ test.describe("Worktree restore", () => {
     ).toHaveText(switchedBranch, { timeout: 30_000 });
   });
 
-  test("restores the workspace and all agents closed by its archive", async ({ page }) => {
+  test("restores the workspace before explicitly unarchiving each selected agent", async ({
+    page,
+  }) => {
     const { agents, worktree } = await createArchivedMissingWorktree("restore-agents", {
       agentCount: 2,
     });
@@ -336,11 +338,13 @@ test.describe("Worktree restore", () => {
     await expect(
       page.getByTestId(`workspace-tab-agent_${firstAgent.id}`).filter({ visible: true }).first(),
     ).toHaveAttribute("aria-selected", "true");
-    await expect.poll(() => fetchAgentArchivedAt(client, firstAgent.id)).toBeNull();
-    await expect.poll(() => fetchAgentArchivedAt(client, secondAgent.id)).toBeNull();
-    await expect(
-      page.getByTestId(`workspace-tab-agent_${secondAgent.id}`).filter({ visible: true }).first(),
-    ).toBeVisible();
+    expect(await fetchAgentArchivedAt(client, firstAgent.id)).not.toBeNull();
+    expect(await fetchAgentArchivedAt(client, secondAgent.id)).not.toBeNull();
+    await page.getByRole("button", { name: "Unarchive", exact: true }).click();
+    await expect
+      .poll(() => fetchAgentArchivedAt(client, firstAgent.id), { timeout: 30_000 })
+      .toBeNull();
+    expect(await fetchAgentArchivedAt(client, secondAgent.id)).not.toBeNull();
     await expect(page.getByRole("button", { name: "Unarchive" })).toHaveCount(0, {
       timeout: 30_000,
     });
@@ -350,8 +354,13 @@ test.describe("Worktree restore", () => {
     await expect(
       page.getByTestId(`workspace-tab-agent_${secondAgent.id}`).filter({ visible: true }).first(),
     ).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByRole("button", { name: "Unarchive" })).toHaveCount(0);
-    await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
+    await expect(page.getByRole("button", { name: "Unarchive" })).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.getByRole("button", { name: "Unarchive" }).click();
+    await expect
+      .poll(() => fetchAgentArchivedAt(client, secondAgent.id), { timeout: 30_000 })
+      .toBeNull();
   });
 
   test("restores a branchless workspace so its archived agent can be used again", async ({
@@ -409,7 +418,12 @@ test.describe("Worktree restore", () => {
     await expect
       .poll(() => existsSync(backingWorktree.workspaceDirectory), { timeout: 30_000 })
       .toBe(true);
-    await expect(page.getByRole("button", { name: "Unarchive", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Unarchive", exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    await captureBranchlessRestoreStep(page, "02-unarchive-agent.png");
+
+    await page.getByRole("button", { name: "Unarchive", exact: true }).click();
     await expect.poll(() => fetchAgentArchivedAt(client, agent.id)).toBeNull();
     await expect(page.getByRole("textbox", { name: "Message agent..." })).toBeEditable();
     await captureBranchlessRestoreStep(page, "03-agent-ready.png");
