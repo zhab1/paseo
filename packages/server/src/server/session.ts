@@ -360,6 +360,10 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
   }
 }
 
+// Keep complete History responses small enough for slow encrypted relay links.
+// The allowance leaves room for encryption and base64 expansion under 64 KiB.
+const MAX_HISTORY_RESPONSE_BYTES = 47 * 1024;
+
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
 export function resolveWaitForFinishError(options: {
@@ -6103,6 +6107,42 @@ export class Session {
     return this.supports(CLIENT_CAPS.backgroundAgents) ? true : "workspaces";
   }
 
+  private boundHistoryPage(
+    entries: FetchAgentsResponseEntry[],
+    request: FetchAgentHistoryRequestMessage,
+    sort: readonly FetchAgentsRequestSort[],
+  ): FetchAgentsResponseEntry[] {
+    let entryBytes = 0;
+    let count = 0;
+    for (const entry of entries) {
+      const nextEntryBytes = Buffer.byteLength(JSON.stringify(entry)) + (count > 0 ? 1 : 0);
+      const cursor = this.agentsPager.encode(entry.agent, sort);
+      const envelopeBytes = Buffer.byteLength(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "fetch_agent_history_response",
+            payload: {
+              requestId: request.requestId,
+              entries: [],
+              pageInfo: {
+                nextCursor: cursor,
+                prevCursor: request.page?.cursor ?? null,
+                hasMore: false,
+              },
+            },
+          },
+        }),
+      );
+      if (count > 0 && envelopeBytes + entryBytes + nextEntryBytes > MAX_HISTORY_RESPONSE_BYTES) {
+        break;
+      }
+      entryBytes += nextEntryBytes;
+      count += 1;
+    }
+    return entries.slice(0, count);
+  }
+
   private async listFetchAgentsEntries(
     request: AgentDirectoryRequestMessage,
     backgroundVisibility: BackgroundVisibility,
@@ -6176,8 +6216,12 @@ export class Session {
       search,
     });
 
-    const pagedEntries = matchedEntries.slice(0, limit);
-    const hasMore = matchedEntries.length > limit;
+    const candidatePage = matchedEntries.slice(0, limit);
+    const pagedEntries =
+      request.type === "fetch_agent_history_request"
+        ? this.boundHistoryPage(candidatePage, request, sort)
+        : candidatePage;
+    const hasMore = matchedEntries.length > pagedEntries.length;
     const nextCursor =
       hasMore && pagedEntries.length > 0
         ? this.agentsPager.encode(pagedEntries[pagedEntries.length - 1].agent, sort)
