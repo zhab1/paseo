@@ -6024,7 +6024,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const maxAttempts = params.maxAttempts ?? 2;
     let turnId = params.turnId;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      this.getTurnTerminalRecord(turnId);
+      const interruptedTurn = this.getTurnTerminalRecord(turnId);
       const requestedTurnId = turnId;
       try {
         const request = params.client.request(
@@ -6039,7 +6039,8 @@ export class CodexAppServerAgentSession implements AgentSession {
           ),
         );
         await request;
-        const activeTurnId = this.currentInterruptTarget(turnId);
+        await this.pendingNotifications;
+        const activeTurnId = this.currentInterruptTarget(interruptedTurn);
         if (!activeTurnId) {
           this.pendingInterruptRollover?.(null);
           return;
@@ -6060,6 +6061,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         }
         return;
       } catch (error) {
+        await this.pendingNotifications;
+        if (interruptedTurn.finished) return;
         const actualTurnId = readCodexInterruptTurnMismatch(error);
         const resyncedTurnId = this.resyncNativeTurn(params, turnId, actualTurnId);
         if (attempt + 1 < maxAttempts && resyncedTurnId && Date.now() < deadline) {
@@ -6077,9 +6080,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private currentInterruptTarget(interruptedTurnId: string): string | null {
-    // A completed interrupted turn cannot roll over into a later autonomous turn.
-    if (this.terminalProcessIdsByTurnId.get(interruptedTurnId)?.finished) return null;
+  private currentInterruptTarget(interruptedTurn: { finished: boolean }): string | null {
+    // Keep the attempt's record even when normal completion removes it from the map.
+    if (interruptedTurn.finished) return null;
     return this.currentTurnId;
   }
 

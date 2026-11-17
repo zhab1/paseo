@@ -41,14 +41,16 @@ afterEach(async () => {
 function createHarness(
   options: {
     terminate?: (processId: string) => unknown;
-    interruptResponse?: (completeTurn: () => void) => unknown;
+    interruptResponse?: (
+      completeTurn: (status?: "completed" | "failed" | "interrupted") => void,
+    ) => unknown;
   } = {},
 ) {
   const handlers: Record<string, Handler> = {
     "thread/backgroundTerminals/list": () => ({ data: [], nextCursor: null }),
     "turn/interrupt": () => {
-      const completeTurn = () =>
-        appServer.completeTurn({ threadId: THREAD, status: "interrupted" });
+      const completeTurn = (status: "completed" | "failed" | "interrupted" = "interrupted") =>
+        appServer.completeTurn({ threadId: THREAD, status });
       if (options.interruptResponse) return options.interruptResponse(completeTurn);
       completeTurn();
       return {};
@@ -206,6 +208,48 @@ describe("an interrupted Codex turn's commands end before the next turn", () => 
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(harness.terminated()).toEqual(["201", "202"]);
   });
+
+  test.each(["completed", "failed"] as const)(
+    "leaves the next turn alone when the original %s before a delayed response",
+    async (status) => {
+      for (const response of ["success", "mismatch", "idle"] as const) {
+        const acknowledge = deferred();
+        const harness = createHarness({
+          interruptResponse: (completeTurn) => {
+            completeTurn(status);
+            return acknowledge.promise.then(() => {
+              if (response === "success") return {};
+              return {
+                __jsonRpcError: {
+                  code: -32600,
+                  message:
+                    response === "mismatch"
+                      ? "expected active turn id native-B but found native-C"
+                      : "no active turn to interrupt",
+                },
+              };
+            });
+          },
+        });
+        await harness.startTurn("run command", "native-B");
+        await harness.runsCommand({ turnId: "native-B", processId: "201" });
+        const interrupting = harness.session.interrupt();
+        await vi.waitFor(() => expect(harness.requests("turn/interrupt")).toHaveLength(1));
+        const next = waitForNextEvent(harness.session, "turn_started");
+        harness.appServer.startsTurn({ threadId: THREAD, turnId: "native-C" });
+        await next;
+        await harness.runsCommand({ turnId: "native-C", processId: "301" });
+        acknowledge.resolve();
+        await interrupting;
+        expect(harness.requests("turn/interrupt")).toHaveLength(1);
+        expect((harness.session as unknown as { currentTurnId: string | null }).currentTurnId).toBe(
+          "native-C",
+        );
+        expect(harness.terminated()).toEqual([]);
+        harness.appServer.assertNoErrors();
+      }
+    },
+  );
 
   test("sends the next turn/start only after the terminates are answered", async () => {
     const answer = deferred();
