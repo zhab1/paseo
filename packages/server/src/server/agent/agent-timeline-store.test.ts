@@ -550,7 +550,7 @@ it("reads only the candidate window when paging a long cached timeline", () => {
   }
 });
 
-it.each(["tool", "assistant", "child"])(
+it.each(["tool", "assistant", "child", "manager"])(
   "serves all 125 MiB of cached %s history in pages with a 96 MiB heap",
   (kind) => {
     const fixture = fileURLToPath(
@@ -563,7 +563,7 @@ it.each(["tool", "assistant", "child"])(
         { encoding: "utf8" },
       ),
     );
-    const expected = { tool: 2000, assistant: 4000, child: 2001 }[kind]!;
+    const expected = { tool: 2000, assistant: 4000, child: 2001, manager: 2000 }[kind]!;
     expect(result.rows).toBe(expected);
     expect(result.unique).toBe(expected);
     expect(result.retained).toBeLessThan(16 * 1024 * 1024);
