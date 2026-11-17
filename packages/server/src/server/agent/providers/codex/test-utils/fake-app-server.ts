@@ -228,12 +228,15 @@ export function createFakeCodexAppServer(
     "thread/turns/list": () => ({ data: [] }),
     ...handlers,
   };
-  const historyRequest = pagedHistoryRequest(async (method, params) => {
-    const handler = handlers[method];
-    if (handler) return handler(params);
-    if (method === "thread/read") return { thread: { status: { type: "idle" }, turns: [] } };
-    return { data: [], nextCursor: null };
-  });
+  const historyRequest = pagedHistoryRequest(
+    async (method, params) => {
+      const handler = handlers[method];
+      if (handler) return handler(params);
+      if (method === "thread/read") return { thread: { status: { type: "idle" }, turns: [] } };
+      return { data: [], nextCursor: null };
+    },
+    { nativePages: Boolean(handlers["thread/items/list"]) },
+  );
   for (const method of ["thread/read", "thread/turns/list", "thread/items/list"]) {
     responseHandlers[method] = (params) => historyRequest(method, params);
   }
@@ -800,6 +803,7 @@ export interface FakeCodexHistoryThread {
 export interface FakeCodexHistoryOptions {
   /** Any response carrying one of these items is written past the line cap. */
   oversizedItemIds?: string[];
+  maxItemsPerPage?: number;
 }
 
 /**
@@ -836,6 +840,22 @@ export function fakeCodexThreadHistory(
       if (isOversized(thread.turns.flatMap((turn) => turn.items))) return OVERSIZED_RESPONSE;
       return { thread: { id, turns: thread.turns } };
     },
+    "thread/turns/list": (params) => {
+      const { thread } = readThread(params);
+      const request = toJsonObject(params);
+      const turns = request.sortDirection === "desc" ? thread.turns.toReversed() : thread.turns;
+      const limit = Math.min(typeof request.limit === "number" ? request.limit : 25, 100);
+      const start =
+        typeof request.cursor === "string" ? Number(request.cursor.slice("cursor-".length)) : 0;
+      const end = Math.min(turns.length, start + limit);
+      const selected = turns.slice(start, end);
+      if (request.itemsView === "full" && isOversized(selected.flatMap((turn) => turn.items)))
+        return OVERSIZED_RESPONSE;
+      const data = selected.map((turn) =>
+        request.itemsView === "full" ? turn : Object.assign({}, turn, { items: undefined }),
+      );
+      return { data, nextCursor: end < turns.length ? `cursor-${end}` : null };
+    },
     "thread/items/list": (params) => {
       const { thread } = readThread(params);
       if (thread.historyMode !== "paginated") {
@@ -843,7 +863,7 @@ export function fakeCodexThreadHistory(
       }
       const request = toJsonObject(params);
       // Codex records each item's own times; the fake gives every item its turn's.
-      const rows = thread.turns.flatMap((turn) =>
+      let rows = thread.turns.flatMap((turn) =>
         turn.items.map((item) => ({
           turnId: turn.id,
           item,
@@ -851,12 +871,19 @@ export function fakeCodexThreadHistory(
           completedAtMs: turn.completedAt === undefined ? null : turn.completedAt * 1000,
         })),
       );
+      if (typeof request.turnId === "string")
+        rows = rows.filter((row) => row.turnId === request.turnId);
+      if (request.sortDirection === "desc") rows.reverse();
       const limit = Math.min(typeof request.limit === "number" ? request.limit : 25, 100);
       const start =
         typeof request.cursor === "string" ? Number(request.cursor.slice("cursor-".length)) : 0;
       const end = Math.min(rows.length, start + limit);
       const data = rows.slice(start, end);
-      if (isOversized(data.map((row) => row.item))) return OVERSIZED_RESPONSE;
+      if (
+        isOversized(data.map((row) => row.item)) ||
+        (options.maxItemsPerPage !== undefined && data.length > options.maxItemsPerPage)
+      )
+        return OVERSIZED_RESPONSE;
       return { data, nextCursor: end < rows.length ? `cursor-${end}` : null };
     },
   };

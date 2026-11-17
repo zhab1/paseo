@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { AGENT_TIMELINE_ITEM_LIMIT } from "../../agent-timeline-content.js";
 import { resolveCreateAgentTitles } from "../../create-agent-title.js";
-import { CodexAppServerRpcError } from "./app-server-transport.js";
+import {
+  CodexAppServerRpcError,
+  CodexAppServerResponseTooLargeError,
+} from "./app-server-transport.js";
+import { CodexThreadHistoryTooLargeError } from "./thread-history.js";
 
 interface HistoryClient {
   request(method: string, params: Record<string, unknown>): Promise<unknown>;
@@ -105,15 +109,22 @@ export async function openCodexHistory(
     let reachedBoundary = !throughTurnId || resume !== undefined;
     let itemIndex = resume?.legacyItemIndex;
     do {
-      const page = TurnsPageSchema.parse(
-        await requestPage("thread/turns/list", {
+      let response: unknown;
+      try {
+        response = await requestPage("thread/turns/list", {
           threadId,
           limit: 1,
           sortDirection: "desc",
           itemsView: "full",
           ...(cursor ? { cursor } : {}),
-        }),
-      );
+        });
+      } catch (error) {
+        if (!(error instanceof CodexAppServerResponseTooLargeError)) throw error;
+        throw new CodexThreadHistoryTooLargeError(
+          `This Codex thread's history is too large to load in one read. To move it to paginated history, archive this agent, run \`codex migrate-rollouts --apply --thread ${threadId}\` (Codex 0.148 or newer), then unarchive the agent.`,
+        );
+      }
+      const page = TurnsPageSchema.parse(response);
       for (const rawTurn of page.data) {
         const { items: turnItems, ...turn } = TurnSchema.extend({
           items: z.array(z.unknown()),
@@ -148,6 +159,34 @@ export async function openCodexHistory(
     return turn;
   }
 
+  async function readItemsPage(
+    turnId: string | undefined,
+    cursor: string | null,
+    pageSize: number,
+    remaining: number,
+  ) {
+    for (;;) {
+      try {
+        const response = await requestPage("thread/items/list", {
+          threadId,
+          ...(turnId ? { turnId } : {}),
+          limit: Math.min(pageSize, remaining),
+          sortDirection: "desc",
+          ...(cursor ? { cursor } : {}),
+        });
+        return { page: ItemsPageSchema.parse(response), pageSize };
+      } catch (error) {
+        if (!(error instanceof CodexAppServerResponseTooLargeError)) throw error;
+        const attempted = Math.min(pageSize, remaining);
+        if (attempted <= 1)
+          throw new CodexThreadHistoryTooLargeError(
+            "The rest of this Codex thread's history is too large to load.",
+          );
+        pageSize = Math.max(1, Math.floor(attempted / 2));
+      }
+    }
+  }
+
   async function* pagedItems() {
     let remaining = AGENT_TIMELINE_ITEM_LIMIT;
     // A deferred child is frozen at its saved completed turn. Native turn filters
@@ -157,16 +196,11 @@ export async function openCodexHistory(
       const turnId = turnIds[turnIndex];
       let cursor: string | null =
         turnIndex === (resume?.turnIndex ?? 0) ? (resume?.nativeCursor ?? null) : null;
-      do {
-        const page = ItemsPageSchema.parse(
-          await requestPage("thread/items/list", {
-            threadId,
-            ...(turnId ? { turnId } : {}),
-            limit: Math.min(PAGE_SIZE, remaining),
-            sortDirection: "desc",
-            ...(cursor ? { cursor } : {}),
-          }),
-        );
+      let pageSize = PAGE_SIZE;
+      for (;;) {
+        const result = await readItemsPage(turnId, cursor, pageSize, remaining);
+        const { page } = result;
+        pageSize = result.pageSize;
         for (const entry of page.data) {
           const turn = await resolveTurn(entry.turnId);
           yield { ...entry, turn };
@@ -184,7 +218,8 @@ export async function openCodexHistory(
         if (page.nextCursor && page.nextCursor === cursor)
           throw new Error("Codex item cursor did not advance");
         cursor = page.nextCursor;
-      } while (cursor);
+        if (!cursor) break;
+      }
     }
   }
   return {

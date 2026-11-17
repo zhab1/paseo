@@ -4,6 +4,7 @@ import {
   type CodexHistoryCursor,
 } from "./codex/history-reader.js";
 import { readCodexDescendantIds } from "./codex/thread-graph.js";
+import { CodexThreadHistoryTooLargeError } from "./codex/thread-history.js";
 import {
   AGENT_TIMELINE_ITEM_LIMIT,
   limitAgentTimelineItemContent,
@@ -2249,37 +2250,55 @@ async function readCodexHistoryGroups(
 ) {
   const groups = [];
   const errorTurnIds = new Set(cursor?.errorTurnIds);
-  for await (const entry of history.items) {
-    if (!errorTurnIds.has(entry.turn.id)) {
-      const item = readCodexTurnError(
-        entry.turn,
-        "completedAtMs" in entry ? entry.completedAtMs : undefined,
-      );
-      if (item) {
-        errorTurnIds.add(entry.turn.id);
-        // Native pages are newest first. Put the terminal error before the turn's
-        // newest item here so reversal places it after that turn's final output.
-        groups.push({
-          items: [item],
-          turn: entry.turn,
-          timestamp: readCodexTurnHistoryTimestamp(entry.turn, item),
-          activity: null,
-          childThreadIds: [],
-        });
+  try {
+    for await (const entry of history.items) {
+      if (!errorTurnIds.has(entry.turn.id)) {
+        const item = readCodexTurnError(
+          entry.turn,
+          "completedAtMs" in entry ? entry.completedAtMs : undefined,
+        );
+        if (item) {
+          errorTurnIds.add(entry.turn.id);
+          // Native pages are newest first. Put the terminal error before the turn's
+          // newest item here so reversal places it after that turn's final output.
+          groups.push({
+            items: [item],
+            turn: entry.turn,
+            timestamp: readCodexTurnHistoryTimestamp(entry.turn, item),
+            startedAt: null,
+            completedAt: null,
+            activity: null,
+            childThreadIds: [],
+          });
+        }
       }
+      const activity = readCodexSubAgentActivity(entry.item);
+      groups.push({
+        items: (await threadItemToTimelineEntries(entry.item, { cwd })).map(
+          limitAgentTimelineItemContent,
+        ),
+        turn: entry.turn,
+        timestamp: readCodexHistoryTimestamp(entry.item),
+        startedAt: normalizeProviderReplayTimestamp(
+          "startedAtMs" in entry ? entry.startedAtMs : null,
+        ),
+        completedAt: normalizeProviderReplayTimestamp(
+          "completedAtMs" in entry ? entry.completedAtMs : null,
+        ),
+        activity,
+        childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
+      });
     }
-    const activity = readCodexSubAgentActivity(entry.item);
+  } catch (error) {
+    if (!(error instanceof CodexThreadHistoryTooLargeError)) throw error;
     groups.push({
-      items: (await threadItemToTimelineEntries(entry.item, { cwd })).map(
-        limitAgentTimelineItemContent,
-      ),
-      turn: entry.turn,
-      timestamp:
-        readCodexHistoryTimestamp(entry.item) ??
-        normalizeProviderReplayTimestamp("startedAtMs" in entry ? entry.startedAtMs : null) ??
-        normalizeProviderReplayTimestamp("completedAtMs" in entry ? entry.completedAtMs : null),
-      activity,
-      childThreadIds: readCodexHistoricalSubAgentThreadIds(entry.item),
+      items: [{ type: "notification" as const, level: "warning" as const, message: error.message }],
+      turn: { id: "" },
+      timestamp: null,
+      startedAt: null,
+      completedAt: null,
+      activity: null,
+      childThreadIds: [],
     });
   }
   return { groups, errorTurnIds: [...errorTurnIds] };
@@ -2322,7 +2341,12 @@ async function loadCodexThreadHistoryTimeline(params: {
       }
     }
     for (const timelineItem of group.items) {
-      const timestamp = group.timestamp ?? readCodexTurnHistoryTimestamp(turn, timelineItem);
+      const itemTime =
+        timelineItem.type === "user_message"
+          ? (group.startedAt ?? group.completedAt)
+          : (group.completedAt ?? group.startedAt);
+      const timestamp =
+        group.timestamp ?? itemTime ?? readCodexTurnHistoryTimestamp(turn, timelineItem);
       const settledTimelineItem =
         historicalSubAgentActivity && timelineItem.type === "tool_call"
           ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)

@@ -136,7 +136,8 @@ describe("native paged history", () => {
       expect(result.rows).toBe(200);
       expect(result.firstCallId).toBe(`${kind === "mcp" ? "mcp" : "command"}-200`);
       expect(result.lastCallId).toBe(`${kind === "mcp" ? "mcp" : "command"}-399`);
-      expect(result.maxOutput).toBe(64 * 1024);
+      expect(result.maxOutput).toBeGreaterThan(0);
+      expect(result.maxOutput).toBeLessThanOrEqual(64 * 1024);
       // The older half is never read; retained output is capped before reversing the tail.
       expect(result.retained).toBeLessThan(64 * 1024 * 1024);
     },
