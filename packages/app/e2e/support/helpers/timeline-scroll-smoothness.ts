@@ -41,6 +41,7 @@ interface Recording {
 interface TimelinePage {
   direction: string;
   count: number;
+  bytes: number;
   hasOlder: boolean;
   at: number;
 }
@@ -237,6 +238,7 @@ export function observeTimelinePages(page: Page, agentId: string): TimelinePage[
       pages.push({
         direction: message.payload.direction,
         count: message.payload.entries.length,
+        bytes: Buffer.byteLength(JSON.stringify(envelope)),
         hasOlder: message.payload.hasOlder,
         at: Date.now(),
       });
@@ -259,7 +261,8 @@ export async function openOnlyTimelineTail(
     .toBeGreaterThanOrEqual(1);
 
   expect(pages[0]).toMatchObject({ direction: "tail", hasOlder: true });
-  expect(pages[0].count).toBe(40);
+  expect(pages[0].count).toBeGreaterThan(0);
+  expect(pages[0].bytes <= 47 * 1024 || pages[0].count === 1).toBe(true);
   expect(pages.filter((entry) => entry.direction === "tail")).toHaveLength(1);
   expect(
     pages.filter((entry) => entry.direction === "after").every((entry) => entry.count === 0),
