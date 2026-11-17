@@ -26,6 +26,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { z } from "zod";
 
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { DaemonClient, type DaemonTransport } from "@getpaseo/client/internal/daemon-client";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
@@ -3197,6 +3198,286 @@ test("fetch_agent_history_request filters across history and paginates chronolog
   expect(second.payload.entries.map((entry) => entry.agent.id)).toEqual(["strong"]);
   expect(second.payload.pageInfo.hasMore).toBe(false);
 });
+
+test("history pages bound relay bytes without losing matching tied rows", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  const cwd = path.resolve("/tmp/history-relay-budget");
+  const project = createPersistedProjectRecord({
+    projectId: "proj-relay-budget",
+    rootPath: cwd,
+    kind: "non_git",
+    displayName: "history",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-relay-budget",
+    projectId: project.projectId,
+    cwd,
+    kind: "directory",
+    displayName: "history",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.projectRegistry.get = async () => project;
+  session.workspaceRegistry.listAll = session.workspaceRegistry.listActive = async () => [
+    workspace,
+  ];
+  session.workspaceRegistry.get = async () => workspace;
+  const agents = Array.from({ length: 64 }, (_, index) => ({
+    ...makeAgent({
+      id: `row-${String(index).padStart(2, "0")}`,
+      cwd,
+      workspaceId: workspace.workspaceId,
+      status: "idle",
+      updatedAt: "2026-03-01T12:00:00.000Z",
+      labels: { group: index % 2 ? "other" : "chosen" },
+    }),
+    title: index % 4 === 0 ? "target session" : "other session",
+    persistence: {
+      provider: "codex",
+      sessionId: `session-${index}`,
+      metadata: { data: "x".repeat(7500) },
+    },
+  }));
+  session.listAgentPayloads = async () => agents;
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  let pages = 0;
+  do {
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: `req-${pages}`,
+      search: "target",
+      filter: { labels: { group: "chosen" } },
+      page: { limit: 200, ...(cursor ? { cursor } : {}) },
+    });
+    const response = filterByType(emitted, "fetch_agent_history_response").at(-1)!;
+    const plaintext = Buffer.byteLength(JSON.stringify({ type: "session", message: response }));
+    const conservativeRelayBytes = 4 * Math.ceil((plaintext + 500) / 3);
+    expect(conservativeRelayBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(response.payload.entries.length).toBeGreaterThan(0);
+    seen.push(...response.payload.entries.map((entry) => entry.agent.id));
+    cursor = response.payload.pageInfo.nextCursor ?? undefined;
+    expect(response.payload.pageInfo.hasMore).toBe(Boolean(cursor));
+    pages++;
+    expect(pages).toBeLessThan(10);
+  } while (cursor);
+  expect(pages).toBeGreaterThan(1);
+  expect(seen).toEqual(
+    agents.filter((agent) => agent.title === "target session").map((agent) => agent.id),
+  );
+
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "unfiltered-first",
+    page: { limit: 200 },
+  });
+  const unfilteredFirst = filterByType(emitted, "fetch_agent_history_response").at(-1)!;
+  expect(unfilteredFirst.payload.entries.map((entry) => entry.agent.id)).toEqual(
+    agents.slice(0, unfilteredFirst.payload.entries.length).map((agent) => agent.id),
+  );
+  expect(unfilteredFirst.payload.pageInfo.hasMore).toBe(true);
+  expect(unfilteredFirst.payload.pageInfo.nextCursor).toBeTruthy();
+  await expectHistoryOverThrottledLink(unfilteredFirst, agents);
+
+  // A single item larger than the page budget must remain reachable and advance the cursor.
+  const huge = {
+    ...agents[0],
+    id: "row-huge",
+    updatedAt: "2026-03-02T12:00:00.000Z",
+    persistence: { provider: "codex", sessionId: "huge", metadata: { data: "x".repeat(70000) } },
+  };
+  session.listAgentPayloads = async () => [huge, agents[1]];
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "oversize",
+    page: { limit: 200 },
+  });
+  const oversized = filterByType(emitted, "fetch_agent_history_response").at(-1)!;
+  expect(oversized.payload.entries.map((entry) => entry.agent.id)).toEqual(["row-huge"]);
+  expect(oversized.payload.pageInfo.hasMore).toBe(true);
+  await session.handleMessage({
+    type: "fetch_agent_history_request",
+    requestId: "oversize-next",
+    page: { limit: 200, cursor: oversized.payload.pageInfo.nextCursor! },
+  });
+  const afterOversized = filterByType(emitted, "fetch_agent_history_response").at(-1)!;
+  expect(afterOversized.payload.entries.map((entry) => entry.agent.id)).toEqual([agents[1].id]);
+  expect(afterOversized.payload.pageInfo.hasMore).toBe(false);
+});
+
+async function expectHistoryOverThrottledLink(
+  first: Extract<SessionOutboundMessage, { type: "fetch_agent_history_response" }>,
+  agents: AgentSnapshotPayload[],
+): Promise<void> {
+  vi.useFakeTimers({
+    toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance"],
+  });
+  try {
+    for (const unbounded of [true, false]) {
+      let onOpen = () => {};
+      let onMessage: (data: string, binary: boolean) => void = () => {};
+      let onClose: (event?: unknown) => void = () => {};
+      let closed = false;
+      let closeReason = "";
+      let wireAvailableAt = performance.now();
+      let historyCompletedAt = 0;
+      const project = first.payload.entries[0].project;
+      const queue = (message: object) => {
+        const frame = JSON.stringify(message);
+        // Whole encrypted relay frames share a 10 KB/s downstream link; pongs queue behind data.
+        const wireBytes = 4 * Math.ceil((Buffer.byteLength(frame) + 500) / 3);
+        const now = performance.now();
+        wireAvailableAt = Math.max(now, wireAvailableAt) + (wireBytes / 10000) * 1000;
+        setTimeout(() => {
+          if (!closed) onMessage(frame, false);
+        }, wireAvailableAt - now);
+      };
+      const transport: DaemonTransport = {
+        send: (data) => {
+          if (typeof data !== "string") return;
+          const frame = JSON.parse(data);
+          if (frame.type === "ping") {
+            queue({ type: "pong" });
+            return;
+          }
+          if (frame.type !== "session") return;
+          const request = frame.message;
+          let response: object | undefined;
+          if (request.type === "fetch_agent_history_request") {
+            const entries = unbounded
+              ? agents.map((agent) => ({ agent, project }))
+              : first.payload.entries;
+            response = {
+              type: "fetch_agent_history_response",
+              payload: {
+                ...first.payload,
+                requestId: request.requestId,
+                entries,
+                ...(unbounded
+                  ? { pageInfo: { nextCursor: null, prevCursor: null, hasMore: false } }
+                  : {}),
+              },
+            };
+          } else if (request.type === "fetch_agents_request") {
+            response = {
+              type: "fetch_agents_response",
+              payload: {
+                requestId: request.requestId,
+                entries: [],
+                pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+              },
+            };
+          } else if (request.type === "fetch_agent_timeline_request") {
+            response = {
+              type: "fetch_agent_timeline_response",
+              payload: {
+                requestId: request.requestId,
+                agentId: request.agentId,
+                agent: null,
+                direction: "tail",
+                projection: "projected",
+                epoch: "epoch",
+                reset: false,
+                staleCursor: false,
+                gap: false,
+                window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
+                startCursor: null,
+                endCursor: null,
+                hasOlder: false,
+                hasNewer: false,
+                entries: [],
+                error: null,
+              },
+            };
+          }
+          if (response) queue({ type: "session", message: response });
+        },
+        close: (code, reason) => {
+          closed = true;
+          closeReason = reason ?? "";
+          onClose({ code, reason });
+        },
+        onMessage: (handler) => {
+          onMessage = handler;
+          return () => {};
+        },
+        onOpen: (handler) => {
+          onOpen = handler;
+          return () => {};
+        },
+        onClose: (handler) => {
+          onClose = handler;
+          return () => {};
+        },
+        onError: () => () => {},
+      };
+      const client = new DaemonClient({
+        url: "ws://test",
+        clientId: "throttled-history",
+        clientType: "mobile",
+        appVersion: "0.16.1",
+        providerSnapshots: "wire",
+        capabilities: {},
+        transportFactory: () => transport,
+        reconnect: { enabled: false },
+      });
+      const connected = client.connect();
+      onOpen();
+      onMessage(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "status",
+            payload: {
+              status: "server_info",
+              serverId: "test-server",
+              hostname: null,
+              version: null,
+              features: { binaryChunkingV1: true, ownedSubscriptions: true },
+            },
+          },
+        }),
+        false,
+      );
+      await connected;
+      const startedAt = performance.now();
+      const requests = Promise.allSettled([
+        client.fetchAgentHistory({ page: { limit: 200 } }).then((page) => {
+          historyCompletedAt = performance.now() - startedAt;
+          return page;
+        }),
+        client.fetchAgents({ page: { limit: 20 } }),
+        client.fetchAgentTimeline("row-00", { direction: "tail", limit: 20 }),
+      ]);
+      await vi.advanceTimersByTimeAsync(70000);
+      const results = await requests;
+      if (unbounded) {
+        expect(closed).toBe(true);
+        expect(closeReason).toBe("Liveness check timed out");
+        expect(results[0].status).toBe("rejected");
+      } else {
+        expect(results.map((result) => result.status)).toEqual([
+          "fulfilled",
+          "fulfilled",
+          "fulfilled",
+        ]);
+        expect(historyCompletedAt).toBeGreaterThan(0);
+        expect(historyCompletedAt).toBeLessThan(10000);
+        expect(closed).toBe(false);
+      }
+      await client.close();
+      vi.clearAllTimers();
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+}
 
 test("fetch_agent_history_request rejects a malformed search cursor", async () => {
   const emitted: SessionOutboundMessage[] = [];
