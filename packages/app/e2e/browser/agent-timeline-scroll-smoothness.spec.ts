@@ -5,7 +5,7 @@ import {
   expectImageSpaceReserved,
   type ScrollFrame,
   observeTimelinePages,
-  openOnlyTimelineTail,
+  openTimelineForTraversal,
   recordUpwardTraversal,
   reportScrollJumps,
   scrollCadences,
@@ -194,9 +194,9 @@ for (const cadence of scrollCadences) {
     test.setTimeout(180_000);
     await withVariedTimeline(async (agent, newestPrompt) => {
       const pages = observeTimelinePages(page, agent.agentId);
-      await openOnlyTimelineTail(page, agent, newestPrompt, pages);
+      const initialOlderPages = await openTimelineForTraversal(page, agent, newestPrompt, pages);
       const frames = await recordUpwardTraversal(page, cadence, testInfo);
-      await reportScrollJumps(page, testInfo, frames, pages);
+      await reportScrollJumps(page, testInfo, frames, pages, initialOlderPages);
     });
   });
 }

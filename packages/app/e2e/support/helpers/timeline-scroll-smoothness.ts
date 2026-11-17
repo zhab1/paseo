@@ -4,6 +4,7 @@ import { expect, type Page, type TestInfo } from "@playwright/test";
 import { seedMockAgentWorkspace, openAgentRoute, type MockAgentWorkspace } from "./mock-agent";
 import { openAgentTimeline, expectTimelinePromptVisible } from "./timeline-pagination";
 import { holdAssistantStream } from "./agent-timeline-gate";
+import { readScrollMetrics } from "./agent-bottom-anchor";
 
 export const scrollCadences = [
   { name: "slow", delta: 160, intervalMs: 50, steps: 1000 },
@@ -247,12 +248,12 @@ export function observeTimelinePages(page: Page, agentId: string): TimelinePage[
   return pages;
 }
 
-export async function openOnlyTimelineTail(
+export async function openTimelineForTraversal(
   page: Page,
   agent: MockAgentWorkspace,
   newestPrompt: string,
   pages: TimelinePage[],
-): Promise<void> {
+): Promise<number> {
   await page.addInitScript(() => Reflect.set(globalThis, "__PASEO_RENDER_PROFILE_ENABLED__", true));
   await openAgentTimeline(page, agent);
   await expectTimelinePromptVisible(page, newestPrompt.trim());
@@ -267,10 +268,34 @@ export async function openOnlyTimelineTail(
   expect(
     pages.filter((entry) => entry.direction === "after").every((entry) => entry.count === 0),
   ).toBe(true);
-  await expect(page.getByText(/^Review turn 0\./)).toHaveCount(0);
-  // Start each cadence after the tail's initial image loads and bottom anchoring.
+  await expect(page.getByTestId("agent-initial-fill")).toBeHidden();
+  await expect(page.getByTestId("agent-chat-scroll")).toHaveCSS("opacity", "1");
+  await expect
+    .poll(() =>
+      page.getByTestId("agent-chat-scroll").evaluate((viewport) => {
+        const images = [...viewport.querySelectorAll("img")];
+        return (
+          images.length > 0 && images.every((image) => image.complete && image.naturalWidth > 0)
+        );
+      }),
+    )
+    .toBe(true);
+  await expect
+    .poll(async () => {
+      const metrics = await readScrollMetrics(page);
+      return {
+        hasOverflow: metrics.contentHeight > metrics.viewportHeight,
+        atBottom: metrics.distanceFromBottom <= 2,
+      };
+    })
+    .toEqual({ hasOverflow: true, atBottom: true });
+  // Byte-limited pages may need older responses to fill the initial viewport.
+  // Start each cadence only after that fill and its image loads have settled.
+  const initialOlderPages = pages.filter((entry) => entry.direction === "before").length;
   await page.waitForTimeout(1500);
-  expect(pages.filter((entry) => entry.direction === "before")).toHaveLength(0);
+  expect(pages.filter((entry) => entry.direction === "before")).toHaveLength(initialOlderPages);
+  await expect(page.getByText(/^Review turn 0\./)).toHaveCount(0);
+  return initialOlderPages;
 }
 
 export async function recordUpwardTraversal(
@@ -486,6 +511,7 @@ export async function reportScrollJumps(
   testInfo: TestInfo,
   frames: ScrollFrame[],
   pages: TimelinePage[],
+  initialOlderPages: number,
 ): Promise<void> {
   const jumps = findScrollJumps(frames);
   const react = await page.evaluate(() => Reflect.get(window, "__PASEO_RENDER_PROFILE__") ?? []);
@@ -497,6 +523,7 @@ export async function reportScrollJumps(
     browserTimeOrigin: await page.evaluate(() => performance.timeOrigin),
     frames: frames.length,
     pages,
+    initialOlderPages,
     jumpCount: jumps.length,
     worstReversePx: Math.max(0, ...jumps.map((jump) => -jump.movement)),
     frameGapP95Ms: gaps[Math.floor(gaps.length * 0.95)],
@@ -526,8 +553,8 @@ export async function reportScrollJumps(
     `[scroll] ${testInfo.title}: ${JSON.stringify({ ...summary, jumps: jumps.slice(0, 5) })}`,
   );
   expect(
-    pages.filter((entry) => entry.direction === "before").length,
-    "must exercise multiple older pages",
+    pages.filter((entry) => entry.direction === "before").length - initialOlderPages,
+    "must exercise multiple additional older pages during traversal",
   ).toBeGreaterThanOrEqual(2);
   expect(
     frames.some((frame) => frame.virtualized),
