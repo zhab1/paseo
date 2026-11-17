@@ -167,6 +167,12 @@ test("explicit unarchive after branchless workspace restore leaves sibling archi
   expect(existsSync(cwd)).toBe(false);
   const archived = (await client.fetchAgent({ agentId: sibling.id }))!.agent.archivedAt;
   expect(archived).toEqual(expect.any(String));
+  await client.fetchAgents({ scope: "active", includeBackground: true, subscribe: {} });
+  const timeline = client.observeTimeline([selected.id]);
+  await timeline.ready;
+  await client.fetchWorkspaces({ subscribe: {} });
+  const updates: DaemonEvent[] = [];
+  client.subscribe((event) => updates.push(event));
   await client.restoreWorkspace(workspace.id);
   expect(existsSync(cwd)).toBe(true);
   expect((await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt).toEqual(
@@ -174,7 +180,26 @@ test("explicit unarchive after branchless workspace restore leaves sibling archi
   );
   await client.refreshAgent(selected.id);
   expect((await client.fetchAgent({ agentId: selected.id }))?.agent.archivedAt).toBeNull();
+  const selectedUpdates = updates.filter(
+    (event) =>
+      event.type === "agent_update" &&
+      event.payload.kind === "upsert" &&
+      event.payload.agent.id === selected.id,
+  );
+  expect(selectedUpdates.length).toBeGreaterThan(0);
+  expect(selectedUpdates.at(-1)).toMatchObject({
+    payload: {
+      agent: {
+        id: selected.id,
+        status: expect.any(String),
+        cwd,
+        workspaceId: workspace.id,
+        archivedAt: null,
+      },
+    },
+  });
   expect((await client.fetchAgent({ agentId: sibling.id }))?.agent.archivedAt).toBe(archived);
+  await timeline.release();
 }, 60000);
 
 test("workspace.create worktree source forwards action=checkout + refName into the real worktree", async () => {
