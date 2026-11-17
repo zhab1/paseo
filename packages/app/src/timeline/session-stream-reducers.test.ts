@@ -3306,10 +3306,11 @@ describe("processTimelineResponse", () => {
     expect(result.cursor).toBe(existingCursor);
   });
 
-  it("merges assistant chunks across the older-page prepend boundary", () => {
+  it("merges assistant chunks from a split turn across the older-page prepend boundary", () => {
     const currentTail = [
       {
         ...makeAssistantItem("newer chunk", "assistant-newer"),
+        turnId: "oversized-turn",
         timelineCursor: { epoch: "epoch-1", seq: 3 },
       },
     ];
@@ -3329,7 +3330,7 @@ describe("processTimelineResponse", () => {
         epoch: "epoch-1",
         startCursor: { seq: 1 },
         endCursor: { seq: 2 },
-        entries: [makeTimelineEntry(1, "older chunk ")],
+        entries: [{ ...makeTimelineEntry(1, "older chunk "), turnId: "oversized-turn" }],
       },
     });
 
@@ -3337,6 +3338,7 @@ describe("processTimelineResponse", () => {
     expect(result.tail[0]).toEqual(
       expect.objectContaining({
         id: "assistant-newer",
+        turnId: "oversized-turn",
         timelineCursor: { epoch: "epoch-1", seq: 3 },
       }),
     );

@@ -363,6 +363,8 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
 // Keep complete History responses small enough for slow encrypted relay links.
 // The allowance leaves room for encryption and base64 expansion under 64 KiB.
 const MAX_HISTORY_RESPONSE_BYTES = 47 * 1024;
+// Leave space for relay encryption/base64 around an ordinary 64 KiB frame.
+const MAX_TIMELINE_RESPONSE_BYTES = 47 * 1024;
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
@@ -8600,36 +8602,36 @@ export class Session {
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
 
-      const fetchedControlTimeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
+      let timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction,
         cursor,
         limit: msg.limit,
         wholeTurns: msg.wholeTurns,
       });
-      const selectedTimeline = {
-        timeline: fetchedControlTimeline,
-        entries: fetchedControlTimeline.rows,
-        startSeq: fetchedControlTimeline.startSeq,
-        endSeq: fetchedControlTimeline.endSeq,
-        hasOlder: fetchedControlTimeline.hasOlder,
-        hasNewer: fetchedControlTimeline.hasNewer,
-      };
-      const startCursor =
-        selectedTimeline.startSeq !== null
-          ? { epoch: selectedTimeline.timeline.epoch, seq: selectedTimeline.startSeq }
-          : null;
-      const endCursor =
-        selectedTimeline.endSeq !== null
-          ? { epoch: selectedTimeline.timeline.epoch, seq: selectedTimeline.endSeq }
-          : null;
-      const entries = selectedTimeline.entries.filter((entry) =>
-        this.supportsTimelineItem(entry.item, source),
-      );
-      const seenMessageIds = new Set(fetchedControlTimeline.priorAssistantMessageIds);
+      const buildResponse = (fetchedControlTimeline: AgentTimelineFetchResult) => {
+        const selectedTimeline = {
+          timeline: fetchedControlTimeline,
+          entries: fetchedControlTimeline.rows,
+          startSeq: fetchedControlTimeline.startSeq,
+          endSeq: fetchedControlTimeline.endSeq,
+          hasOlder: fetchedControlTimeline.hasOlder,
+          hasNewer: fetchedControlTimeline.hasNewer,
+        };
+        const startCursor =
+          selectedTimeline.startSeq !== null
+            ? { epoch: selectedTimeline.timeline.epoch, seq: selectedTimeline.startSeq }
+            : null;
+        const endCursor =
+          selectedTimeline.endSeq !== null
+            ? { epoch: selectedTimeline.timeline.epoch, seq: selectedTimeline.endSeq }
+            : null;
+        const entries = selectedTimeline.entries.filter((entry) =>
+          this.supportsTimelineItem(entry.item, source),
+        );
+        const seenMessageIds = new Set(fetchedControlTimeline.priorAssistantMessageIds);
 
-      this.emitForSource(
-        {
-          type: "fetch_agent_timeline_response",
+        return {
+          type: "fetch_agent_timeline_response" as const,
           payload: {
             requestId: msg.requestId,
             agentId: msg.agentId,
@@ -8668,9 +8670,27 @@ export class Session {
             }),
             error: null,
           },
-        },
-        source,
-      );
+        };
+      };
+      let response = buildResponse(timeline);
+      // Reselect through the store so source coverage, overlap resets, and cursors
+      // describe the delivered rows. Whole turns are a preference; one intact
+      // entry (or a large agent envelope) may exceed the budget to make progress.
+      while (
+        msg.limit !== 0 &&
+        timeline.rows.length > 1 &&
+        Buffer.byteLength(JSON.stringify({ type: "session", message: response })) >
+          MAX_TIMELINE_RESPONSE_BYTES
+      ) {
+        timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
+          direction,
+          cursor,
+          limit: Math.max(1, Math.floor(timeline.rows.length / 2)),
+          wholeTurns: false,
+        });
+        response = buildResponse(timeline);
+      }
+      this.emitForSource(response, source);
     } catch (error) {
       this.sessionLogger.error(
         { err: error, agentId: msg.agentId },

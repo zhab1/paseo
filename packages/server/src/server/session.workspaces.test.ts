@@ -1,4 +1,7 @@
 import { AgentDirectory } from "./agent/directory.js";
+import { InMemoryAgentTimelineStore } from "./agent/agent-timeline-store.js";
+import { TimelineCache } from "./agent/timeline-cache.js";
+import type { AgentTimelineFetchOptions } from "./agent/agent-timeline-store-types.js";
 import { buildStoredAgentPayload } from "./agent/agent-projections.js";
 import {
   createWorkspaceRuntimeStore,
@@ -120,6 +123,7 @@ afterEach(async () => {
 });
 
 interface SessionTestAccess {
+  cleanup(): Promise<void>;
   projectRegistry: {
     list(...args: unknown[]): Promise<unknown[]>;
     archive(projectId: string, archivedAt: string): Promise<void>;
@@ -569,6 +573,7 @@ class CreateAgentTestClient implements AgentClient {
 
 function createSessionForWorkspaceTests(
   options: {
+    clientType?: SessionOptions["clientType"];
     appVersion?: string | null;
     onMessage?: (message: SessionOutboundMessage) => void;
     onWorkspaceRecovered?: SessionOptions["onWorkspaceRecovered"];
@@ -661,6 +666,7 @@ function createSessionForWorkspaceTests(
       agentMessages: createAgentMessageDeliveryStub(),
       creationService: createTestCreationService(),
       clientId: "test-client",
+      clientType: options.clientType,
       permissions: OWNER_PERMISSIONS,
       appVersion: options.appVersion ?? null,
       onMessage: options.onMessage ?? vi.fn(),
@@ -3198,6 +3204,554 @@ test("fetch_agent_history_request filters across history and paginates chronolog
   expect(second.payload.entries.map((entry) => entry.agent.id)).toEqual(["strong"]);
   expect(second.payload.pageInfo.hasMore).toBe(false);
 });
+
+function createTimelineBudgetFixture(backend: "memory" | "disk", modern = false) {
+  const directory = path.join(process.cwd(), ".dev", `timeline-budget-${crypto.randomUUID()}`);
+  const cache =
+    backend === "disk" ? new TimelineCache(path.join(directory, "timeline.sqlite")) : undefined;
+  const store = new InMemoryAgentTimelineStore(cache);
+  const agent = {
+    ...makeManagedAgent({
+      id: "timeline-budget",
+      cwd: REPO_CWD,
+      lifecycle: "idle",
+      updatedAt: "2026-03-01T12:00:00.000Z",
+    }),
+    persistence: null as AgentPersistenceHandle | null,
+  };
+  const emitted: SessionOutboundMessage[] = [];
+  store.initialize(agent.id, { epoch: "budget-epoch" });
+  const session = createSessionForWorkspaceTests({
+    clientType: "mobile",
+    agentManager: {
+      waitForAgentClose: async () => {},
+      getAgent: () => agent,
+      fetchTimelinePage: async (id: string, options: AgentTimelineFetchOptions) =>
+        store.fetchPage(id, options, { hasOlder: () => false, loadOlder: async () => [] }),
+    },
+    onMessage: (message) => emitted.push(message),
+  });
+  const source = modern ? {} : undefined;
+  if (source) session.updateClientCapabilities({ [CLIENT_CAPS.ownedSubscriptions]: true }, source);
+  return {
+    store,
+    agent,
+    session,
+    emitted,
+    source,
+    async fetch(options: AgentTimelineFetchOptions = {}) {
+      await session.handleMessage(
+        {
+          type: "fetch_agent_timeline_request",
+          agentId: agent.id,
+          requestId: "timeline-budget-request",
+          ...options,
+        },
+        source,
+      );
+      const response = filterByType(emitted, "fetch_agent_timeline_response").at(-1)!;
+      expect(response.payload.error).toBeNull();
+      return response;
+    },
+    async close() {
+      await session.cleanup();
+      cache?.close();
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test.each(["memory", "disk"] as const)(
+  "timeline byte budget preserves whole turns and complete backward/forward access (%s)",
+  async (backend) => {
+    const fixture = createTimelineBudgetFixture(backend);
+    const { store, agent } = fixture;
+    try {
+      const append = (index: number, text: string, turnId: string) =>
+        store.append(
+          agent.id,
+          {
+            type: "assistant_message",
+            messageId: `message-${index}`,
+            text,
+          },
+          { turnId, timestamp: "2026-03-01T12:00:00.000Z" },
+        );
+      append(0, "prompt response", "normal");
+      append(1, "second response", "normal");
+      const normal = await fixture.fetch({ direction: "tail", limit: 1, wholeTurns: true });
+      expect(normal.payload.entries).toHaveLength(2);
+      expect(normal.payload.hasOlder).toBe(false);
+      for (let index = 2; index < 121; index++) append(index, "界\\\n".repeat(1800), "large");
+      const expected = store.getRows(agent.id);
+      const complete = await fixture.fetch({ direction: "tail", limit: 0, wholeTurns: true });
+      expect(complete.payload.entries.map((row) => row.seqStart)).toEqual(
+        expected.map((row) => row.seqStart),
+      );
+      expect(complete.payload).toMatchObject({ hasOlder: false, hasNewer: false });
+      const defaultPage = await fixture.fetch({ direction: "tail" });
+      expect(
+        Buffer.byteLength(JSON.stringify({ type: "session", message: defaultPage })),
+      ).toBeLessThanOrEqual(47 * 1024);
+      let page = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
+      expect(
+        Buffer.byteLength(JSON.stringify({ type: "session", message: page })),
+      ).toBeLessThanOrEqual(47 * 1024);
+      expect(page.payload.hasOlder).toBe(true);
+      expect(page.payload.endCursor?.seq).toBe(121);
+      const backwards = [...page.payload.entries];
+      for (let count = 0; page.payload.hasOlder; count++) {
+        expect(count).toBeLessThan(121);
+        const before = page.payload.startCursor!;
+        page = await fixture.fetch({
+          direction: "before",
+          cursor: before,
+          limit: 40,
+          wholeTurns: true,
+        });
+        expect(
+          Buffer.byteLength(JSON.stringify({ type: "session", message: page })),
+        ).toBeLessThanOrEqual(47 * 1024);
+        expect(page.payload.startCursor!.seq).toBeLessThan(before.seq);
+        expect(page.payload.endCursor!.seq).toBe(before.seq - 1);
+        backwards.unshift(...page.payload.entries);
+      }
+      expect(
+        backwards.map((row) => [row.seqStart, row.seqEnd, row.sourceSeqRanges, row.turnId]),
+      ).toEqual(expected.map((row) => [row.seqStart, row.seqEnd, row.sourceSeqRanges, row.turnId]));
+      expect(
+        backwards.map((row) => {
+          const original = expected[row.seqStart - 1].item;
+          return (
+            row.item.type === "assistant_message" &&
+            original.type === "assistant_message" &&
+            row.item.text.endsWith(original.text)
+          );
+        }),
+      ).toEqual(Array(121).fill(true));
+      let cursor = { epoch: "budget-epoch", seq: 0 };
+      const forwards: number[] = [];
+      for (let count = 0; count < 121; count++) {
+        const next = await fixture.fetch({
+          direction: "after",
+          cursor,
+          limit: 40,
+          wholeTurns: true,
+        });
+        expect(
+          Buffer.byteLength(JSON.stringify({ type: "session", message: next })),
+        ).toBeLessThanOrEqual(47 * 1024);
+        expect(next.payload.endCursor!.seq).toBeGreaterThan(cursor.seq);
+        forwards.push(...next.payload.entries.map((row) => row.seqStart));
+        cursor = next.payload.endCursor!;
+        if (!next.payload.hasNewer) break;
+      }
+      expect(forwards).toEqual(expected.map((row) => row.seqStart));
+      expect(cursor.seq).toBe(121);
+      const jump = await fixture.fetch({
+        direction: "before",
+        cursor: { epoch: cursor.epoch, seq: 52 },
+        limit: 40,
+        wholeTurns: true,
+      });
+      expect(jump.payload.entries.at(-1)?.seqStart).toBe(51);
+      expect(jump.payload.hasNewer).toBe(true);
+      const reset = await fixture.fetch({
+        direction: "after",
+        cursor: { epoch: "old", seq: 10 },
+        limit: 40,
+        wholeTurns: true,
+      });
+      expect(reset.payload).toMatchObject({
+        reset: true,
+        staleCursor: true,
+        hasOlder: true,
+        hasNewer: false,
+        endCursor: cursor,
+      });
+      store.initialize(agent.id, { epoch: "prompt-epoch" });
+      store.append(
+        agent.id,
+        { type: "user_message", text: "jump target" },
+        { turnId: "prompt-turn" },
+      );
+      for (let index = 0; index < 8; index++)
+        store.append(
+          agent.id,
+          {
+            type: "tool_call",
+            callId: `prompt-tool-${index}`,
+            name: "shell",
+            status: "completed",
+            error: null,
+            detail: { type: "unknown", input: null, output: "x".repeat(10000) },
+          },
+          { turnId: "prompt-turn" },
+        );
+      const prompt = await fixture.fetch({
+        direction: "before",
+        cursor: { epoch: "prompt-epoch", seq: 2 },
+        limit: 40,
+        wholeTurns: true,
+      });
+      expect(prompt.payload.entries.map((row) => row.item)).toEqual([
+        { type: "user_message", text: "jump target" },
+      ]);
+      expect(prompt.payload).toMatchObject({ hasNewer: true, endCursor: { seq: 1 } });
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test.each(["memory", "disk"] as const)(
+  "timeline byte budget retains overlapping tool coverage (%s)",
+  async (backend) => {
+    const fixture = createTimelineBudgetFixture(backend);
+    const { store, agent } = fixture;
+    try {
+      const tool = {
+        type: "tool_call" as const,
+        callId: "overlap",
+        name: "shell",
+        status: "running" as const,
+        error: null,
+        detail: { type: "unknown" as const, input: null, output: "x".repeat(20000) },
+      };
+      store.append(agent.id, tool, { turnId: "overlap-turn" });
+      store.append(
+        agent.id,
+        { type: "assistant_message", messageId: "overlap-text", text: "x".repeat(30000) },
+        { turnId: "overlap-turn" },
+      );
+      store.append(
+        agent.id,
+        { type: "reasoning", text: "x".repeat(30000) },
+        { turnId: "overlap-turn" },
+      );
+      store.append(agent.id, { ...tool, status: "completed" }, { turnId: "overlap-turn" });
+      const tail = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
+      expect(tail.payload).toMatchObject({
+        reset: true,
+        hasOlder: true,
+        hasNewer: false,
+        startCursor: { seq: 3 },
+        endCursor: { seq: 4 },
+      });
+      let cursor = { epoch: "budget-epoch", seq: 0 };
+      const seen = new Map<number, unknown>();
+      const positions: number[] = [];
+      for (let count = 0; count < 4; count++) {
+        const page = await fixture.fetch({
+          direction: "after",
+          cursor,
+          limit: 40,
+          wholeTurns: true,
+        });
+        expect(page.payload.endCursor!.seq).toBeGreaterThan(cursor.seq);
+        for (const entry of page.payload.entries) seen.set(entry.seqStart!, entry.sourceSeqRanges);
+        cursor = page.payload.endCursor!;
+        positions.push(cursor.seq);
+        if (!page.payload.hasNewer) break;
+      }
+      expect(positions).toEqual([1, 2, 3, 4]);
+      expect([...seen]).toEqual([
+        [
+          1,
+          [
+            { startSeq: 1, endSeq: 1 },
+            { startSeq: 4, endSeq: 4 },
+          ],
+        ],
+        [2, [{ startSeq: 2, endSeq: 2 }]],
+        [3, [{ startSeq: 3, endSeq: 3 }]],
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test("timeline byte budget keeps an oversized entry and envelope reachable", async () => {
+  const fixture = createTimelineBudgetFixture("disk");
+  try {
+    fixture.agent.persistence = {
+      provider: "codex",
+      sessionId: "budget-session",
+      metadata: { data: "x".repeat(8000) },
+    };
+    for (let index = 0; index < 3; index++)
+      fixture.store.append(
+        fixture.agent.id,
+        {
+          type: "assistant_message",
+          messageId: `wide-${index}`,
+          text: "界".repeat(18000),
+        },
+        { turnId: "wide" },
+      );
+    let page = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
+    expect(page.payload.entries.map((row) => row.seqStart)).toEqual([3]);
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeGreaterThan(47 * 1024);
+    expect(page.payload.entries[0].item).toMatchObject({
+      text: expect.stringContaining("界".repeat(18000)),
+    });
+    expect(page.payload.agent?.persistence).toEqual(fixture.agent.persistence);
+    const seen = [3];
+    while (page.payload.hasOlder) {
+      page = await fixture.fetch({
+        direction: "before",
+        cursor: page.payload.startCursor!,
+        limit: 40,
+        wholeTurns: true,
+      });
+      expect(page.payload.entries).toHaveLength(1);
+      seen.unshift(page.payload.entries[0].seqStart!);
+    }
+    expect(seen).toEqual([1, 2, 3]);
+    fixture.store.initialize(fixture.agent.id, { epoch: "large-envelope" });
+    fixture.agent.persistence = {
+      provider: "codex",
+      sessionId: "budget-session",
+      metadata: { data: "x".repeat(70000) },
+    };
+    for (let index = 0; index < 2; index++)
+      fixture.store.append(fixture.agent.id, {
+        type: "assistant_message",
+        messageId: `small-${index}`,
+        text: "small",
+      });
+    const envelope = await fixture.fetch({ direction: "tail", limit: 40 });
+    expect(envelope.payload.entries.map((row) => row.seqStart)).toEqual([2]);
+    expect(envelope.payload.agent?.persistence).toEqual(fixture.agent.persistence);
+    expect(envelope.payload.hasOlder).toBe(true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("timeline byte budget leaves History and heartbeat responsive during slow-link startup", async () => {
+  const fixture = createTimelineBudgetFixture("disk", true);
+  try {
+    for (let index = 0; index < 119; index++)
+      fixture.store.append(
+        fixture.agent.id,
+        {
+          type: "tool_call",
+          callId: `startup-${index}`,
+          name: "shell",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: null, output: "x".repeat(8500) },
+        },
+        { turnId: "startup-turn" },
+      );
+    const agents = Array.from({ length: 8 }, (_, index) => ({
+      ...makeAgent({
+        id: `startup-agent-${index}`,
+        cwd: REPO_CWD,
+        workspaceId: "ws-repo-running",
+        status: "idle",
+        updatedAt: "2026-03-01T12:00:00.000Z",
+      }),
+      persistence: {
+        provider: "codex",
+        sessionId: `startup-session-${index}`,
+        metadata: { data: "x".repeat(7000) },
+      },
+    }));
+    fixture.session.listAgentPayloads = async () => agents;
+    const project = createPersistedProjectRecord({
+      projectId: "proj-repo-running",
+      rootPath: REPO_CWD,
+      kind: "non_git",
+      displayName: "startup",
+      createdAt: "2026-03-01T12:00:00.000Z",
+      updatedAt: "2026-03-01T12:00:00.000Z",
+    });
+    fixture.session.projectRegistry.get = async () => project;
+    fixture.session.projectRegistry.list = async () => [project];
+    await fixture.session.handleMessage(
+      {
+        type: "fetch_agents_request",
+        requestId: "directory",
+        scope: "active",
+        page: { limit: 200 },
+        subscribe: {},
+        sync: {},
+      },
+      fixture.source,
+    );
+    await fixture.session.handleMessage(
+      {
+        type: "fetch_workspaces_request",
+        requestId: "workspaces",
+        page: { limit: 200 },
+        subscribe: {},
+        sync: {},
+      },
+      fixture.source,
+    );
+    const timeline = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
+    await fixture.session.handleMessage(
+      { type: "fetch_agent_history_request", requestId: "history", page: { limit: 200 } },
+      fixture.source,
+    );
+    const responses = [
+      findByType(fixture.emitted, "fetch_agents_response")!,
+      findByType(fixture.emitted, "fetch_workspaces_response")!,
+      timeline,
+      findByType(fixture.emitted, "fetch_agent_history_response")!,
+    ];
+    expect(responses[0].payload.entries).toHaveLength(8);
+    expect(responses[3].payload.entries.length).toBeGreaterThan(0);
+    await expectTimelineStartupOverThrottledLink(responses);
+    let page = timeline;
+    const recovered = [...page.payload.entries];
+    for (let count = 0; page.payload.hasOlder; count++) {
+      expect(count).toBeLessThan(119);
+      page = await fixture.fetch({
+        direction: "before",
+        cursor: page.payload.startCursor!,
+        limit: 40,
+        wholeTurns: true,
+      });
+      recovered.unshift(...page.payload.entries);
+    }
+    expect(
+      recovered.map(({ item, turnId, sourceSeqRanges }) => ({ item, turnId, sourceSeqRanges })),
+    ).toEqual(
+      fixture.store
+        .getRows(fixture.agent.id)
+        .map(({ item, turnId, sourceSeqRanges }) => ({ item, turnId, sourceSeqRanges })),
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
+async function expectTimelineStartupOverThrottledLink(responses: SessionOutboundMessage[]) {
+  vi.useFakeTimers({
+    toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance"],
+  });
+  let client: DaemonClient | undefined;
+  try {
+    let onOpen = () => {};
+    let onMessage: (data: string, binary: boolean) => void = () => {};
+    let onClose: (event?: unknown) => void = () => {};
+    let closed = false;
+    let wireAvailableAt = performance.now();
+    let pongs = 0;
+    const completed: Record<string, number> = {};
+    const queue = (message: object, pong = false) => {
+      const frame = JSON.stringify(message);
+      const wireBytes = 4 * Math.ceil((Buffer.byteLength(frame) + 500) / 3);
+      const now = performance.now();
+      wireAvailableAt = Math.max(now, wireAvailableAt) + wireBytes / 10;
+      setTimeout(() => {
+        if (!closed) {
+          if (pong) pongs++;
+          onMessage(frame, false);
+        }
+      }, wireAvailableAt - now);
+    };
+    const transport: DaemonTransport = {
+      send(data) {
+        if (typeof data !== "string") throw new Error("Unexpected binary startup request");
+        const frame = JSON.parse(data);
+        if (frame.type === "ping") return queue({ type: "pong" }, true);
+        if (frame.type === "hello") return;
+        if (frame.type !== "session") throw new Error(`Unexpected frame ${frame.type}`);
+        const request = frame.message;
+        const response = responses.find(
+          (candidate) => candidate.type === request.type.replace(/_request$/, "_response"),
+        );
+        if (!response || !("payload" in response))
+          throw new Error(`Unexpected request ${request.type}`);
+        queue({
+          type: "session",
+          message: { ...response, payload: { ...response.payload, requestId: request.requestId } },
+        });
+      },
+      close(code, reason) {
+        closed = true;
+        onClose({ code, reason });
+      },
+      onMessage(handler) {
+        onMessage = handler;
+        return () => {};
+      },
+      onOpen(handler) {
+        onOpen = handler;
+        return () => {};
+      },
+      onClose(handler) {
+        onClose = handler;
+        return () => {};
+      },
+      onError: () => () => {},
+    };
+    client = new DaemonClient({
+      url: "ws://test",
+      clientId: "timeline-startup",
+      clientType: "mobile",
+      appVersion: "0.16.1",
+      providerSnapshots: "wire",
+      capabilities: {},
+      transportFactory: () => transport,
+      reconnect: { enabled: false },
+    });
+    const connected = client.connect();
+    onOpen();
+    onMessage(
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "status",
+          payload: {
+            status: "server_info",
+            serverId: "startup-host",
+            hostname: null,
+            version: null,
+            features: { binaryChunkingV1: true, ownedSubscriptions: true, wholeTurnTimeline: true },
+          },
+        },
+      }),
+      false,
+    );
+    await connected;
+    const startedAt = performance.now();
+    const directory = client.observeAgents({ scope: "active", page: { limit: 200 }, sync: {} });
+    const workspaces = client.observeWorkspaces({ page: { limit: 200 }, sync: {} });
+    const requests = Promise.allSettled([
+      directory.ready,
+      workspaces.ready,
+      client
+        .fetchAgentTimeline("timeline-budget", { direction: "tail", limit: 40, wholeTurns: true })
+        .then((page) => {
+          completed.timeline = performance.now() - startedAt;
+          return page;
+        }),
+      client.fetchAgentHistory({ page: { limit: 200 } }).then((page) => {
+        completed.history = performance.now() - startedAt;
+        return page;
+      }),
+    ]);
+    await vi.advanceTimersByTimeAsync(70000);
+    const results = await requests;
+    expect(results.map((result) => result.status)).toEqual(Array(4).fill("fulfilled"));
+    expect(completed.timeline).toBeGreaterThan(0);
+    expect(completed.timeline).toBeLessThan(60000);
+    expect(completed.history).toBeGreaterThan(0);
+    expect(completed.history).toBeLessThan(60000);
+    expect(pongs).toBeGreaterThanOrEqual(2);
+    expect(closed).toBe(false);
+  } finally {
+    await client?.close();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+}
 
 test("history pages bound relay bytes without losing matching tied rows", async () => {
   const emitted: SessionOutboundMessage[] = [];
