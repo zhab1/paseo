@@ -19,6 +19,7 @@ import {
   type AgentStreamReducerEvent,
   type TimelineCursor,
 } from "./session-stream-reducers";
+import { planTimelinePromptJump } from "./timeline-sync-plan";
 
 it("keeps streamed reasoning together while the initial history is loading", () => {
   let head: StreamItem[] = [];
@@ -2929,6 +2930,52 @@ describe("processTimelineResponse", () => {
     expect(result.sideEffects).not.toContainEqual(expect.objectContaining({ type: "catch_up" }));
   });
 
+  it("merges a byte-limited prompt window that ends at the jump target", () => {
+    const target = { epoch: "epoch-1", seq: 42 };
+    const request = planTimelinePromptJump(target);
+    const result = processTimelineResponse({
+      ...baseTimelineInput,
+      currentTail: [
+        {
+          kind: "user_message",
+          id: "newest",
+          text: "newest",
+          timestamp: new Date(1000),
+          timelineCursor: { epoch: target.epoch, seq: 100 },
+        },
+      ],
+      currentCursor: { epoch: target.epoch, startSeq: 80, endSeq: 100 },
+      payload: {
+        ...baseTimelineInput.payload,
+        direction: request.direction,
+        mergeWindow: request.mergeWindow,
+        epoch: request.cursor.epoch,
+        startCursor: { seq: target.seq },
+        endCursor: { seq: target.seq },
+        hasOlder: true,
+        hasNewer: true,
+        entries: [
+          {
+            ...makeTimelineEntry(target.seq, "jump target", "user_message"),
+            turnId: "oversized-turn",
+          },
+        ],
+      },
+    });
+    expect(getUserTexts(result.tail)).toEqual(["jump target", "newest"]);
+    expect(result.tail[0]).toMatchObject({
+      turnId: "oversized-turn",
+      timelineCursor: { epoch: target.epoch, seq: target.seq },
+    });
+    expect(result.cursor).toEqual({
+      epoch: target.epoch,
+      startSeq: 80,
+      endSeq: 100,
+      retainedRanges: [{ startSeq: target.seq, endSeq: target.seq, hasOlder: true }],
+    });
+    expect(result.sideEffects).not.toContainEqual(expect.objectContaining({ type: "catch_up" }));
+  });
+
   it("keeps whole live assistant messages ordered when merging a disjoint prompt-jump window", () => {
     const live = processAgentStreamEvents({
       events: [
@@ -3306,10 +3353,11 @@ describe("processTimelineResponse", () => {
     expect(result.cursor).toBe(existingCursor);
   });
 
-  it("merges assistant chunks across the older-page prepend boundary", () => {
+  it("merges assistant chunks from a split turn across the older-page prepend boundary", () => {
     const currentTail = [
       {
         ...makeAssistantItem("newer chunk", "assistant-newer"),
+        turnId: "oversized-turn",
         timelineCursor: { epoch: "epoch-1", seq: 3 },
       },
     ];
@@ -3329,7 +3377,7 @@ describe("processTimelineResponse", () => {
         epoch: "epoch-1",
         startCursor: { seq: 1 },
         endCursor: { seq: 2 },
-        entries: [makeTimelineEntry(1, "older chunk ")],
+        entries: [{ ...makeTimelineEntry(1, "older chunk "), turnId: "oversized-turn" }],
       },
     });
 
@@ -3337,6 +3385,7 @@ describe("processTimelineResponse", () => {
     expect(result.tail[0]).toEqual(
       expect.objectContaining({
         id: "assistant-newer",
+        turnId: "oversized-turn",
         timelineCursor: { epoch: "epoch-1", seq: 3 },
       }),
     );

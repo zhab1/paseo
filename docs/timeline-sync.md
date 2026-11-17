@@ -20,7 +20,7 @@ Cumulative text snapshots must be released after their deltas have been consumed
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an
-> agent establishes the daemon's current tail in one complete-turn request, with older history reachable
+> agent establishes the daemon's current tail in one bounded request, with older history reachable
 > through backward pagination.
 
 Every item is bounded before it enters either delivery path, because a timeline page is one
@@ -83,7 +83,7 @@ Heartbeat is used for notification routing. It must not be used as a correctness
 
 ## Gap recovery is paged but complete
 
-Large unbounded timeline responses can exceed relay frame limits, so catch-up uses bounded pages. Bounded does not mean partial.
+Large unbounded timeline responses can block other requests and liveness probes on the same relay connection, so catch-up uses bounded pages. Each projected item remains intact.
 
 Page limits are projected-item targets. A tool call lifecycle is one projected item even if it spans many source sequence numbers, and assistant/reasoning chunks are merged before counting. The response carries `seqStart`, `seqEnd`, `sourceSeqRanges`, and `collapsed` so clients can advance sequence cursors without rendering delta rows.
 
@@ -95,8 +95,17 @@ Initialization timeouts guard lack of catch-up progress, not the full multi-page
 
 Opening or resuming an agent fetches the latest available turns with a soft target of 40
 projected items. Backward pages and prompt-jump windows also include whole turns, including
-all currently available rows of an active run. There is no per-turn cap: a large run can
-exceed the target. Local history mounting uses the same boundaries so revealing older rows
+all currently available rows of an active run. A run can exceed the item target, but the
+serialized response, including its agent snapshot and envelope, targets 47 KiB of UTF-8.
+When a response exceeds that budget, the daemon reselects a smaller item-based page with
+the same direction and cursor. A prompt-jump window instead retains its target while
+reducing the surrounding context. Oversized turns can therefore span pages; older pages
+retain their turn identities and reconstruct the turn through ordinary pagination.
+A single intact projected item or agent snapshot may exceed the byte target so pagination
+still advances. This adds no content truncation beyond the existing per-item limits.
+An explicit `limit: 0` remains a complete snapshot for exports and other all-row consumers;
+the response byte target applies to ordinary default and positive-limit pages.
+Local history mounting uses turn boundaries so revealing older rows
 does not change the collapse state of a turn already displayed.
 
 `wholeTurns` is a preference negotiated once at the client fetch boundary. Hosts advertising

@@ -510,6 +510,26 @@ async function expectFilledChatAtBottom(page: Page) {
     .toEqual({ hasOverflow: true, atBottom: true });
 }
 
+async function releaseInitialHistoryPages(
+  page: Page,
+  history: Awaited<ReturnType<typeof holdOlderHistoryPages>>,
+): Promise<number> {
+  // A byte-limited turn can need more than two older pages. Unblock each actual
+  // request while retaining the visible completion and bottom-anchor checks.
+  await expect
+    .poll(async () => {
+      for (let pageNumber = 1; pageNumber <= history.requestCount(); pageNumber++) {
+        history.releasePage(pageNumber);
+      }
+      return page.getByTestId("agent-initial-fill").isVisible();
+    })
+    .toBe(false);
+  const pageCount = history.requestCount();
+  await expectFilledChatAtBottom(page);
+  await history.expectSettledWithRequestedPages(pageCount);
+  return pageCount;
+}
+
 test("fills collapsed history before revealing a fresh chat", async ({ page }) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 1280, height: 1000 });
@@ -524,13 +544,13 @@ test("fills collapsed history before revealing a fresh chat", async ({ page }) =
     await history.expectRequestedPages(2);
     await expectInitialFillIsConcealed(page);
     history.releasePage(2);
-    await expectFilledChatAtBottom(page);
+    const initialPages = await releaseInitialHistoryPages(page, history);
     await page.setViewportSize({ width: 1280, height: 8000 });
-    await history.expectRequestedPages(3);
+    await history.expectRequestedPages(initialPages + 1);
     await expect(page.getByTestId("agent-chat-scroll")).toHaveCSS("opacity", "1");
     await expect(page.getByTestId("agent-initial-fill")).toBeHidden();
-    history.releasePage(3);
-    await history.expectSettledWithRequestedPages(3);
+    history.releasePage(initialPages + 1);
+    await history.expectSettledWithRequestedPages(initialPages + 1);
     history.expectNoRepeatedEntries();
   } finally {
     await agent.cleanup();
@@ -551,7 +571,7 @@ test("loads complete long turns and preserves expansion while revealing older hi
     history.releasePage(1);
     await history.expectRequestedPages(2);
     history.releasePage(2);
-    await expectFilledChatAtBottom(page);
+    const initialPages = await releaseInitialHistoryPages(page, history);
     await expectComposerVisible(page);
     const latest = page
       .getByTestId("turn-summary")
@@ -566,8 +586,8 @@ test("loads complete long turns and preserves expansion while revealing older hi
     await latest.click();
     await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(120);
     await userScrollsTimelineToHistoryStart(page);
-    await history.expectRequestedPages(3);
-    history.releasePage(3);
+    await history.expectRequestedPages(initialPages + 1);
+    history.releasePage(initialPages + 1);
     await page.getByTestId("scroll-to-bottom-button").click();
     await expect.poll(() => rowsBetweenLatestSummaryAndReply(page)).toBe(120);
     history.expectNoRepeatedEntries();
