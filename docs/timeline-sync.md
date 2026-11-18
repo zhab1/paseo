@@ -96,8 +96,8 @@ Initialization timeouts guard lack of catch-up progress, not the full multi-page
 Opening or resuming an agent fetches the latest available turns with a soft target of 40
 projected items. Backward pages and prompt-jump windows also include whole turns, including
 all currently available rows of an active run. A run can exceed the item target, but the
-serialized response, including its agent snapshot and envelope, targets 47 KiB of UTF-8.
-When a response exceeds that budget, the daemon reselects a smaller item-based page with
+serialized response, including its agent snapshot and envelope, targets 200 KiB of UTF-8.
+When a response exceeds that budget, the daemon searches for the fullest fitting item-based page with
 the same direction and cursor. A prompt-jump window instead retains its target while
 reducing the surrounding context. Oversized turns can therefore span pages; older pages
 retain their turn identities and reconstruct the turn through ordinary pagination.

@@ -3292,11 +3292,11 @@ test.each(["memory", "disk"] as const)(
       const defaultPage = await fixture.fetch({ direction: "tail" });
       expect(
         Buffer.byteLength(JSON.stringify({ type: "session", message: defaultPage })),
-      ).toBeLessThanOrEqual(47 * 1024);
+      ).toBeLessThanOrEqual(200 * 1024);
       let page = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
       expect(
         Buffer.byteLength(JSON.stringify({ type: "session", message: page })),
-      ).toBeLessThanOrEqual(47 * 1024);
+      ).toBeLessThanOrEqual(200 * 1024);
       expect(page.payload.hasOlder).toBe(true);
       expect(page.payload.endCursor?.seq).toBe(121);
       const backwards = [...page.payload.entries];
@@ -3311,7 +3311,7 @@ test.each(["memory", "disk"] as const)(
         });
         expect(
           Buffer.byteLength(JSON.stringify({ type: "session", message: page })),
-        ).toBeLessThanOrEqual(47 * 1024);
+        ).toBeLessThanOrEqual(200 * 1024);
         expect(page.payload.startCursor!.seq).toBeLessThan(before.seq);
         expect(page.payload.endCursor!.seq).toBe(before.seq - 1);
         backwards.unshift(...page.payload.entries);
@@ -3340,7 +3340,7 @@ test.each(["memory", "disk"] as const)(
         });
         expect(
           Buffer.byteLength(JSON.stringify({ type: "session", message: next })),
-        ).toBeLessThanOrEqual(47 * 1024);
+        ).toBeLessThanOrEqual(200 * 1024);
         expect(next.payload.endCursor!.seq).toBeGreaterThan(cursor.seq);
         forwards.push(...next.payload.entries.map((row) => row.seqStart));
         cursor = next.payload.endCursor!;
@@ -3384,7 +3384,7 @@ test.each(["memory", "disk"] as const)(
             name: "shell",
             status: "completed",
             error: null,
-            detail: { type: "unknown", input: null, output: "x".repeat(10000) },
+            detail: { type: "unknown", input: null, output: "界".repeat(10000) },
           },
           { turnId: "prompt-turn" },
         );
@@ -3413,6 +3413,115 @@ test.each(["memory", "disk"] as const)(
       });
       expect(ordinary.payload).toMatchObject({ hasNewer: false, endCursor: { seq: 9 } });
       expect(ordinary.payload.entries.at(-1)?.seqStart).toBe(9);
+
+      store.initialize(agent.id, { epoch: "recentered-prompt" });
+      for (let index = 1; index < 60; index++)
+        store.append(
+          agent.id,
+          {
+            type: "assistant_message",
+            messageId: `context-${index}`,
+            text: `Earlier reply ${index}`,
+          },
+          { turnId: `context-${index}` },
+        );
+      store.append(
+        agent.id,
+        { type: "user_message", text: "recentered target" },
+        { turnId: "heavy-prompt" },
+      );
+      for (let index = 0; index < 20; index++)
+        store.append(
+          agent.id,
+          {
+            type: "tool_call",
+            callId: `heavy-${index}`,
+            name: "shell",
+            status: "completed",
+            error: null,
+            detail: { type: "unknown", input: null, output: "界".repeat(10000) },
+          },
+          { turnId: "heavy-prompt" },
+        );
+      const recentered = await fixture.fetch({
+        direction: "before",
+        cursor: { epoch: "recentered-prompt", seq: 60 + 21 },
+        limit: 40,
+        wholeTurns: true,
+        mergeWindow: true,
+      });
+      // All 40 older-context rows fit, although the original newer-heavy window did not.
+      expect(recentered.payload.entries).toHaveLength(40);
+      expect(recentered.payload).toMatchObject({
+        mergeWindow: true,
+        hasOlder: true,
+        hasNewer: true,
+        startCursor: { seq: 21 },
+        endCursor: { seq: 60 },
+      });
+      expect(recentered.payload.entries.at(-1)?.item).toEqual({
+        type: "user_message",
+        text: "recentered target",
+      });
+    } finally {
+      await fixture.close();
+    }
+  },
+);
+
+test.each(["memory", "disk"] as const)(
+  "timeline byte budget fills conversation pages without a linear scan (%s)",
+  async (backend) => {
+    const fixture = createTimelineBudgetFixture(backend);
+    try {
+      for (let index = 0; index < 45; index++) {
+        let item: Parameters<typeof fixture.store.append>[1];
+        if (index === 5 || index === 15) {
+          item = { type: "user_message", text: `question-${index}` };
+        } else if (index === 10 || index === 20) {
+          item = { type: "assistant_message", messageId: `reply-${index}`, text: `reply-${index}` };
+        } else {
+          item = {
+            type: "tool_call",
+            callId: `work-${index}`,
+            name: "shell",
+            status: "completed",
+            error: null,
+            detail: { type: "unknown", input: null, output: "x".repeat(5000) },
+          };
+        }
+        fixture.store.append(fixture.agent.id, item, {
+          turnId: "conversation",
+          timestamp: "2026-03-01T12:00:00.000Z",
+        });
+      }
+      const reads = vi.spyOn(fixture.store, "fetchPage");
+      const page = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
+      for (const index of [5, 15])
+        expect(
+          page.payload.entries.some(
+            ({ item }) => item.type === "user_message" && item.text === `question-${index}`,
+          ),
+        ).toBe(true);
+      for (const index of [10, 20])
+        expect(
+          page.payload.entries.some(
+            ({ item }) => item.type === "assistant_message" && item.text.endsWith(`reply-${index}`),
+          ),
+        ).toBe(true);
+      const bytes = Buffer.byteLength(JSON.stringify({ type: "session", message: page }));
+      expect(bytes).toBeGreaterThan(190 * 1024);
+      expect(bytes).toBeLessThanOrEqual(200 * 1024);
+      expect(reads.mock.calls.length).toBeLessThanOrEqual(2 + Math.ceil(Math.log2(45)));
+      const extra = await fixture.fetch({
+        direction: "before",
+        cursor: page.payload.startCursor!,
+        limit: 1,
+      });
+      expect(extra.payload.entries).toHaveLength(1);
+      expect(bytes + Buffer.byteLength(JSON.stringify(extra.payload.entries[0]))).toBeGreaterThan(
+        200 * 1024,
+      );
     } finally {
       await fixture.close();
     }
@@ -3425,23 +3534,28 @@ test.each(["memory", "disk"] as const)(
     const fixture = createTimelineBudgetFixture(backend);
     const { store, agent } = fixture;
     try {
+      agent.persistence = {
+        provider: "codex",
+        sessionId: "overlap",
+        metadata: { data: "x".repeat(100000) },
+      };
       const tool = {
         type: "tool_call" as const,
         callId: "overlap",
         name: "shell",
         status: "running" as const,
         error: null,
-        detail: { type: "unknown" as const, input: null, output: "x".repeat(20000) },
+        detail: { type: "unknown" as const, input: null, output: "界".repeat(20000) },
       };
       store.append(agent.id, tool, { turnId: "overlap-turn" });
       store.append(
         agent.id,
-        { type: "assistant_message", messageId: "overlap-text", text: "x".repeat(30000) },
+        { type: "assistant_message", messageId: "overlap-text", text: "界".repeat(30000) },
         { turnId: "overlap-turn" },
       );
       store.append(
         agent.id,
-        { type: "reasoning", text: "x".repeat(30000) },
+        { type: "reasoning", text: "界".repeat(30000) },
         { turnId: "overlap-turn" },
       );
       store.append(agent.id, { ...tool, status: "completed" }, { turnId: "overlap-turn" });
@@ -3464,6 +3578,9 @@ test.each(["memory", "disk"] as const)(
           wholeTurns: true,
         });
         expect(page.payload.endCursor!.seq).toBeGreaterThan(cursor.seq);
+        expect(
+          Buffer.byteLength(JSON.stringify({ type: "session", message: page })),
+        ).toBeLessThanOrEqual(200 * 1024);
         for (const entry of page.payload.entries) seen.set(entry.seqStart!, entry.sourceSeqRanges);
         cursor = page.payload.endCursor!;
         positions.push(cursor.seq);
@@ -3501,15 +3618,15 @@ test("timeline byte budget keeps an oversized entry and envelope reachable", asy
         {
           type: "assistant_message",
           messageId: `wide-${index}`,
-          text: "界".repeat(18000),
+          text: "界".repeat(80000),
         },
         { turnId: "wide" },
       );
     let page = await fixture.fetch({ direction: "tail", limit: 40, wholeTurns: true });
     expect(page.payload.entries.map((row) => row.seqStart)).toEqual([3]);
-    expect(Buffer.byteLength(JSON.stringify(page))).toBeGreaterThan(47 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeGreaterThan(200 * 1024);
     expect(page.payload.entries[0].item).toMatchObject({
-      text: expect.stringContaining("界".repeat(18000)),
+      text: expect.stringContaining("界".repeat(80000)),
     });
     expect(page.payload.agent?.persistence).toEqual(fixture.agent.persistence);
     const seen = [3];
@@ -3528,7 +3645,7 @@ test("timeline byte budget keeps an oversized entry and envelope reachable", asy
     fixture.agent.persistence = {
       provider: "codex",
       sessionId: "budget-session",
-      metadata: { data: "x".repeat(70000) },
+      metadata: { data: "x".repeat(240000) },
     };
     for (let index = 0; index < 2; index++)
       fixture.store.append(fixture.agent.id, {
