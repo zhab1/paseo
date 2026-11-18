@@ -363,8 +363,8 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
 // Keep complete History responses small enough for slow encrypted relay links.
 // The allowance leaves room for encryption and base64 expansion under 64 KiB.
 const MAX_HISTORY_RESPONSE_BYTES = 47 * 1024;
-// Leave space for relay encryption/base64 around an ordinary 64 KiB frame.
-const MAX_TIMELINE_RESPONSE_BYTES = 47 * 1024;
+// Retain useful conversation depth while bounding each timeline RPC's wire work.
+const MAX_TIMELINE_RESPONSE_BYTES = 200 * 1024;
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
@@ -8602,7 +8602,7 @@ export class Session {
       });
       const agentPayload = await this.buildAgentPayload(snapshot);
 
-      let timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
+      const timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
         direction,
         cursor,
         limit: msg.limit,
@@ -8687,19 +8687,44 @@ export class Session {
       // Reselect through the store so source coverage, overlap resets, and cursors
       // describe the delivered rows. Whole turns are a preference; one intact
       // entry (or a large agent envelope) may exceed the budget to make progress.
-      while (
+      if (
         msg.limit !== 0 &&
         timeline.rows.length > 1 &&
         Buffer.byteLength(JSON.stringify({ type: "session", message: response })) >
           MAX_TIMELINE_RESPONSE_BYTES
       ) {
-        timeline = await this.agentManager.fetchTimelinePage(msg.agentId, {
-          direction,
-          cursor: budgetCursor,
-          limit: Math.max(1, Math.floor(timeline.rows.length / 2)),
-          wholeTurns: false,
-        });
-        response = buildResponse(timeline);
+        let low = 1;
+        let high = timeline.rows.length;
+        let fitting: typeof response | undefined;
+        // Item-count pages grow by nested projected rows in the selected direction.
+        // Search their counts instead of discarding half a conversation or scanning linearly.
+        while (low <= high) {
+          const limit = Math.floor((low + high) / 2);
+          const selected = await this.agentManager.fetchTimelinePage(msg.agentId, {
+            direction,
+            cursor: budgetCursor,
+            limit,
+            wholeTurns: false,
+          });
+          const selectedResponse = buildResponse(selected);
+          if (
+            Buffer.byteLength(JSON.stringify({ type: "session", message: selectedResponse })) <=
+            MAX_TIMELINE_RESPONSE_BYTES
+          ) {
+            fitting = selectedResponse;
+            low = limit + 1;
+          } else high = limit - 1;
+        }
+        response =
+          fitting ??
+          buildResponse(
+            await this.agentManager.fetchTimelinePage(msg.agentId, {
+              direction,
+              cursor: budgetCursor,
+              limit: 1,
+              wholeTurns: false,
+            }),
+          );
       }
       this.emitForSource(response, source);
     } catch (error) {
